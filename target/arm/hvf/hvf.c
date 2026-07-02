@@ -1437,8 +1437,16 @@ int hvf_arch_init_vcpu(CPUState *cpu)
             continue;
         }
 
-        if (ri) {
-            assert(!(ri->type & ARM_CP_NO_RAW));
+        /*
+         * Skip NO_RAW registers instead of asserting on them. Some ID registers
+         * (e.g. ID_AA64ISAR0_EL1) became ARM_CP_NO_RAW in system emulation
+         * because a field is computed at read time via a readfn (RNDR depends on
+         * SCR_EL3.TRNDR under FEAT_RNG_TRAP). Such regs have no raw backing store
+         * to sync with HVF, so they must not be added to the cpreg sync list.
+         * Without this, hvf_arch_init_vcpu() aborts on macOS hosts and no
+         * aarch64 HVF guest (incl. vmapple) can start.
+         */
+        if (ri && !(ri->type & ARM_CP_NO_RAW)) {
             arm_cpu->cpreg_indexes[sregs_cnt++] = kvm_id;
         }
     }
