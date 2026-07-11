@@ -226,3 +226,20 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+
+# Sampled-texture resolve failure for a draw bind: reason is ReimsVgpuResourceResolveReason
+# (0=none/post-resolve sample fail); fmt/w/h are 0 when resolve itself fails.
+# Extra type-2 fields when sampled convert fails after geometry resolve (fmt may be 0).
+# Main-loop stall instrumentation: begin/end pairs around every point where the
+# device blocks the drain (or a vCPU MMIO doorbell) on in-flight backend work.
+# A wedged boot's trace TAIL names the stall site: a *_begin with no matching
+# *_end is the loop the device is stuck in; worker begin/end durations expose a
+# slow backend job (e.g. a Vulkan-rail shader translate) directly.
+# Temporary content-vs-publish oracle (scanout gap map G1/G4). reason: 1=0x3b/0x28
+# boundary sample, 2=type-11 0x73 LOAD writeback with partial scissor. outside_clobber
+# counts strided samples outside the job scissor union where guest-pre != job rgba
+# (full-FB store would destroy those pixels). outside_seed_drift: pre != seed outside
+# (another writer landed between seed and complete). unique_blocks: 32x32 mean diversity
+# on boundary samples (width/height omitted — use t11_register / scanout_frame).
+# Probe-only — remove after the isolation boot.
+
