@@ -587,6 +587,14 @@ static const CPUArchIdList *vmapple_possible_cpu_arch_ids(MachineState *ms)
     return ms->possible_cpus;
 }
 
+static bool vmapple_get_vgic_bases(const MachineState *ms,
+                                   uint64_t *dist_base, uint64_t *redist_base)
+{
+    *dist_base = memmap[VMAPPLE_GIC_DIST].base;
+    *redist_base = memmap[VMAPPLE_GIC_REDIST].base;
+    return true;
+}
+
 static GlobalProperty vmapple_compat_defaults[] = {
     { TYPE_VIRTIO_PCI, "disable-legacy", "on" },
     /*
@@ -611,6 +619,7 @@ static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
     mc->cpu_index_to_instance_props = vmapple_cpu_index_to_props;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("host");
     mc->get_default_cpu_node_id = vmapple_get_default_cpu_node_id;
+    mc->get_vgic_bases = vmapple_get_vgic_bases;
     mc->default_ram_id = "mach-vmapple.ram";
     mc->desc = "Apple aarch64 Virtual Machine";
 

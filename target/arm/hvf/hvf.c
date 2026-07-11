@@ -1353,9 +1353,26 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
              * This must be done prior to the creation of any vCPU
              * but past hv_vm_create()
              */
-            hv_gic_config_t cfg = hv_gic_config_create();
-            hv_gic_config_set_distributor_base(cfg, 0x08000000);
-            hv_gic_config_set_redistributor_base(cfg, 0x080A0000);
+            MachineClass *mc = MACHINE_GET_CLASS(ms);
+            /*
+             * Fallback matches hw/arm/virt.c's base_memmap; boards whose
+             * GICv3 lives elsewhere must implement get_vgic_bases or the
+             * in-kernel vGIC is placed at GPAs the guest never accesses.
+             */
+            uint64_t dist_base = 0x08000000;
+            uint64_t redist_base = 0x080A0000;
+            hv_gic_config_t cfg;
+
+            if (mc->get_vgic_bases &&
+                !mc->get_vgic_bases(ms, &dist_base, &redist_base)) {
+                error_report("HVF: machine has no GICv3 for the platform vGIC");
+                ret = HV_UNSUPPORTED;
+                goto cleanup;
+            }
+
+            cfg = hv_gic_config_create();
+            hv_gic_config_set_distributor_base(cfg, dist_base);
+            hv_gic_config_set_redistributor_base(cfg, redist_base);
             ret = hv_gic_create(cfg);
             if (ret != HV_SUCCESS) {
                 error_report("error creating platform VGIC");
