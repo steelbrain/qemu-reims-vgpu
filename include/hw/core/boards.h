@@ -281,6 +281,14 @@ struct MachineClass {
     int (*get_physical_address_range)(MachineState *machine,
         int default_ipa_size, int max_ipa_size);
     bool (*get_kernel_irqchip_default) (const MachineState *machine);
+    /*
+     * Guest physical addresses of the GICv3 distributor and (first)
+     * redistributor region, for accelerators (HVF) that must place an
+     * in-kernel vGIC before any vCPU exists. Returns false when the
+     * board has no GICv3.
+     */
+    bool (*get_vgic_bases) (const MachineState *machine,
+                            uint64_t *dist_base, uint64_t *redist_base);
 
     BlockInterfaceType block_default_type;
     int units_per_default_bus;
