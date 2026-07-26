@@ -31,4 +31,5 @@ config VMAPPLE
     select VMAPPLE_BDIF
     select VMAPPLE_CFG
     select MAC_PVG_MMIO
+    select REIMS_VGPU
     select VMAPPLE_VIRTIO_BLK

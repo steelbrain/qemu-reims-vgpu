@@ -216,8 +216,9 @@ static void create_gfx(VMAppleMachineState *vms, MemoryRegion *mem)
     SysBusDevice *gfx;
 
     /*
-     * The platform's fixed REIMS_VGPU_GFX/REIMS_VGPU_IOSFC slots are backed by
-     * apple-gfx-mmio (ParavirtualizedGraphics.framework host side).
+     * The platform's fixed REIMS_VGPU_GFX/REIMS_VGPU_IOSFC slots are backed by either
+     * apple-gfx-mmio (ParavirtualizedGraphics.framework host side, reference)
+     * or reims-vgpu-mmio (product: thin C → host/reims-vgpu Rust staticlib).
      * Sysbus layout: mmio 0/irq 0 = gfx window, mmio 1/irq 1 = IOSurface mapper.
      */
     gfx_dev = qdev_new(vms->gfx_device);
@@ -648,8 +649,11 @@ static void vmapple_set_gfx_device(Object *obj, const char *value,
 {
     VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
 
-    if (strcmp(value, "apple-gfx-mmio") != 0) {
-        error_setg(errp, "invalid gfx-device '%s' (valid: apple-gfx-mmio)", value);
+    if (strcmp(value, "apple-gfx-mmio") != 0 &&
+        strcmp(value, "reims-vgpu-mmio") != 0) {
+        error_setg(errp,
+                   "invalid gfx-device '%s' (valid: apple-gfx-mmio, reims-vgpu-mmio)",
+                   value);
         return;
     }
 
@@ -671,7 +675,7 @@ static void vmapple_instance_init(Object *obj)
                             vmapple_set_gfx_device);
     object_property_set_description(obj, "gfx-device",
                                     "Paravirt GPU device backing the Reims VGPU "
-                                    "slots (apple-gfx-mmio)");
+                                    "slots (apple-gfx-mmio | reims-vgpu-mmio)");
 }
 
 static void vmapple_instance_finalize(Object *obj)

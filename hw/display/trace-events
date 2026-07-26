@@ -226,6 +226,25 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+# reims-vgpu-mmio.c — thin QEMU shim → host/reims-vgpu staticlib
+reims_vgpu_mmio_realize(uint64_t handle, const char *backend) "handle=0x%"PRIx64" backend=%s"
+reims_vgpu_mmio_gfx_read(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
+reims_vgpu_mmio_gfx_write(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
+reims_vgpu_mmio_iosfc_read(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
+reims_vgpu_mmio_iosfc_write(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
+reims_vgpu_mmio_irq_gfx(void) "pulse gfx IRQ"
+reims_vgpu_mmio_irq_iosfc(void) "pulse iosfc IRQ"
+reims_vgpu_mmio_scanout(uint64_t mapping_id, uint64_t width, uint64_t height) "mapping=%"PRIu64" %"PRIu64"x%"PRIu64
+reims_vgpu_mmio_mode_change(uint64_t width, uint64_t height) "mode=%"PRIu64"x%"PRIu64
+reims_vgpu_mmio_cursor(uint64_t x, uint64_t y, uint64_t show) "x=%"PRIu64" y=%"PRIu64" show=%"PRIu64
+
+# reims-vgpu-pci.c — thin PCI shim (x86 Tahoe) → same staticlib
+reims_vgpu_pci_realize(uint64_t handle, const char *backend) "handle=0x%"PRIx64" backend=%s"
+reims_vgpu_pci_gfx_read(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
+reims_vgpu_pci_gfx_write(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
+reims_vgpu_pci_irq_gfx(void) "msi vector 0"
+reims_vgpu_pci_scanout(uint64_t mapping_id, uint64_t width, uint64_t height) "mapping=%"PRIu64" %"PRIu64"x%"PRIu64
+reims_vgpu_pci_mode_change(uint64_t width, uint64_t height) "mode=%"PRIu64"x%"PRIu64
 
 # Sampled-texture resolve failure for a draw bind: reason is ReimsVgpuResourceResolveReason
 # (0=none/post-resolve sample fail); fmt/w/h are 0 when resolve itself fails.

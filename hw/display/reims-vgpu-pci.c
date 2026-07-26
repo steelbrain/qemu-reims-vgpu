@@ -1,0 +1,1422 @@
+/*
+ * Thin PCI QEMU shim for the product paravirtualized GPU device.
+ *
+ * Type name: reims-vgpu-pci (PCI IDs vendor 0x106B / device 0xEEEE).
+ * Sibling of reims-vgpu-mmio (sysbus/vmapple): same HostOps + Rust staticlib
+ * boundary. C owns only PCI/QOM/BAR/MSI/console/BH — no protocol or GPU logic
+ * Product behaviour lives in host/reims-vgpu.
+ *
+ * Topology: -vga none + pcie-root-port (non-zero bus) + this device;
+ * class VGA 0x030000; MSI vector 0; BAR0 16 KiB (control +0x1000).
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "qemu/log.h"
+#include "qemu/module.h"
+#include "qemu/timer.h"
+#include "qemu/main-loop.h"
+#include "qemu/aio.h"
+#include "qemu/thread.h"
+#include "qapi/error.h"
+#include "hw/core/cpu.h"
+#include "hw/pci/pci_device.h"
+#include "hw/pci/msi.h"
+#include "hw/pci/pci.h"
+#include "hw/pci/pcie.h"
+#include "qom/object.h"
+#include "exec/cpu-common.h"
+#include "system/address-spaces.h"
+#include "system/hw_accel.h"
+#include "system/memory.h"
+#include "system/runstate.h"
+#include "ui/console.h"
+#include "ui/surface.h"
+#include "ui/dmabuf.h"
+#include "ui/input.h"
+#include "standard-headers/drm/drm_fourcc.h"
+#include "trace.h"
+#include "reims_vgpu_qemu_abi.h"
+
+#define TYPE_REIMS_VGPU_PCI "reims-vgpu-pci"
+OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUPCIState, REIMS_VGPU_PCI)
+
+/* BAR0 = full gfx window (16 KiB); control block at +0x1000. */
+#define REIMS_VGPU_PCI_BAR_SIZE  0x4000
+/* BAR1 = linear UEFI GOP framebuffer (BGRA8 1920×1080 + headroom). */
+#define REIMS_VGPU_PCI_FB_SIZE   (16u * 1024u * 1024u)
+#define REIMS_VGPU_PCI_VENDOR    0x106B
+#define REIMS_VGPU_PCI_DEVICE    0xEEEE
+#define REIMS_VGPU_PCI_EFI_W     1920u
+#define REIMS_VGPU_PCI_EFI_H     1080u
+#define REIMS_VGPU_PCI_EFI_BPP   4u
+#define REIMS_VGPU_PCI_MAX_DIM   8192u
+
+/* RAM-only GPA attrs — avoid re-entering BAR MMIO on bad PFNs (tahoe-x86). */
+static const MemTxAttrs reims_vgpu_ram_attrs = {
+    .memory = true,
+};
+
+struct ReimsVGPUPCIState {
+    PCIDevice parent_obj;
+
+    MemoryRegion iomem_gfx;
+    /*
+     * BAR1 linear FB (same PCI device — not a second display). UEFI GOP option
+     * ROM + OpenCore paint here until the product present path latches.
+     */
+    MemoryRegion fb_vram;
+    QemuConsole *con;
+    DisplaySurface *surface;
+    bool new_frame_ready;
+    /*
+     * Deprecated pre-host-window GL/dmabuf bridge latch. The product path is the
+     * Rust host window; this remains only for historical probe compatibility.
+     */
+    bool gl_scanout_active;
+
+    /*
+     * Always-on console-ownership proxy state (/tmp/reims-vgpu-gop-console.log).
+     * Measures freeze class: host stops tracking guest log stream while serial
+     * continues. Not a product policy input — diagnosis only.
+     */
+    uint64_t gop_proxy_last_bar1_fp;
+    uint64_t gop_proxy_last_log_ns;
+    uint32_t gop_proxy_bar1_same;
+    uint32_t gop_proxy_ticks;
+    bool gop_proxy_last_boundary;
+    bool gop_proxy_last_use_bar1;
+    bool gop_proxy_have_sample;
+
+    ReimsVgpuHostOps host_ops;
+    uint64_t rust_handle;
+
+    /* Ordered Rust FIFO/render drain owner. The AIO BH only applies completed
+     * HostActions; it never translates shaders or waits for GPU work. */
+    QemuThread drain_thread;
+    QemuMutex drain_mutex;
+    QemuCond drain_cond;
+    QEMUBH *action_bh;
+    /*
+     * Steady vblank + Dekker-rescue heartbeat. Keep its wait on a dedicated
+     * thread: main-loop timers are delayed by input/QMP/display work during
+     * window drags, which starves the guest display time base.
+     */
+    QemuThread heartbeat_thread;
+    QemuMutex heartbeat_mutex;
+    QemuCond heartbeat_cond;
+    bool drain_pending;
+    bool drain_stopping;
+    bool drain_started;
+    bool heartbeat_stopping;
+    bool heartbeat_started;
+    Notifier shutdown_notifier;
+    bool shutdown_notifier_registered;
+};
+
+/* ---------- HostOps (GPA R/W + BH; Linux has no map_pages / xreg) ---------- */
+
+static int reims_vgpu_pci_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len)
+{
+    MemTxResult r;
+
+    if (!buf || len == 0) {
+        return 0;
+    }
+    r = address_space_read(&address_space_memory, gpa, reims_vgpu_ram_attrs, buf, len);
+    return r == MEMTX_OK ? 0 : -1;
+}
+
+static int reims_vgpu_pci_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
+                             size_t len)
+{
+    MemTxResult r;
+
+    if (!buf || len == 0) {
+        return 0;
+    }
+    r = address_space_write(&address_space_memory, gpa, reims_vgpu_ram_attrs, buf, len);
+    return r == MEMTX_OK ? 0 : -1;
+}
+
+static uint64_t reims_vgpu_pci_mono_ns(void *ctx)
+{
+    return (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_HOST);
+}
+
+static int reims_vgpu_pci_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len)
+{
+    CPUState *cs = current_cpu;
+
+    if (!buf || len == 0) {
+        return 0;
+    }
+    if (!cs) {
+        return -2;
+    }
+    cpu_synchronize_state(cs);
+    return cpu_memory_rw_debug(cs, kva, buf, len, false) == 0 ? 0 : -1;
+}
+
+static int reims_vgpu_pci_read_xreg(void *ctx, uint32_t index, uint64_t *out)
+{
+    (void)ctx;
+    (void)index;
+    (void)out;
+    /* x86 product path: no arm xreg handoff. */
+    return -1;
+}
+
+static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t count,
+                             void **out_ptr)
+{
+    /* x86 guest page granularity (host-pointer import view stride). */
+    const hwaddr page = (hwaddr)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
+    uint8_t *base = NULL;
+    MemoryRegion *base_mr = NULL;
+    size_t i;
+
+    (void)ctx;
+    if (!gpas || count == 0 || !out_ptr) {
+        return -1;
+    }
+
+    /*
+     * Packed contiguous host-VA view: guest RAM is already mmap'd in the QEMU
+     * process. Callers (Rust map_pages consumers) treat page i as
+     * `base + i * page` — so every GPA in the list must alias host VA at that
+     * packed offset (same RAMBlock, sequential host pages). Non-sequential /
+     * cross-MR / non-RAM lists return -1; callers multi-import maximal runs
+     * or fail closed (`not_contig`).
+     *
+     * Note: do **not** accept `hva == base + (gpas[i] - gpas[0])` for sparse
+     * GPAs — that would return success while page i is not at base+i*page,
+     * silently mis-aliasing multi-page views.
+     */
+    rcu_read_lock();
+
+    /*
+     * Maximal GPA runs are the common large-surface path.  One address-space
+     * translation covering the complete sequential run proves the same
+     * RAMBlock/HVA contract as the page loop below.  Avoiding thousands of
+     * identical translations is important for full-frame staging/writeback;
+     * retain the page loop for aliases and region-boundary cases.
+     */
+    if (count <= UINT64_MAX / page &&
+        gpas[0] <= UINT64_MAX - (count - 1) * page) {
+        hwaddr total = count * page;
+        bool sequential = true;
+
+        for (i = 1; i < count; i++) {
+            if (gpas[i] != gpas[0] + i * page) {
+                sequential = false;
+                break;
+            }
+        }
+        if (sequential) {
+            hwaddr xlat, plen = total;
+            MemoryRegion *mr;
+            uint8_t *hva;
+
+            mr = address_space_translate(&address_space_memory, gpas[0],
+                                         &xlat, &plen, true,
+                                         MEMTXATTRS_UNSPECIFIED);
+            if (mr && memory_region_is_ram(mr) && plen >= total) {
+                hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+                if (((uintptr_t)hva & (page - 1)) == 0) {
+                    rcu_read_unlock();
+                    *out_ptr = hva;
+                    return 0;
+                }
+            }
+        }
+    }
+
+    for (i = 0; i < count; i++) {
+        hwaddr xlat, plen = page;
+        MemoryRegion *mr;
+        uint8_t *hva;
+
+        mr = address_space_translate(&address_space_memory, gpas[i], &xlat,
+                                     &plen, true, MEMTXATTRS_UNSPECIFIED);
+        if (!mr || !memory_region_is_ram(mr) || plen < page) {
+            goto fail;
+        }
+        hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+        if (i == 0) {
+            base = hva;
+            base_mr = mr;
+            if (((uintptr_t)base & (page - 1)) != 0) {
+                goto fail; /* base must be page-aligned for import */
+            }
+        } else if (mr != base_mr || hva != base + i * page) {
+            goto fail; /* page i not packed-contig with the run */
+        }
+    }
+    rcu_read_unlock();
+
+    *out_ptr = base;
+    return 0;
+
+fail:
+    rcu_read_unlock();
+    return -1;
+}
+
+static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
+{
+    (void)ctx;
+    (void)ptr;
+    (void)len;
+    /* Pointer is a direct alias of guest RAM (not an allocation) — nothing to
+     * free; guest RAM outlives the view. */
+}
+
+/* 1 = guest RAM, 0 = not (MMIO / ROM / unmapped). Mapper page-entry accept. */
+static int reims_vgpu_pci_is_ram_gpa(void *ctx, uint64_t gpa)
+{
+    hwaddr xlat, plen = 1;
+    MemoryRegion *mr;
+    int ok;
+
+    (void)ctx;
+    rcu_read_lock();
+    mr = address_space_translate(&address_space_memory, gpa, &xlat, &plen, true,
+                                 MEMTXATTRS_UNSPECIFIED);
+    ok = mr && memory_region_is_ram(mr) && plen >= 1;
+    rcu_read_unlock();
+    return ok ? 1 : 0;
+}
+
+static void reims_vgpu_pci_bh(void *opaque);
+static void reims_vgpu_pci_deliver_actions(ReimsVGPUPCIState *s);
+static void reims_vgpu_pci_apply_action(ReimsVGPUPCIState *s, const ReimsVgpuHostAction *a);
+
+static void reims_vgpu_pci_schedule_bh(void *ctx)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    qemu_mutex_lock(&s->drain_mutex);
+    s->drain_pending = true;
+    qemu_cond_signal(&s->drain_cond);
+    qemu_mutex_unlock(&s->drain_mutex);
+}
+
+/*
+ * Prompt HostAction delivery (IRQ pulses / cursor moves): schedule the
+ * action BH from any thread so acks reach the guest while the drain worker
+ * is still executing a tranche. qemu_bh_schedule is thread-safe.
+ */
+static void reims_vgpu_pci_notify_actions(void *ctx)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    if (s->action_bh) {
+        qemu_bh_schedule(s->action_bh);
+    }
+}
+
+static void reims_vgpu_pci_deliver_actions(ReimsVGPUPCIState *s)
+{
+    ReimsVgpuHostAction action;
+    int rc;
+
+    if (s->rust_handle == 0) {
+        return;
+    }
+    while ((rc = reims_vgpu_qemu_device_pop_action(s->rust_handle, &action)) ==
+           REIMS_VGPU_QEMU_OK) {
+        reims_vgpu_pci_apply_action(s, &action);
+    }
+}
+
+/* ---------- Console ---------- */
+
+static void reims_vgpu_pci_set_mode(ReimsVGPUPCIState *s, uint32_t width,
+                             uint32_t height)
+{
+    if (width == 0 || height == 0 ||
+        width > REIMS_VGPU_PCI_MAX_DIM || height > REIMS_VGPU_PCI_MAX_DIM) {
+        return;
+    }
+    if (s->surface &&
+        surface_width(s->surface) == width &&
+        surface_height(s->surface) == height) {
+        return;
+    }
+
+    s->surface = qemu_create_displaysurface(width, height);
+    if (s->con) {
+        qemu_console_set_surface(s->con, s->surface);
+    }
+    trace_reims_vgpu_pci_mode_change(width, height);
+}
+
+/*
+ * Copy BAR1 linear BGRA8 into the QEMU DisplaySurface (UEFI GOP / OpenCore).
+ * Used when the Metal/product present path has not yet latched a front buffer.
+ */
+static bool reims_vgpu_pci_copy_gop_fb(ReimsVGPUPCIState *s)
+{
+    uint8_t *src;
+    uint8_t *dst;
+    uint32_t dst_stride;
+    uint32_t src_stride;
+    uint32_t w = REIMS_VGPU_PCI_EFI_W;
+    uint32_t h = REIMS_VGPU_PCI_EFI_H;
+    uint32_t y;
+
+    if (!s->surface || !memory_region_is_ram(&s->fb_vram)) {
+        return false;
+    }
+    src = memory_region_get_ram_ptr(&s->fb_vram);
+    if (!src) {
+        return false;
+    }
+    if (surface_width(s->surface) != w || surface_height(s->surface) != h) {
+        reims_vgpu_pci_set_mode(s, w, h);
+        if (!s->surface) {
+            return false;
+        }
+    }
+    dst = surface_data(s->surface);
+    dst_stride = surface_stride(s->surface);
+    src_stride = w * REIMS_VGPU_PCI_EFI_BPP;
+    if (dst_stride == src_stride) {
+        memcpy(dst, src, (size_t)src_stride * h);
+    } else {
+        for (y = 0; y < h; y++) {
+            memcpy(dst + (size_t)y * dst_stride,
+                   src + (size_t)y * src_stride, src_stride);
+        }
+    }
+    return true;
+}
+
+/*
+ * Pre-boundary early console: prefer guest-programmed EFI FB (MMIO 0x1210)
+ * when the kernel relocates the video console off BAR1 into guest RAM
+ * (serial: "console relocated to 0xf1000000"). Fall back to BAR1 GOP.
+ * Contract: efi_fb_start / stride from Apple EFI block — not serial scrape.
+ */
+static bool reims_vgpu_pci_copy_early_console(ReimsVGPUPCIState *s)
+{
+    uint8_t *dst;
+    uint32_t dst_stride;
+    uint32_t w = REIMS_VGPU_PCI_EFI_W;
+    uint32_t h = REIMS_VGPU_PCI_EFI_H;
+    uint64_t gpa = 0;
+    uint32_t fb_stride = 0;
+    int rc;
+
+    if (!s->surface) {
+        reims_vgpu_pci_set_mode(s, w, h);
+        if (!s->surface) {
+            return false;
+        }
+    }
+    if (surface_width(s->surface) != w || surface_height(s->surface) != h) {
+        reims_vgpu_pci_set_mode(s, w, h);
+        if (!s->surface) {
+            return false;
+        }
+    }
+    if (s->rust_handle != 0) {
+        dst = surface_data(s->surface);
+        dst_stride = surface_stride(s->surface);
+        rc = reims_vgpu_qemu_efi_console_copy(s->rust_handle, dst, dst_stride, w, h,
+                                       &gpa, &fb_stride);
+        if (rc == REIMS_VGPU_QEMU_OK) {
+            return true;
+        }
+    }
+    return reims_vgpu_pci_copy_gop_fb(s);
+}
+
+/* True once Rust has seen DisplaySwap (frame_flush_seen). */
+static bool reims_vgpu_pci_present_boundary(ReimsVGPUPCIState *s)
+{
+    uint32_t seen = 0;
+
+    if (s->rust_handle == 0) {
+        return false;
+    }
+    if (reims_vgpu_qemu_present_boundary_seen(s->rust_handle, &seen) != REIMS_VGPU_QEMU_OK) {
+        return false;
+    }
+    return seen != 0;
+}
+
+/*
+ * Cheap BAR1 content fingerprint (not a full hash): stride samples of BGRA
+ * words so we can see whether the guest is still painting BAR1 after the host
+ * stops showing it. Always-on proxy path only.
+ */
+static uint64_t reims_vgpu_pci_bar1_fingerprint(ReimsVGPUPCIState *s, uint32_t *rgb_nz_out)
+{
+    const uint8_t *src;
+    uint32_t w = REIMS_VGPU_PCI_EFI_W;
+    uint32_t h = REIMS_VGPU_PCI_EFI_H;
+    uint32_t stride = w * REIMS_VGPU_PCI_EFI_BPP;
+    uint32_t rgb_nz = 0;
+    uint64_t fp = 14695981039346656037ULL; /* FNV-1a offset basis */
+    uint32_t y, x;
+
+    if (rgb_nz_out) {
+        *rgb_nz_out = 0;
+    }
+    if (!memory_region_is_ram(&s->fb_vram)) {
+        return 0;
+    }
+    src = memory_region_get_ram_ptr(&s->fb_vram);
+    if (!src) {
+        return 0;
+    }
+    /* Sample every 8th pixel on every 8th row — enough to catch text scroll. */
+    for (y = 0; y < h; y += 8) {
+        const uint32_t *row = (const uint32_t *)(src + (size_t)y * stride);
+        for (x = 0; x < w; x += 8) {
+            uint32_t px = row[x];
+            uint8_t b = px & 0xff;
+            uint8_t g = (px >> 8) & 0xff;
+            uint8_t r = (px >> 16) & 0xff;
+            if (r | g | b) {
+                rgb_nz++;
+            }
+            fp ^= (uint64_t)px;
+            fp *= 1099511628211ULL;
+        }
+    }
+    if (rgb_nz_out) {
+        *rgb_nz_out = rgb_nz;
+    }
+    return fp;
+}
+
+/*
+ * Always-on GOP console ownership proxy.
+ * Path: /tmp/reims-vgpu-gop-console.log
+ * Grep: GOPCON
+ *
+ * Freeze class under test: host console stops tracking guest early-boot log
+ * stream (user observation: stalls at serial "kdp_core zlib memory") while
+ * software VGA would keep updating. Correlate this log with serial milestones
+ * (scripts/gop-console-measure/) — do NOT use content as product cutover.
+ *
+ * Logs on: source/boundary/fingerprint change, else ≥250ms heartbeat.
+ */
+static void reims_vgpu_pci_gop_console_proxy(ReimsVGPUPCIState *s, bool use_bar1,
+                                      bool boundary)
+{
+    uint64_t now = (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    uint32_t rgb_nz = 0;
+    uint64_t bar1_fp = reims_vgpu_pci_bar1_fingerprint(s, &rgb_nz);
+    bool bar1_changed;
+    bool force;
+    FILE *f;
+
+    s->gop_proxy_ticks++;
+    bar1_changed = !s->gop_proxy_have_sample ||
+                   bar1_fp != s->gop_proxy_last_bar1_fp;
+    if (bar1_changed) {
+        s->gop_proxy_bar1_same = 0;
+    } else {
+        s->gop_proxy_bar1_same++;
+    }
+
+    force = !s->gop_proxy_have_sample ||
+            use_bar1 != s->gop_proxy_last_use_bar1 ||
+            boundary != s->gop_proxy_last_boundary ||
+            bar1_changed ||
+            (now - s->gop_proxy_last_log_ns) >= 250000000ULL; /* 250 ms */
+
+    if (!force) {
+        s->gop_proxy_last_bar1_fp = bar1_fp;
+        return;
+    }
+
+    f = fopen("/tmp/reims-vgpu-gop-console.log", "a");
+    if (f) {
+        fprintf(f,
+                "GOPCON mono_ns=%" PRIu64
+                " src=%s boundary=%u bar1_fp=%016" PRIx64
+                " bar1_changed=%u bar1_same=%u bar1_rgb_nz=%u ticks=%u\n",
+                now,
+                use_bar1 ? "bar1" : "product",
+                boundary ? 1u : 0u,
+                bar1_fp,
+                bar1_changed ? 1u : 0u,
+                s->gop_proxy_bar1_same,
+                rgb_nz,
+                s->gop_proxy_ticks);
+        fclose(f);
+    }
+
+    s->gop_proxy_last_bar1_fp = bar1_fp;
+    s->gop_proxy_last_log_ns = now;
+    s->gop_proxy_last_boundary = boundary;
+    s->gop_proxy_last_use_bar1 = use_bar1;
+    s->gop_proxy_have_sample = true;
+}
+
+/*
+ * Paint a named guest mapping into the QEMU surface (pre- or post-boundary).
+ * Pre-boundary early writebacks and post-boundary DisplaySwap both use this
+ * path. Return true when the surface was updated.
+ */
+static bool reims_vgpu_pci_paint_scanout(ReimsVGPUPCIState *s, uint32_t mapping_id,
+                                  uint32_t width, uint32_t height,
+                                  uint32_t generation)
+{
+    uint8_t *dst;
+    uint32_t stride;
+    int rc;
+
+    if (!s->surface || s->rust_handle == 0) {
+        return false;
+    }
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    if (surface_width(s->surface) != width ||
+        surface_height(s->surface) != height) {
+        reims_vgpu_pci_set_mode(s, width, height);
+        if (!s->surface) {
+            return false;
+        }
+    }
+    dst = surface_data(s->surface);
+    stride = surface_stride(s->surface);
+    rc = reims_vgpu_qemu_scanout_copy(s->rust_handle, mapping_id, dst, stride,
+                               width, height, generation);
+    if (rc == REIMS_VGPU_QEMU_OK) {
+        s->new_frame_ready = true;
+        trace_reims_vgpu_pci_scanout(mapping_id, width, height);
+        /* Push retain immediately — waiting only for the next gfx_update can
+         * leave a black surface if a later EMPTY/Unchanged path races. */
+        if (s->con) {
+            qemu_console_update_full(s->con);
+            s->new_frame_ready = false;
+        }
+        return true;
+    }
+    return false;
+}
+
+/* True when Rust has a pre-boundary latched early front (protocol state). */
+static bool reims_vgpu_pci_early_scanout_latched(ReimsVGPUPCIState *s,
+                                          uint32_t *out_mid, uint32_t *out_w,
+                                          uint32_t *out_h, uint32_t *out_gen)
+{
+    uint32_t mid = 0, w = 0, h = 0, gen = 0;
+
+    if (s->rust_handle == 0) {
+        return false;
+    }
+    if (reims_vgpu_qemu_early_scanout_target(s->rust_handle, &mid, &w, &h, &gen)
+        != REIMS_VGPU_QEMU_OK) {
+        return false;
+    }
+    if (mid == 0 || w == 0 || h == 0) {
+        return false;
+    }
+    if (out_mid) {
+        *out_mid = mid;
+    }
+    if (out_w) {
+        *out_w = w;
+    }
+    if (out_h) {
+        *out_h = h;
+    }
+    if (out_gen) {
+        *out_gen = gen;
+    }
+    return true;
+}
+
+static void reims_vgpu_pci_apply_scanout(ReimsVGPUPCIState *s, uint32_t mapping_id,
+                                  uint32_t width, uint32_t height,
+                                  uint32_t generation)
+{
+    /*
+     * Contract:
+     * - Pre-boundary: only paint when HostAction matches the latched early
+     *   front (type-11 writeback logo+pill). Clear-only present HostActions
+     *   must not steal the QEMU surface from BAR1/efi PE log console.
+     * - Post-boundary (frame_flush_seen): product present owns the console.
+     */
+    /*
+     * Historical GL/dmabuf bridge: once it has taken over the QEMU console, do
+     * not paint the CPU DisplaySurface underneath it.
+     */
+    if (s->gl_scanout_active) {
+        return;
+    }
+    if (!reims_vgpu_pci_present_boundary(s)) {
+        uint32_t mid = 0, w = 0, h = 0, gen = 0;
+
+        if (!reims_vgpu_pci_early_scanout_latched(s, &mid, &w, &h, &gen) ||
+            mid != mapping_id) {
+            return;
+        }
+    }
+    (void)reims_vgpu_pci_paint_scanout(s, mapping_id, width, height, generation);
+}
+
+/*
+ * Deprecated pre-host-window GL/dmabuf bridge: import an exported present dmabuf
+ * into QEMU's console GL context. The supported product path is the Rust host
+ * window/direct-present route; keep this shim thin and do not extend it for fps
+ * work unless explicitly doing historical investigation. `fd` is owned here and
+ * closed after import/fallback.
+ */
+static void reims_vgpu_pci_scanout_gl(ReimsVGPUPCIState *s, int fd, uint32_t stride,
+                               uint32_t width, uint32_t height, uint32_t fourcc)
+{
+    QemuDmaBuf *dmabuf;
+    uint32_t offset = 0;
+    int32_t fds[1];
+
+    if (fd < 0) {
+        return;
+    }
+    if (!s->con || !qemu_console_has_gl(s->con) || width == 0 || height == 0) {
+        close(fd);
+        return;
+    }
+    /*
+     * Historical egl-headless / gtk gl=on bridge: size QEMU's DisplaySurface
+     * before GL update so its console readback is not wrong-sized.
+     */
+    reims_vgpu_pci_set_mode(s, width, height);
+
+    fds[0] = fd;
+    /* Single LINEAR plane at offset 0; modifier implicit DRM_FORMAT_MOD_LINEAR. */
+    dmabuf = qemu_dmabuf_new(width, height, &offset, &stride, 0, 0,
+                             width, height, fourcc, DRM_FORMAT_MOD_LINEAR,
+                             fds, 1, false, /* y0_top */ true);
+    qemu_console_gl_scanout_dmabuf(s->con, dmabuf);
+    qemu_console_gl_update(s->con, 0, 0, width, height);
+    qemu_console_gl_release_dmabuf(s->con, dmabuf);
+    qemu_dmabuf_free(dmabuf);
+    close(fd);
+
+    /*
+     * Once GL owns the console, the CPU SCANOUT path must stop painting the
+     * DisplaySurface underneath it (else it thrashes SCANOUT_SURFACE vs
+     * SCANOUT_DMABUF each present). Latch here rather than up front because
+     * egl-headless registers the GL ctx at init — so console_has_gl is already
+     * true during the EFI/boot frames that legitimately paint via CPU.
+     */
+    s->gl_scanout_active = true;
+}
+
+/*
+ * Host-owned-window input: replay a neutral Rust input action through the QEMU
+ * input subsystem. Input routes to the guest's active handlers (usb-kbd /
+ * usb-tablet) independent of any display, so these work with -display none.
+ * All business logic (platform key -> evdev, scroll delta -> wheel notches,
+ * coordinate origin) lives in Rust; the shim only translates the neutral wire
+ * form into the QEMU input ABI (which owns the QEMU-side keycode/button enums).
+ */
+static InputButton reims_vgpu_pci_button(uint32_t code, bool *ok)
+{
+    *ok = true;
+    switch (code) {
+    case REIMS_VGPU_BUTTON_LEFT:
+        return INPUT_BUTTON_LEFT;
+    case REIMS_VGPU_BUTTON_MIDDLE:
+        return INPUT_BUTTON_MIDDLE;
+    case REIMS_VGPU_BUTTON_RIGHT:
+        return INPUT_BUTTON_RIGHT;
+    case REIMS_VGPU_BUTTON_WHEEL_UP:
+        return INPUT_BUTTON_WHEEL_UP;
+    case REIMS_VGPU_BUTTON_WHEEL_DOWN:
+        return INPUT_BUTTON_WHEEL_DOWN;
+    case REIMS_VGPU_BUTTON_SIDE:
+        return INPUT_BUTTON_SIDE;
+    case REIMS_VGPU_BUTTON_EXTRA:
+        return INPUT_BUTTON_EXTRA;
+    case REIMS_VGPU_BUTTON_WHEEL_LEFT:
+        return INPUT_BUTTON_WHEEL_LEFT;
+    case REIMS_VGPU_BUTTON_WHEEL_RIGHT:
+        return INPUT_BUTTON_WHEEL_RIGHT;
+    default:
+        *ok = false;
+        return INPUT_BUTTON_LEFT;
+    }
+}
+
+static void reims_vgpu_pci_input_key(ReimsVGPUPCIState *s, uint32_t evdev, bool down)
+{
+    if (!s->con) {
+        return;
+    }
+    /* QEMU maps the Linux evdev code to its qcode; unknown codes are dropped
+     * there, so no Reims VGPU-side keycode table is needed. */
+    qemu_input_event_send_key_linux(s->con, evdev, down);
+}
+
+static void reims_vgpu_pci_input_pointer_move(ReimsVGPUPCIState *s, uint32_t x,
+                                       uint32_t y, uint32_t w, uint32_t h)
+{
+    if (!s->con || w == 0 || h == 0) {
+        return;
+    }
+    /* Absolute pointer (usb-tablet): scale window pixels into the abs range. */
+    qemu_input_queue_abs(s->con, INPUT_AXIS_X, (int)x, 0, (int)w);
+    qemu_input_queue_abs(s->con, INPUT_AXIS_Y, (int)y, 0, (int)h);
+    qemu_input_event_sync();
+}
+
+static void reims_vgpu_pci_input_button(ReimsVGPUPCIState *s, uint32_t code, bool down)
+{
+    InputButton btn;
+    bool ok;
+
+    if (!s->con) {
+        return;
+    }
+    btn = reims_vgpu_pci_button(code, &ok);
+    if (!ok) {
+        return;
+    }
+    qemu_input_queue_btn(s->con, btn, down);
+    qemu_input_event_sync();
+}
+
+/*
+ * Whether the host-owned window (kb host-window) is requested via REIMS_VGPU_WINDOW.
+ * Presence enables it; 0/off/no/false explicitly disable so REIMS_VGPU_WINDOW=0 opts
+ * out (vm/boot-x86.sh defaults it on for this device, unset to disable). Env
+ * plumbing only — the window itself lives entirely in the staticlib.
+ */
+static bool reims_vgpu_pci_window_requested(void)
+{
+    const char *v = getenv("REIMS_VGPU_WINDOW");
+
+    if (!v || v[0] == '\0') {
+        return false;
+    }
+    if (!strcmp(v, "0") || !strcasecmp(v, "off") || !strcasecmp(v, "no") ||
+        !strcasecmp(v, "false")) {
+        return false;
+    }
+    return true;
+}
+
+static void reims_vgpu_pci_apply_action(ReimsVGPUPCIState *s, const ReimsVgpuHostAction *a)
+{
+    PCIDevice *pdev = PCI_DEVICE(s);
+
+    switch (a->kind) {
+    case REIMS_VGPU_HOST_ACTION_IRQ_GFX:
+        if (msi_enabled(pdev)) {
+            msi_notify(pdev, 0);
+        }
+        trace_reims_vgpu_pci_irq_gfx();
+        break;
+    case REIMS_VGPU_HOST_ACTION_IRQ_IOSFC:
+        /* Single MSI vector; pulse same vector (guest demuxes by status). */
+        if (msi_enabled(pdev)) {
+            msi_notify(pdev, 0);
+        }
+        break;
+    case REIMS_VGPU_HOST_ACTION_SCANOUT:
+        reims_vgpu_pci_apply_scanout(s, (uint32_t)a->a0, (uint32_t)a->a1,
+                              (uint32_t)a->a2, (uint32_t)a->a3);
+        break;
+    case REIMS_VGPU_HOST_ACTION_SCANOUT_GL:
+        /* a0 = dmabuf fd, a1 = row_pitch, a2 = (width << 32) | height,
+         * a3 = DRM fourcc; modifier implicit DRM_FORMAT_MOD_LINEAR. */
+        reims_vgpu_pci_scanout_gl(s, (int)(int32_t)a->a0, (uint32_t)a->a1,
+                           (uint32_t)(a->a2 >> 32),
+                           (uint32_t)(a->a2 & 0xffffffffu), (uint32_t)a->a3);
+        break;
+    case REIMS_VGPU_HOST_ACTION_CURSOR:
+        if (s->con) {
+            qemu_console_set_mouse(s->con, (int)a->a0, (int)a->a1, a->a2 != 0);
+        }
+        break;
+    case REIMS_VGPU_HOST_ACTION_INPUT_KEY:
+        reims_vgpu_pci_input_key(s, (uint32_t)a->a0, a->a1 != 0);
+        break;
+    case REIMS_VGPU_HOST_ACTION_INPUT_POINTER_MOVE:
+        reims_vgpu_pci_input_pointer_move(s, (uint32_t)a->a0, (uint32_t)a->a1,
+                                   (uint32_t)a->a2, (uint32_t)a->a3);
+        break;
+    case REIMS_VGPU_HOST_ACTION_INPUT_POINTER_BUTTON:
+        reims_vgpu_pci_input_button(s, (uint32_t)a->a0, a->a1 != 0);
+        break;
+    case REIMS_VGPU_HOST_ACTION_WINDOW_CLOSED:
+        /* The host window is the VM's display; closing it shuts the VM down. */
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        break;
+    case REIMS_VGPU_HOST_ACTION_CURSOR_GLYPH: {
+        ReimsVgpuCursorGlyphInfo info;
+        g_autofree uint32_t *pixels = NULL;
+        QEMUCursor *c;
+        int rc;
+
+        if (!s->con || s->rust_handle == 0) {
+            break;
+        }
+        rc = reims_vgpu_qemu_cursor_glyph_info(s->rust_handle, &info);
+        if (rc != REIMS_VGPU_QEMU_OK || info.width == 0 || info.height == 0 ||
+            info.pixel_count == 0 ||
+            info.pixel_count != info.width * info.height) {
+            break;
+        }
+        pixels = g_new(uint32_t, info.pixel_count);
+        rc = reims_vgpu_qemu_cursor_glyph_copy(s->rust_handle, pixels,
+                                        info.pixel_count);
+        if (rc != REIMS_VGPU_QEMU_OK) {
+            break;
+        }
+        c = cursor_alloc(info.width, info.height);
+        if (!c) {
+            break;
+        }
+        c->hot_x = info.hot_x;
+        c->hot_y = info.hot_y;
+        memcpy(c->data, pixels, (size_t)info.pixel_count * sizeof(uint32_t));
+        qemu_console_set_cursor(s->con, c);
+        cursor_unref(c);
+        break;
+    }
+    case REIMS_VGPU_HOST_ACTION_TRACE:
+    case REIMS_VGPU_HOST_ACTION_NONE:
+    default:
+        break;
+    }
+}
+
+static void reims_vgpu_pci_bh(void *opaque)
+{
+    ReimsVGPUPCIState *s = opaque;
+
+    if (s->rust_handle == 0) {
+        return;
+    }
+    reims_vgpu_pci_deliver_actions(s);
+}
+
+static void *reims_vgpu_pci_drain_thread(void *opaque)
+{
+    ReimsVGPUPCIState *s = opaque;
+
+    for (;;) {
+        int rc;
+
+        qemu_mutex_lock(&s->drain_mutex);
+        while (!s->drain_pending && !s->drain_stopping) {
+            qemu_cond_wait(&s->drain_cond, &s->drain_mutex);
+        }
+        if (s->drain_stopping) {
+            qemu_mutex_unlock(&s->drain_mutex);
+            break;
+        }
+        s->drain_pending = false;
+        qemu_mutex_unlock(&s->drain_mutex);
+
+        rc = reims_vgpu_qemu_device_drain(s->rust_handle);
+        if (rc != REIMS_VGPU_QEMU_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: worker drain failed rc=%d\n",
+                          TYPE_REIMS_VGPU_PCI, rc);
+        }
+        qemu_bh_schedule(s->action_bh);
+    }
+    return NULL;
+}
+
+/*
+ * Oversample the Rust-owned VBL limiter (DISPLAY_VBL_MIN_INTERVAL_MS = 8 ms for
+ * the 120 Hz advertised mode). Polling at 4 ms guarantees the 8 ms limiter is
+ * the gate even when the main loop stalls under input/QMP/display work. This
+ * thread only supplies poll opportunities and schedules the existing main-loop
+ * BH; Rust owns pacing and protocol state, while the BH remains the sole
+ * HostAction applier.
+ */
+#define REIMS_VGPU_PCI_HEARTBEAT_MS 4
+
+static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
+{
+    ReimsVGPUPCIState *s = opaque;
+
+    qemu_mutex_lock(&s->heartbeat_mutex);
+    while (!s->heartbeat_stopping) {
+        qemu_cond_timedwait(&s->heartbeat_cond, &s->heartbeat_mutex,
+                            REIMS_VGPU_PCI_HEARTBEAT_MS);
+        if (s->heartbeat_stopping) {
+            break;
+        }
+        qemu_mutex_unlock(&s->heartbeat_mutex);
+
+        if (s->rust_handle != 0 &&
+            reims_vgpu_qemu_device_poll(s->rust_handle) == REIMS_VGPU_QEMU_OK &&
+            s->action_bh) {
+            qemu_bh_schedule(s->action_bh);
+        }
+
+        qemu_mutex_lock(&s->heartbeat_mutex);
+    }
+    qemu_mutex_unlock(&s->heartbeat_mutex);
+    return NULL;
+}
+
+static bool reims_vgpu_pci_fb_update(void *opaque)
+{
+    ReimsVGPUPCIState *s = opaque;
+    bool boundary;
+
+    if (!s->con) {
+        return true;
+    }
+
+    if (s->rust_handle != 0 &&
+        reims_vgpu_qemu_device_poll(s->rust_handle) == REIMS_VGPU_QEMU_OK) {
+        reims_vgpu_pci_deliver_actions(s);
+    }
+
+    /*
+     * Host-console ownership (contract state only):
+     *   !frame_flush_seen && no early front latch → BAR1 / efi_fb (UEFI+PE log)
+     *   !frame_flush_seen && early_scanout_target  → product early paint (logo+pill)
+     *   frame_flush_seen                          → product present owns console
+     * No content/sparsity/boot-stage sticky cutover. Early latch is protocol
+     * (type-11 front writeback same-geom), not a screenshot heuristic.
+     *
+     * Proxy (always-on, not a control input): reims_vgpu_pci_gop_console_proxy logs
+     * whether BAR1 content still changes after we leave it.
+     */
+    boundary = reims_vgpu_pci_present_boundary(s);
+    if (!boundary) {
+        uint32_t mid = 0, w = 0, h = 0, gen = 0;
+        bool early = reims_vgpu_pci_early_scanout_latched(s, &mid, &w, &h, &gen);
+
+        if (early) {
+            /* Re-pull latched front (archive fb_update early path). */
+            if (reims_vgpu_pci_paint_scanout(s, mid, w, h, gen)) {
+                /* painted */
+            } else if (s->new_frame_ready && s->surface) {
+                qemu_console_update_full(s->con);
+                s->new_frame_ready = false;
+            }
+            reims_vgpu_pci_gop_console_proxy(s, false /* not BAR1 sole feed */, false);
+        } else {
+            if (reims_vgpu_pci_copy_early_console(s)) {
+                qemu_console_update_full(s->con);
+                s->new_frame_ready = false;
+            }
+            reims_vgpu_pci_gop_console_proxy(s, true /* early console BAR1/efi */, false);
+        }
+        return true;
+    }
+
+    /* Post-boundary: HostAction apply_scanout paints; re-push if pending. */
+    if (s->new_frame_ready && s->surface) {
+        qemu_console_update_full(s->con);
+        s->new_frame_ready = false;
+    }
+    /* Still fingerprint BAR1 so we can see guest writes after cutover. */
+    reims_vgpu_pci_gop_console_proxy(s, false /* use_bar1 */, true);
+    return true;
+}
+
+static const GraphicHwOps reims_vgpu_pci_fb_ops = {
+    .gfx_update = reims_vgpu_pci_fb_update,
+};
+
+/* ---------- MMIO (forward only) ---------- */
+
+static uint64_t reims_vgpu_pci_gfx_read(void *opaque, hwaddr offset, unsigned size)
+{
+    ReimsVGPUPCIState *s = opaque;
+    uint64_t val = 0;
+
+    if (s->rust_handle == 0) {
+        return 0;
+    }
+    if (reims_vgpu_qemu_gfx_read(s->rust_handle, offset, size, &val) != REIMS_VGPU_QEMU_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: gfx read failed offset=0x%" HWADDR_PRIx " size=%u\n",
+                      TYPE_REIMS_VGPU_PCI, offset, size);
+        return 0;
+    }
+    trace_reims_vgpu_pci_gfx_read(offset, val);
+    return val;
+}
+
+static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
+                              unsigned size)
+{
+    ReimsVGPUPCIState *s = opaque;
+
+    if (s->rust_handle == 0) {
+        return;
+    }
+    trace_reims_vgpu_pci_gfx_write(offset, data);
+    if (reims_vgpu_qemu_gfx_write(s->rust_handle, offset, data, size) != REIMS_VGPU_QEMU_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: gfx write failed offset=0x%" HWADDR_PRIx
+                      " data=0x%" PRIx64 " size=%u\n",
+                      TYPE_REIMS_VGPU_PCI, offset, data, size);
+        return;
+    }
+    /*
+     * Deliver residual HostActions on the MMIO path, but do not run heavy
+     * GPU work under BQL here — Rust schedules BH for pure-host work after
+     * snapshotting guest inputs.
+     */
+    reims_vgpu_pci_deliver_actions(s);
+}
+
+static const MemoryRegionOps reims_vgpu_pci_gfx_ops = {
+    .read = reims_vgpu_pci_gfx_read,
+    .write = reims_vgpu_pci_gfx_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
+};
+
+/* ---------- Lifecycle ---------- */
+
+/*
+ * Stop and destroy the Rust/Vulkan backend before QEMU enters process/driver
+ * teardown.  PCI exit is not guaranteed to run on the main-loop shutdown
+ * path: a guest panic previously left reims-vgpu-pci-drain inside Vulkan execution
+ * while libc exit unloaded NVIDIA EGL, crashing QEMU in libnvidia-eglcore.
+ */
+static void reims_vgpu_pci_stop_backend(ReimsVGPUPCIState *s)
+{
+    if (s->heartbeat_started) {
+        qemu_mutex_lock(&s->heartbeat_mutex);
+        s->heartbeat_stopping = true;
+        qemu_cond_signal(&s->heartbeat_cond);
+        qemu_mutex_unlock(&s->heartbeat_mutex);
+        qemu_thread_join(&s->heartbeat_thread);
+        s->heartbeat_started = false;
+    }
+    if (s->drain_started) {
+        qemu_mutex_lock(&s->drain_mutex);
+        s->drain_stopping = true;
+        qemu_cond_signal(&s->drain_cond);
+        qemu_mutex_unlock(&s->drain_mutex);
+        qemu_thread_join(&s->drain_thread);
+        s->drain_started = false;
+    }
+    if (s->action_bh) {
+        qemu_bh_delete(s->action_bh);
+        s->action_bh = NULL;
+    }
+    if (s->rust_handle != 0) {
+        /*
+         * Close + join the host window first (no-op if none): its Vulkan
+         * objects tear down on the window thread before we proceed, so the
+         * process/driver-unload teardown never races live Vulkan work (the
+         * libnvidia-eglcore crash class the drain teardown already guards).
+         */
+        reims_vgpu_qemu_window_stop(s->rust_handle);
+        reims_vgpu_qemu_device_destroy(s->rust_handle);
+        s->rust_handle = 0;
+    }
+}
+
+static void reims_vgpu_pci_shutdown_notifier(Notifier *n, void *data)
+{
+    ReimsVGPUPCIState *s = container_of(n, ReimsVGPUPCIState,
+                                         shutdown_notifier);
+
+    (void)data;
+    reims_vgpu_pci_stop_backend(s);
+}
+
+static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
+{
+    ReimsVGPUPCIState *s = REIMS_VGPU_PCI(pdev);
+    ReimsVgpuQemuCreateInfo info;
+    ReimsVgpuQemuDevice out = {
+        .abi_version = 0,
+        .struct_size = 0,
+        .handle = 0,
+    };
+    char backend[32];
+    int rc;
+
+    if (reims_vgpu_qemu_abi_version() != REIMS_VGPU_QEMU_ABI_VERSION) {
+        error_setg(errp,
+                   "%s: ABI version mismatch (header %u, staticlib %u)",
+                   TYPE_REIMS_VGPU_PCI, REIMS_VGPU_QEMU_ABI_VERSION,
+                   reims_vgpu_qemu_abi_version());
+        return;
+    }
+
+    memory_region_init_io(&s->iomem_gfx, OBJECT(s), &reims_vgpu_pci_gfx_ops, s,
+                          TYPE_REIMS_VGPU_PCI ".gfx",
+                          REIMS_VGPU_PCI_BAR_SIZE);
+    /* 32-bit non-prefetch BAR (16 KiB control window). Live 2026-07-13: 64-bit
+     * BAR behind pcie-root-port caused Apple efiboot STOP 0x15; keep 32-bit. */
+    pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->iomem_gfx);
+
+    /*
+     * BAR1: host RAM linear framebuffer for UEFI Graphics Output Protocol.
+     * OpenCore/OVMF have no built-in driver for 0x106B:0xEEEE; our PCI option
+     * ROM (or OC Drivers entry) installs GOP with FrameBufferBase = BAR1.
+     * Prefetchable 32-bit MEM so OVMF assigns under 4G (same STOP 0x15 caution).
+     */
+    memory_region_init_ram(&s->fb_vram, OBJECT(s), TYPE_REIMS_VGPU_PCI ".fb",
+                           REIMS_VGPU_PCI_FB_SIZE, &error_fatal);
+    /*
+     * Non-prefetchable 32-bit MEM (same as BAR0 caution). Prefetchable BAR1
+     * was a live suspect for macOS "console relocated" off the display BAR
+     * into system RAM (0xf1000000) while VMware SVGA keeps console on its
+     * VRAM BAR at the same GPA. Host can only follow system-RAM consoles via
+     * EFI FB start (0x1210); pure XNU relocate does not rewrite that reg.
+     */
+    pci_register_bar(pdev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->fb_vram);
+
+    /*
+     * Behind pcie-root-port the endpoint must be a real PCIe function with an
+     * Express capability. Conventional-only devices leave the secondary bus
+     * empty under macOS (guest ioreg: bridge 0:5 only, no 0x106B:0xEEEE).
+     * Mirror bochs-display / virtio-pci.
+     */
+    if (pci_bus_is_express(pci_get_bus(pdev))) {
+        rc = pcie_endpoint_cap_init(pdev, 0x80);
+        if (rc < 0) {
+            error_setg(errp, "%s: pcie_endpoint_cap_init failed",
+                       TYPE_REIMS_VGPU_PCI);
+            return;
+        }
+    } else {
+        pdev->cap_present &= ~QEMU_PCI_CAP_EXPRESS;
+    }
+
+    /* Guest enables MSI count 1; always raise vector 0. */
+    rc = msi_init(pdev, 0x0, 1, true /* 64-bit */, false /* per-vector mask */,
+                  errp);
+    if (rc < 0) {
+        return;
+    }
+
+    s->host_ops = (ReimsVgpuHostOps){
+        .abi_version = REIMS_VGPU_QEMU_ABI_VERSION,
+        .struct_size = sizeof(ReimsVgpuHostOps),
+        .ctx = s,
+        .read_gpa = reims_vgpu_pci_read_gpa,
+        .write_gpa = reims_vgpu_pci_write_gpa,
+        .mono_ns = reims_vgpu_pci_mono_ns,
+        .schedule_bh = reims_vgpu_pci_schedule_bh,
+        .read_kva = reims_vgpu_pci_read_kva,
+        .read_xreg = reims_vgpu_pci_read_xreg,
+        .map_pages = reims_vgpu_pci_map_pages,
+        .unmap_pages = reims_vgpu_pci_unmap_pages,
+        .is_ram_gpa = reims_vgpu_pci_is_ram_gpa,
+        .notify_actions = reims_vgpu_pci_notify_actions,
+        /* map_pages hands back memory_region_get_ram_ptr()+xlat directly and
+         * unmap_pages is a no-op: guest RAM outlives every view. */
+        .map_pages_stable = 1,
+    };
+
+    qemu_mutex_init(&s->drain_mutex);
+    qemu_cond_init(&s->drain_cond);
+    qemu_mutex_init(&s->heartbeat_mutex);
+    qemu_cond_init(&s->heartbeat_cond);
+    s->action_bh = aio_bh_new(qemu_get_aio_context(), reims_vgpu_pci_bh, s);
+
+    info = (ReimsVgpuQemuCreateInfo){
+        .abi_version = REIMS_VGPU_QEMU_ABI_VERSION,
+        .struct_size = sizeof(ReimsVgpuQemuCreateInfo),
+        .host_ops = &s->host_ops,
+        /* x86 Tahoe guest: 4 KiB pages. */
+        .guest_page_shift = REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64,
+    };
+
+    rc = reims_vgpu_qemu_device_create(&info, &out);
+    if (rc != REIMS_VGPU_QEMU_OK || out.handle == 0) {
+        error_setg(errp, "%s: reims_vgpu_qemu_device_create failed (rc=%d)",
+                   TYPE_REIMS_VGPU_PCI, rc);
+        msi_uninit(pdev);
+        qemu_bh_delete(s->action_bh);
+        s->action_bh = NULL;
+        qemu_cond_destroy(&s->heartbeat_cond);
+        qemu_mutex_destroy(&s->heartbeat_mutex);
+        qemu_cond_destroy(&s->drain_cond);
+        qemu_mutex_destroy(&s->drain_mutex);
+        return;
+    }
+    s->rust_handle = out.handle;
+    qemu_thread_create(&s->drain_thread, "reims-vgpu-pci-drain",
+                       reims_vgpu_pci_drain_thread, s, QEMU_THREAD_JOINABLE);
+    s->drain_started = true;
+    qemu_thread_create(&s->heartbeat_thread, "reims-vgpu-pci-heartbeat",
+                       reims_vgpu_pci_heartbeat_thread, s, QEMU_THREAD_JOINABLE);
+    s->heartbeat_started = true;
+    s->shutdown_notifier.notify = reims_vgpu_pci_shutdown_notifier;
+    qemu_register_shutdown_notifier(&s->shutdown_notifier);
+    s->shutdown_notifier_registered = true;
+
+    s->con = qemu_graphic_console_create(DEVICE(pdev), 0, &reims_vgpu_pci_fb_ops, s);
+    reims_vgpu_pci_set_mode(s, REIMS_VGPU_PCI_EFI_W, REIMS_VGPU_PCI_EFI_H);
+    if (s->surface) {
+        memset(surface_data(s->surface), 0,
+               (size_t)surface_stride(s->surface) * REIMS_VGPU_PCI_EFI_H);
+        qemu_console_update_full(s->con);
+    }
+    if (s->con) {
+        qemu_console_set_cursor(s->con, cursor_builtin_hidden());
+        qemu_console_set_mouse(s->con, 0, 0, false);
+    }
+
+    /*
+     * Host-owned presentation window (kb host-window): on unless REIMS_VGPU_WINDOW
+     * disables it (reims_vgpu_pci_window_requested; vm/boot-x86.sh defaults it on for
+     * this device). Rust spawns a winit + VkSurfaceKHR window on its own thread,
+     * the drain publishes finished present frames to it, and window input is
+     * injected
+     * through the neutral Input* prompt-action rail (qemu_input_*, which works
+     * under -display none). All window/present logic lives in the staticlib;
+     * the shim only flips it on. A staticlib built without the host-window
+     * feature returns ERR_STATE here and QEMU's own display stays in charge.
+     */
+    if (reims_vgpu_pci_window_requested()) {
+        int wrc = reims_vgpu_qemu_window_start(s->rust_handle, REIMS_VGPU_PCI_EFI_W,
+                                        REIMS_VGPU_PCI_EFI_H);
+        if (wrc != REIMS_VGPU_QEMU_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: host window unavailable (rc=%d); "
+                          "using QEMU display\n",
+                          TYPE_REIMS_VGPU_PCI, wrc);
+        } else if (memory_region_is_ram(&s->fb_vram)) {
+            /*
+             * Hand the window the BAR1 GOP framebuffer (host RAM) so it shows
+             * UEFI/OpenCore/boot.efi output before the product present path
+             * latches. The pointer is a stable RAMBlock host VA valid for the
+             * device lifetime; the staticlib reads it on the poll path (gated
+             * by protocol console-ownership state, never content).
+             */
+            uint8_t *fb = memory_region_get_ram_ptr(&s->fb_vram);
+
+            if (fb) {
+                reims_vgpu_qemu_window_set_early_fb(
+                    s->rust_handle, fb,
+                    REIMS_VGPU_PCI_EFI_W * REIMS_VGPU_PCI_EFI_BPP,
+                    REIMS_VGPU_PCI_EFI_W, REIMS_VGPU_PCI_EFI_H);
+            }
+        }
+    }
+
+    backend[0] = '\0';
+    reims_vgpu_qemu_backend_name(backend, sizeof(backend));
+    trace_reims_vgpu_pci_realize(s->rust_handle, backend);
+}
+
+static void reims_vgpu_pci_exit(PCIDevice *pdev)
+{
+    ReimsVGPUPCIState *s = REIMS_VGPU_PCI(pdev);
+
+    if (s->shutdown_notifier_registered) {
+        notifier_remove(&s->shutdown_notifier);
+        s->shutdown_notifier_registered = false;
+    }
+    reims_vgpu_pci_stop_backend(s);
+    qemu_cond_destroy(&s->heartbeat_cond);
+    qemu_mutex_destroy(&s->heartbeat_mutex);
+    qemu_cond_destroy(&s->drain_cond);
+    qemu_mutex_destroy(&s->drain_mutex);
+    msi_uninit(pdev);
+    if (s->con) {
+        qemu_graphic_console_close(s->con);
+        s->con = NULL;
+    }
+    s->surface = NULL;
+}
+
+static void reims_vgpu_pci_reset(DeviceState *dev)
+{
+    ReimsVGPUPCIState *s = REIMS_VGPU_PCI(dev);
+
+    if (s->rust_handle != 0) {
+        reims_vgpu_qemu_device_reset(s->rust_handle);
+    }
+    qemu_mutex_lock(&s->drain_mutex);
+    s->drain_pending = false;
+    qemu_mutex_unlock(&s->drain_mutex);
+    s->gop_proxy_last_bar1_fp = 0;
+    s->gop_proxy_last_log_ns = 0;
+    s->gop_proxy_bar1_same = 0;
+    s->gop_proxy_ticks = 0;
+    s->gop_proxy_last_boundary = false;
+    s->gop_proxy_last_use_bar1 = false;
+    s->gop_proxy_have_sample = false;
+    s->new_frame_ready = false;
+    s->gl_scanout_active = false;
+    reims_vgpu_pci_set_mode(s, REIMS_VGPU_PCI_EFI_W, REIMS_VGPU_PCI_EFI_H);
+    if (s->surface && s->con) {
+        memset(surface_data(s->surface), 0,
+               (size_t)surface_stride(s->surface) * REIMS_VGPU_PCI_EFI_H);
+        qemu_console_set_cursor(s->con, cursor_builtin_hidden());
+        qemu_console_set_mouse(s->con, 0, 0, false);
+        s->new_frame_ready = true;
+        qemu_console_update_full(s->con);
+        s->new_frame_ready = false;
+    }
+}
+
+static void reims_vgpu_pci_instance_init(Object *obj)
+{
+    PCIDevice *pdev = PCI_DEVICE(obj);
+
+    /* Required before realize so config space is PCIe-sized (4 KiB). */
+    pdev->cap_present |= QEMU_PCI_CAP_EXPRESS;
+}
+
+static void reims_vgpu_pci_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    (void)data;
+    k->realize = reims_vgpu_pci_realize;
+    k->exit = reims_vgpu_pci_exit;
+    k->vendor_id = REIMS_VGPU_PCI_VENDOR;
+    k->device_id = REIMS_VGPU_PCI_DEVICE;
+    k->revision = 0x00;
+    k->class_id = PCI_CLASS_DISPLAY_VGA;
+    k->subsystem_vendor_id = REIMS_VGPU_PCI_VENDOR;
+    k->subsystem_id = REIMS_VGPU_PCI_DEVICE;
+
+    dc->desc = "Reims vGPU (PCI thin shim -> reims-vgpu)";
+    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    dc->hotpluggable = false;
+    dc->user_creatable = true;
+    device_class_set_legacy_reset(dc, reims_vgpu_pci_reset);
+}
+
+static const TypeInfo reims_vgpu_pci_info = {
+    .name = TYPE_REIMS_VGPU_PCI,
+    .parent = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(ReimsVGPUPCIState),
+    .instance_init = reims_vgpu_pci_instance_init,
+    .class_init = reims_vgpu_pci_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_PCIE_DEVICE },
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
+static void reims_vgpu_pci_register_types(void)
+{
+    type_register_static(&reims_vgpu_pci_info);
+}
+
+type_init(reims_vgpu_pci_register_types)

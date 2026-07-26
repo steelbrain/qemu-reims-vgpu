@@ -65,6 +65,85 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
 
+if config_all_devices.has_key('CONFIG_REIMS_VGPU')
+  # Thin QEMU C device links host/reims-vgpu (Cargo staticlib). Backend is a
+  # configure-time choice (REIMS_VGPU_BACKEND=metal|vulkan, default metal) baked into
+  # the binary — one backend per boot, never a runtime env sniff.
+  # Sources live in the parent repo (host/), one directory above this submodule.
+  # On non-Apple hosts, backend-metal builds the Rust host stubs (no frameworks).
+  reims_vgpu_host_dir = meson.global_source_root() / '..'
+  reims_vgpu_abi_header_dir = reims_vgpu_host_dir / 'reims-vgpu' / 'include'
+  reims_vgpu_backend_kind = run_command(find_program('sh'), '-c',
+    'printf %s "${REIMS_VGPU_BACKEND:-metal}"', check: true).stdout().strip()
+  cargo = find_program('cargo')
+  # Rust staticlib always needs these on Unix; Apple frameworks only on Darwin.
+  reims_vgpu_rust_sys_libs = ['-lm', '-ldl', '-lpthread']
+  if host_os == 'darwin'
+    reims_vgpu_rust_sys_libs += ['-liconv']
+  endif
+  if reims_vgpu_backend_kind == 'metal'
+    reims_vgpu_cargo_features = '--features backend-metal'
+    if host_os == 'darwin'
+      reims_vgpu_link_args = [
+        '-framework', 'Metal',
+        '-framework', 'Foundation',
+        '-framework', 'QuartzCore',
+        '-framework', 'CoreGraphics',
+        '-lobjc',
+      ] + reims_vgpu_rust_sys_libs
+    else
+      # Host metal stubs: no Apple frameworks.
+      reims_vgpu_link_args = reims_vgpu_rust_sys_libs
+    endif
+  elif reims_vgpu_backend_kind == 'vulkan'
+    # host-window adds the Rust-owned winit + VkSurfaceKHR presentation window
+    # (kb host-window), opt-in at runtime behind REIMS_VGPU_WINDOW. Always built into
+    # the vulkan binary; reims_vgpu_qemu_window_start returns ERR_STATE if unused.
+    reims_vgpu_cargo_features = '--no-default-features --features backend-vulkan,host-window'
+    # ash loads the Vulkan loader at runtime; no link-time Vulkan dep.
+    if host_os == 'darwin'
+      # winit/raw-window-metal link against the native macOS windowing stack even
+      # when REIMS_VGPU_WINDOW is off at runtime. Keep the Rust staticlib dependency
+      # self-contained so a Darwin Vulkan QEMU link does not depend on Cocoa
+      # already being enabled elsewhere in QEMU.
+      reims_vgpu_link_args = [
+        '-framework', 'AppKit',
+        '-framework', 'ApplicationServices',
+        '-framework', 'Carbon',
+        '-framework', 'CoreFoundation',
+        '-framework', 'CoreGraphics',
+        '-framework', 'CoreVideo',
+        '-framework', 'Foundation',
+        '-framework', 'Metal',
+        '-framework', 'QuartzCore',
+        '-lobjc',
+      ] + reims_vgpu_rust_sys_libs
+    else
+      # Linux window backends are loaded by winit/ash-window at runtime.
+      reims_vgpu_link_args = reims_vgpu_rust_sys_libs
+    endif
+  else
+    error('unknown REIMS_VGPU_BACKEND: ' + reims_vgpu_backend_kind + ' (metal | vulkan)')
+  endif
+  reims_vgpu_built = reims_vgpu_host_dir / 'target' / 'release' / 'libreims_vgpu.a'
+  reims_vgpu_a = custom_target('reims-vgpu-staticlib',
+    output: 'libreims_vgpu.a',
+    console: true,
+    build_always_stale: true,
+    command: [find_program('sh'), '-c',
+      '"' + cargo.full_path() + '" build --release --manifest-path "' +
+      reims_vgpu_host_dir + '/Cargo.toml" -p reims-vgpu ' + reims_vgpu_cargo_features +
+      ' && ( cmp -s "' + reims_vgpu_built + '" "@OUTPUT@" || cp "' +
+      reims_vgpu_built + '" "@OUTPUT@" )'])
+  # Header lives outside the qemu submodule tree; use compile_args -I.
+  reims_vgpu_dep = declare_dependency(
+    link_with: reims_vgpu_a,
+    link_args: reims_vgpu_link_args,
+    compile_args: ['-I' + reims_vgpu_abi_header_dir])
+  system_ss.add(when: 'CONFIG_REIMS_VGPU',
+    if_true: [files('reims-vgpu-mmio.c', 'reims-vgpu-pci.c'), reims_vgpu_dep])
+endif
+
 if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   virtio_gpu_ss = ss.source_set()
   virtio_gpu_ss.add(when: 'CONFIG_VIRTIO_GPU',
