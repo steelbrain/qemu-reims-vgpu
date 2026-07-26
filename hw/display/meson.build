@@ -66,13 +66,12 @@ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
 
 if config_all_devices.has_key('CONFIG_REIMS_VGPU')
-  # Thin QEMU C device links host/reims-vgpu (Cargo staticlib). Backend is a
+  # Thin QEMU C device links crates/reims-vgpu (Cargo staticlib). Backend is a
   # configure-time choice (REIMS_VGPU_BACKEND=metal|vulkan, default metal) baked into
   # the binary — one backend per boot, never a runtime env sniff.
-  # Sources live in the parent repo (host/), one directory above this submodule.
-  # On non-Apple hosts, backend-metal builds the Rust host stubs (no frameworks).
-  reims_vgpu_host_dir = meson.global_source_root() / '..'
-  reims_vgpu_abi_header_dir = reims_vgpu_host_dir / 'reims-vgpu' / 'include'
+  # Sources live in the parent repo, two directories above this vendored submodule.
+  reims_vgpu_repo_dir = meson.global_source_root() / '..' / '..'
+  reims_vgpu_abi_header_dir = reims_vgpu_repo_dir / 'crates' / 'reims-vgpu' / 'include'
   reims_vgpu_backend_kind = run_command(find_program('sh'), '-c',
     'printf %s "${REIMS_VGPU_BACKEND:-metal}"', check: true).stdout().strip()
   cargo = find_program('cargo')
@@ -125,14 +124,14 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
   else
     error('unknown REIMS_VGPU_BACKEND: ' + reims_vgpu_backend_kind + ' (metal | vulkan)')
   endif
-  reims_vgpu_built = reims_vgpu_host_dir / 'target' / 'release' / 'libreims_vgpu.a'
+  reims_vgpu_built = reims_vgpu_repo_dir / 'target' / 'release' / 'libreims_vgpu.a'
   reims_vgpu_a = custom_target('reims-vgpu-staticlib',
     output: 'libreims_vgpu.a',
     console: true,
     build_always_stale: true,
     command: [find_program('sh'), '-c',
       '"' + cargo.full_path() + '" build --release --manifest-path "' +
-      reims_vgpu_host_dir + '/Cargo.toml" -p reims-vgpu ' + reims_vgpu_cargo_features +
+      reims_vgpu_repo_dir + '/Cargo.toml" -p reims-vgpu ' + reims_vgpu_cargo_features +
       ' && ( cmp -s "' + reims_vgpu_built + '" "@OUTPUT@" || cp "' +
       reims_vgpu_built + '" "@OUTPUT@" )'])
   # Header lives outside the qemu submodule tree; use compile_args -I.

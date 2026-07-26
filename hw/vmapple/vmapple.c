@@ -218,7 +218,7 @@ static void create_gfx(VMAppleMachineState *vms, MemoryRegion *mem)
     /*
      * The platform's fixed REIMS_VGPU_GFX/REIMS_VGPU_IOSFC slots are backed by either
      * apple-gfx-mmio (ParavirtualizedGraphics.framework host side, reference)
-     * or reims-vgpu-mmio (product: thin C → host/reims-vgpu Rust staticlib).
+     * or reims-vgpu-mmio (product: thin C → crates/reims-vgpu Rust staticlib).
      * Sysbus layout: mmio 0/irq 0 = gfx window, mmio 1/irq 1 = IOSurface mapper.
      */
     gfx_dev = qdev_new(vms->gfx_device);

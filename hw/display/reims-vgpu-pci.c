@@ -4,7 +4,7 @@
  * Type name: reims-vgpu-pci (PCI IDs vendor 0x106B / device 0xEEEE).
  * Sibling of reims-vgpu-mmio (sysbus/vmapple): same HostOps + Rust staticlib
  * boundary. C owns only PCI/QOM/BAR/MSI/console/BH — no protocol or GPU logic
- * Product behaviour lives in host/reims-vgpu.
+ * Product behaviour lives in crates/reims-vgpu.
  *
  * Topology: -vga none + pcie-root-port (non-zero bus) + this device;
  * class VGA 0x030000; MSI vector 0; BAR0 16 KiB (control +0x1000).
