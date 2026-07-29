@@ -88,9 +88,6 @@ struct ReimsVGPUMMIOState {
     /* Display (apple-gfx console role only). */
     QemuConsole *con;
     DisplaySurface *surface;
-    bool surface_gpu_direct;
-    uint64_t surface_buffer_len;
-    GPtrArray *scanout_buffers;
     /*
      * Guest frame-ready (archive apple-pv-gpu present-boundary policy +
      * apple-gfx new_frame_ready). Set when CmdDisplaySwap / early front paint
@@ -450,64 +447,11 @@ static void reims_vgpu_mmio_set_mode(ReimsVGPUMMIOState *s, uint32_t width,
     }
 
     s->surface = qemu_create_displaysurface(width, height);
-    s->surface_gpu_direct = false;
-    s->surface_buffer_len = 0;
     if (s->con) {
         /* apple-gfx: set_surface alone; cocoa switchSurface resizes the window. */
         qemu_console_set_surface(s->con, s->surface);
     }
     trace_reims_vgpu_mmio_mode_change(width, height);
-}
-
-/*
- * Install an aligned stable host buffer as the QEMU surface backing. Rust owns
- * the resident-to-buffer GPU copy; this shim only allocates and attaches the
- * DisplaySurface. Buffers are retained until teardown because Vulkan caches
- * their external-host-memory imports.
- */
-static bool reims_vgpu_mmio_set_gpu_mode(ReimsVGPUMMIOState *s,
-                                       uint32_t width, uint32_t height)
-{
-    DisplaySurface *surface;
-    uint64_t alignment;
-    uint64_t stride;
-    uint64_t frame_len;
-    uint64_t alloc_len;
-    void *data;
-    int rc;
-
-    if (s->surface_gpu_direct && s->surface &&
-        surface_width(s->surface) == width &&
-        surface_height(s->surface) == height) {
-        return true;
-    }
-    rc = reims_vgpu_qemu_scanout_host_alignment(s->rust_handle, &alignment);
-    if (rc != REIMS_VGPU_QEMU_OK || alignment == 0 ||
-        (alignment & (alignment - 1)) != 0) {
-        return false;
-    }
-    stride = (uint64_t)width * 4;
-    frame_len = stride * height;
-    if (stride > INT_MAX || frame_len == 0 ||
-        frame_len > SIZE_MAX - (alignment - 1)) {
-        return false;
-    }
-    alloc_len = (frame_len + alignment - 1) & ~(alignment - 1);
-    if (alloc_len > SIZE_MAX) {
-        return false;
-    }
-    data = qemu_memalign((size_t)alignment, (size_t)alloc_len);
-    memset(data, 0, (size_t)alloc_len);
-    g_ptr_array_add(s->scanout_buffers, data);
-    surface = qemu_create_displaysurface_from(width, height,
-                                              PIXMAN_x8r8g8b8,
-                                              (int)stride, data);
-    s->surface = surface;
-    s->surface_gpu_direct = true;
-    s->surface_buffer_len = alloc_len;
-    qemu_console_set_surface(s->con, surface);
-    trace_reims_vgpu_mmio_mode_change(width, height);
-    return true;
 }
 
 /*
@@ -536,28 +480,22 @@ static void reims_vgpu_mmio_apply_scanout(ReimsVGPUMMIOState *s,
         return;
     }
 
-    if (!reims_vgpu_mmio_set_gpu_mode(s, width, height)) {
-        reims_vgpu_mmio_set_mode(s, width, height);
-    }
+    /*
+     * One surface path. There used to be two: reims_vgpu_mmio_set_gpu_mode
+     * allocated an alignment-negotiated buffer, attached it as the
+     * DisplaySurface backing, and handed it to Rust for a resident-to-buffer
+     * GPU copy so no framebuffer bytes crossed the CPU. Its alignment came
+     * from VK_EXT_external_memory_host, which is no longer requested, and the
+     * buffers had to be retained until teardown because the engine cached
+     * their imports. Both the retention and the import are gone.
+     */
+    reims_vgpu_mmio_set_mode(s, width, height);
     if (!s->surface) {
         return;
     }
 
     dst = surface_data(s->surface);
     stride = surface_stride(s->surface);
-    if (s->surface_gpu_direct) {
-        rc = reims_vgpu_qemu_scanout_gpu_copy(s->rust_handle, mapping_id, dst,
-                                       s->surface_buffer_len, stride, width,
-                                       height, generation);
-        if (rc == REIMS_VGPU_QEMU_OK) {
-            trace_reims_vgpu_mmio_scanout(mapping_id, width, height);
-            s->new_frame_ready = true;
-            return;
-        }
-        if (rc == REIMS_VGPU_QEMU_EMPTY) {
-            return;
-        }
-    }
     rc = reims_vgpu_qemu_scanout_copy(s->rust_handle, mapping_id, dst, stride,
                                width, height, generation);
     if (rc != REIMS_VGPU_QEMU_OK && rc != REIMS_VGPU_QEMU_EMPTY) {
@@ -1007,13 +945,10 @@ static void reims_vgpu_mmio_init(Object *obj)
     s->rust_handle = 0;
     s->con = NULL;
     s->surface = NULL;
-    s->surface_gpu_direct = false;
-    s->surface_buffer_len = 0;
     s->new_frame_ready = false;
     s->poll_timer = NULL;
     s->stable_aliases = g_array_new(false, false,
                                     sizeof(ReimsVGPUMMIOAlias));
-    s->scanout_buffers = g_ptr_array_new_with_free_func(qemu_vfree);
     memset(&s->host_ops, 0, sizeof(s->host_ops));
 }
 
@@ -1132,10 +1067,7 @@ static void reims_vgpu_mmio_unrealize(DeviceState *dev)
     if (s->con) {
         qemu_console_set_surface(s->con, NULL);
     }
-    g_clear_pointer(&s->scanout_buffers, g_ptr_array_unref);
     s->surface = NULL;
-    s->surface_gpu_direct = false;
-    s->surface_buffer_len = 0;
 }
 
 static void reims_vgpu_mmio_reset(DeviceState *dev)
