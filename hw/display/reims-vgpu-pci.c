@@ -33,9 +33,7 @@
 #include "system/runstate.h"
 #include "ui/console.h"
 #include "ui/surface.h"
-#include "ui/dmabuf.h"
 #include "ui/input.h"
-#include "standard-headers/drm/drm_fourcc.h"
 #include "trace.h"
 #include "reims_vgpu_qemu_abi.h"
 
@@ -70,11 +68,6 @@ struct ReimsVGPUPCIState {
     QemuConsole *con;
     DisplaySurface *surface;
     bool new_frame_ready;
-    /*
-     * Deprecated pre-host-window GL/dmabuf bridge latch. The product path is the
-     * Rust host window; this remains only for historical probe compatibility.
-     */
-    bool gl_scanout_active;
 
     /*
      * Always-on console-ownership proxy state (/tmp/reims-vgpu-gop-console.log).
@@ -647,13 +640,6 @@ static void reims_vgpu_pci_apply_scanout(ReimsVGPUPCIState *s, uint32_t mapping_
      *   must not steal the QEMU surface from BAR1/efi PE log console.
      * - Post-boundary (frame_flush_seen): product present owns the console.
      */
-    /*
-     * Historical GL/dmabuf bridge: once it has taken over the QEMU console, do
-     * not paint the CPU DisplaySurface underneath it.
-     */
-    if (s->gl_scanout_active) {
-        return;
-    }
     if (!reims_vgpu_pci_present_boundary(s)) {
         uint32_t mid = 0, w = 0, h = 0, gen = 0;
 
@@ -663,54 +649,6 @@ static void reims_vgpu_pci_apply_scanout(ReimsVGPUPCIState *s, uint32_t mapping_
         }
     }
     (void)reims_vgpu_pci_paint_scanout(s, mapping_id, width, height, generation);
-}
-
-/*
- * Deprecated pre-host-window GL/dmabuf bridge: import an exported present dmabuf
- * into QEMU's console GL context. The supported product path is the Rust host
- * window/direct-present route; keep this shim thin and do not extend it for fps
- * work unless explicitly doing historical investigation. `fd` is owned here and
- * closed after import/fallback.
- */
-static void reims_vgpu_pci_scanout_gl(ReimsVGPUPCIState *s, int fd, uint32_t stride,
-                               uint32_t width, uint32_t height, uint32_t fourcc)
-{
-    QemuDmaBuf *dmabuf;
-    uint32_t offset = 0;
-    int32_t fds[1];
-
-    if (fd < 0) {
-        return;
-    }
-    if (!s->con || !qemu_console_has_gl(s->con) || width == 0 || height == 0) {
-        close(fd);
-        return;
-    }
-    /*
-     * Historical egl-headless / gtk gl=on bridge: size QEMU's DisplaySurface
-     * before GL update so its console readback is not wrong-sized.
-     */
-    reims_vgpu_pci_set_mode(s, width, height);
-
-    fds[0] = fd;
-    /* Single LINEAR plane at offset 0; modifier implicit DRM_FORMAT_MOD_LINEAR. */
-    dmabuf = qemu_dmabuf_new(width, height, &offset, &stride, 0, 0,
-                             width, height, fourcc, DRM_FORMAT_MOD_LINEAR,
-                             fds, 1, false, /* y0_top */ true);
-    qemu_console_gl_scanout_dmabuf(s->con, dmabuf);
-    qemu_console_gl_update(s->con, 0, 0, width, height);
-    qemu_console_gl_release_dmabuf(s->con, dmabuf);
-    qemu_dmabuf_free(dmabuf);
-    close(fd);
-
-    /*
-     * Once GL owns the console, the CPU SCANOUT path must stop painting the
-     * DisplaySurface underneath it (else it thrashes SCANOUT_SURFACE vs
-     * SCANOUT_DMABUF each present). Latch here rather than up front because
-     * egl-headless registers the GL ctx at init — so console_has_gl is already
-     * true during the EFI/boot frames that legitimately paint via CPU.
-     */
-    s->gl_scanout_active = true;
 }
 
 /*
@@ -827,13 +765,6 @@ static void reims_vgpu_pci_apply_action(ReimsVGPUPCIState *s, const ReimsVgpuHos
     case REIMS_VGPU_HOST_ACTION_SCANOUT:
         reims_vgpu_pci_apply_scanout(s, (uint32_t)a->a0, (uint32_t)a->a1,
                               (uint32_t)a->a2, (uint32_t)a->a3);
-        break;
-    case REIMS_VGPU_HOST_ACTION_SCANOUT_GL:
-        /* a0 = dmabuf fd, a1 = row_pitch, a2 = (width << 32) | height,
-         * a3 = DRM fourcc; modifier implicit DRM_FORMAT_MOD_LINEAR. */
-        reims_vgpu_pci_scanout_gl(s, (int)(int32_t)a->a0, (uint32_t)a->a1,
-                           (uint32_t)(a->a2 >> 32),
-                           (uint32_t)(a->a2 & 0xffffffffu), (uint32_t)a->a3);
         break;
     case REIMS_VGPU_HOST_ACTION_CURSOR:
         if (s->con) {
@@ -1358,7 +1289,6 @@ static void reims_vgpu_pci_reset(DeviceState *dev)
     s->gop_proxy_last_use_bar1 = false;
     s->gop_proxy_have_sample = false;
     s->new_frame_ready = false;
-    s->gl_scanout_active = false;
     reims_vgpu_pci_set_mode(s, REIMS_VGPU_PCI_EFI_W, REIMS_VGPU_PCI_EFI_H);
     if (s->surface && s->con) {
         memset(surface_data(s->surface), 0,
