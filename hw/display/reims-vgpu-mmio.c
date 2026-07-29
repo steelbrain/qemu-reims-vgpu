@@ -72,10 +72,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUMMIOState, REIMS_VGPU_MMIO)
 /* Rust device/window action poll cadence (250 Hz, non-blocking). */
 #define REIMS_VGPU_MMIO_WINDOW_POLL_MS 4
 
-typedef struct ReimsVGPUMMIOAlias {
+/*
+ * One packed mach_vm_remap view handed out by map_pages, and the length it was
+ * allocated at. The length is recorded because unmap_pages cannot trust the
+ * caller's: a run whose first page is entered at an offset asks to release
+ * fewer bytes than the view spans, and mach_vm_deallocate takes the allocation.
+ */
+typedef struct ReimsVGPUMMIOPageView {
     void *ptr;
     size_t len;
-} ReimsVGPUMMIOAlias;
+} ReimsVGPUMMIOPageView;
 
 struct ReimsVGPUMMIOState {
     SysBusDevice parent_obj;
@@ -104,10 +110,14 @@ struct ReimsVGPUMMIOState {
     /* Opaque handle from reims_vgpu_qemu_device_create; 0 when unrealized. */
     uint64_t rust_handle;
     /*
-     * Fragmented mach_vm_remap views retained while Rust may hold cached
-     * VK_EXT_external_memory_host imports. Freed only after Rust teardown.
+     * Live packed mach_vm_remap views, so unmap_pages can tell one of ours
+     * from a direct RAMBlock HVA — the two are indistinguishable as bare
+     * pointers, and mach_vm_deallocate on the latter would unmap guest RAM
+     * out from under the VM. Entries are removed as they are released; a
+     * non-empty array at teardown is a leak, and reims_vgpu_mmio_free_page_views
+     * says so.
      */
-    GArray *stable_aliases;
+    GArray *page_views;
 };
 
 #if defined(CONFIG_DARWIN)
@@ -242,10 +252,16 @@ static int reims_vgpu_mmio_read_xreg(void *ctx, uint32_t index, uint64_t *out)
  * VA). The view aliases guest RAM: Metal render targets created on it write
  * guest memory directly, so there is exactly ONE copy of surface content.
  *
- * A host-contiguous page run returns its direct RAMBlock HVA. A fragmented
- * list gets one packed mach_vm_remap alias retained until Rust has destroyed
- * its cached Vulkan imports. Both pointer kinds are stable for the device
- * lifetime; unmap_pages is intentionally a no-op.
+ * A host-contiguous page run returns its direct RAMBlock HVA, which is guest
+ * RAM itself and outlives every view. A fragmented list gets one packed
+ * mach_vm_remap view, which the caller owns and must release through
+ * unmap_pages.
+ *
+ * The view used to be retained for the whole device lifetime instead, because
+ * Rust cached VK_EXT_external_memory_host imports over it and could re-read the
+ * pages at any later point. Nothing imports guest pages now, so the retention
+ * bought nothing and every fragmented map leaked a VA reservation until
+ * teardown. `map_pages_stable` is 0 accordingly.
  *
  * Non-Darwin hosts: fail closed (no mach_vm); type-11 writeback uses GPA
  * copies through HostOps until a Linux aliasing path lands.
@@ -258,7 +274,7 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
     uint8_t **hvas = NULL;
     mach_vm_address_t view = 0;
     mach_vm_size_t view_len;
-    ReimsVGPUMMIOAlias alias;
+    ReimsVGPUMMIOPageView view_entry;
     kern_return_t kr;
     size_t i;
 
@@ -324,9 +340,9 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
     }
 
     *out_ptr = (void *)(uintptr_t)view;
-    alias.ptr = *out_ptr;
-    alias.len = view_len;
-    g_array_append_val(s->stable_aliases, alias);
+    view_entry.ptr = *out_ptr;
+    view_entry.len = view_len;
+    g_array_append_val(s->page_views, view_entry);
     g_free(hvas);
     return 0;
 
@@ -343,29 +359,69 @@ fail:
 #endif
 }
 
+/*
+ * Release a view map_pages handed out. A pointer that is not in `page_views` is
+ * a direct RAMBlock HVA — guest RAM itself — and must be left alone; there is
+ * nothing to free and deallocating it would unmap the guest's own memory.
+ *
+ * `len` is deliberately ignored in favour of the recorded allocation length.
+ * The caller passes the span it asked for, and a run entered at a page offset
+ * asks for fewer bytes than the view covers.
+ */
 static void reims_vgpu_mmio_unmap_pages(void *ctx, void *ptr, size_t len)
 {
+#if defined(CONFIG_DARWIN)
+    ReimsVGPUMMIOState *s = ctx;
+    size_t i;
+
+    (void)len;
+    if (!s || !ptr || !s->page_views) {
+        return;
+    }
+    for (i = 0; i < s->page_views->len; i++) {
+        ReimsVGPUMMIOPageView *view =
+            &g_array_index(s->page_views, ReimsVGPUMMIOPageView, i);
+        if (view->ptr == ptr) {
+            mach_vm_deallocate(mach_task_self(),
+                               (mach_vm_address_t)(uintptr_t)ptr, view->len);
+            g_array_remove_index_fast(s->page_views, i);
+            return;
+        }
+    }
+#else
     (void)ctx;
     (void)ptr;
     (void)len;
+#endif
 }
 
-static void reims_vgpu_mmio_free_stable_aliases(ReimsVGPUMMIOState *s)
+/*
+ * Teardown backstop. Every view should already have been released by
+ * unmap_pages, so anything still here is a caller that mapped and never freed —
+ * reclaim it, but say so rather than reclaiming quietly, because the silent
+ * version of this function is what hid the leak that made it necessary.
+ */
+static void reims_vgpu_mmio_free_page_views(ReimsVGPUMMIOState *s)
 {
 #if defined(CONFIG_DARWIN)
     size_t i;
 
-    if (!s->stable_aliases) {
+    if (!s->page_views) {
         return;
     }
-    for (i = 0; i < s->stable_aliases->len; i++) {
-        ReimsVGPUMMIOAlias *alias =
-            &g_array_index(s->stable_aliases, ReimsVGPUMMIOAlias, i);
-        mach_vm_deallocate(mach_task_self(),
-                           (mach_vm_address_t)(uintptr_t)alias->ptr,
-                           alias->len);
+    if (s->page_views->len != 0) {
+        qemu_log_mask(LOG_UNIMP,
+                      "%s: %u guest page view(s) still mapped at teardown\n",
+                      TYPE_REIMS_VGPU_MMIO, s->page_views->len);
     }
-    g_array_set_size(s->stable_aliases, 0);
+    for (i = 0; i < s->page_views->len; i++) {
+        ReimsVGPUMMIOPageView *view =
+            &g_array_index(s->page_views, ReimsVGPUMMIOPageView, i);
+        mach_vm_deallocate(mach_task_self(),
+                           (mach_vm_address_t)(uintptr_t)view->ptr,
+                           view->len);
+    }
+    g_array_set_size(s->page_views, 0);
 #else
     (void)s;
 #endif
@@ -947,8 +1003,8 @@ static void reims_vgpu_mmio_init(Object *obj)
     s->surface = NULL;
     s->new_frame_ready = false;
     s->poll_timer = NULL;
-    s->stable_aliases = g_array_new(false, false,
-                                    sizeof(ReimsVGPUMMIOAlias));
+    s->page_views = g_array_new(false, false,
+                                sizeof(ReimsVGPUMMIOPageView));
     memset(&s->host_ops, 0, sizeof(s->host_ops));
 }
 
@@ -985,7 +1041,13 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
         .map_pages = reims_vgpu_mmio_map_pages,
         .unmap_pages = reims_vgpu_mmio_unmap_pages,
         .is_ram_gpa = reims_vgpu_mmio_is_ram_gpa,
-        .map_pages_stable = 1,
+        /*
+         * 0: a fragmented list gets a packed mach_vm_remap view whose lifetime
+         * the caller owns and ends through unmap_pages. Only a pointer that
+         * needs no release at all may claim 1, and this shim cannot promise
+         * that without knowing the run was host-contiguous.
+         */
+        .map_pages_stable = 0,
     };
 
     info = (ReimsVgpuQemuCreateInfo){
@@ -1062,8 +1124,8 @@ static void reims_vgpu_mmio_unrealize(DeviceState *dev)
         reims_vgpu_mmio_window_owner = NULL;
     }
 #endif
-    reims_vgpu_mmio_free_stable_aliases(s);
-    g_clear_pointer(&s->stable_aliases, g_array_unref);
+    reims_vgpu_mmio_free_page_views(s);
+    g_clear_pointer(&s->page_views, g_array_unref);
     if (s->con) {
         qemu_console_set_surface(s->con, NULL);
     }
@@ -1077,7 +1139,7 @@ static void reims_vgpu_mmio_reset(DeviceState *dev)
     if (s->rust_handle != 0) {
         reims_vgpu_qemu_device_reset(s->rust_handle);
     }
-    reims_vgpu_mmio_free_stable_aliases(s);
+    reims_vgpu_mmio_free_page_views(s);
     /* Edge-triggered completion IRQs; leave lines deasserted at reset. */
     qemu_set_irq(s->irq_gfx, 0);
     qemu_set_irq(s->irq_iosfc, 0);

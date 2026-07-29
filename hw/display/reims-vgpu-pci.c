@@ -1152,8 +1152,19 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .unmap_pages = reims_vgpu_pci_unmap_pages,
         .is_ram_gpa = reims_vgpu_pci_is_ram_gpa,
         .notify_actions = reims_vgpu_pci_notify_actions,
-        /* map_pages hands back memory_region_get_ram_ptr()+xlat directly and
-         * unmap_pages is a no-op: guest RAM outlives every view. */
+        /*
+         * 1: this shim never allocates. map_pages refuses anything that is not
+         * a packed host-contiguous run and otherwise hands back
+         * memory_region_get_ram_ptr()+xlat — guest RAM itself, which outlives
+         * every caller — so unmap_pages has nothing to free and a caller may
+         * hold the pointer for the device lifetime.
+         *
+         * The flag used to also license retaining the pointer inside a cached
+         * VK_EXT_external_memory_host import. It does not any more: nothing
+         * imports guest pages. What is left is the narrower claim that no
+         * release is owed, which is why the MMIO shim answers 0 — it can hand
+         * out a mach_vm_remap view, and that one has to be released.
+         */
         .map_pages_stable = 1,
     };
 
