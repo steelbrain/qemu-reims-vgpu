@@ -55,6 +55,27 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token);
 uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token);
 
 /*
+ * Which pages of the set were written, not just whether any were.
+ *
+ * Fills `out` with the page-aligned GPAs of `token`'s set whose most recent
+ * observed write is newer than `since_gen`, and returns how many. `since_gen`
+ * is a value a caller previously read from reims_vgpu_dirty_gen() and recorded
+ * next to a host-side copy of the pages.
+ *
+ * Returns -1 for every case where the answer is not knowable and the caller must
+ * assume the whole set was written: an unknown token, a token whose generation
+ * is still unreadable, a `since_gen` of 0 (no recorded observation to compare
+ * against), or a set with more written pages than `max` can hold. A truncated
+ * list would say "these pages and no others", which is the one answer that turns
+ * a conservative caller into a wrong one.
+ *
+ * Safe from any thread.
+ */
+int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
+                                       uint64_t since_gen, uint64_t *out,
+                                       size_t max);
+
+/*
  * Fold the hypervisor bitmap into every tracked set. **BQL thread only** —
  * this enables MemoryRegion dirty logging and drives the accelerator's
  * log_sync, neither of which is safe off the main thread.

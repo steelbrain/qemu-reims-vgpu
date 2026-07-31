@@ -298,6 +298,15 @@ static uint64_t reims_vgpu_pci_guest_write_gen(void *ctx, uint64_t token)
     return reims_vgpu_dirty_gen(s->dirty, token);
 }
 
+static int64_t reims_vgpu_pci_guest_written_pages(void *ctx, uint64_t token,
+                                         uint64_t since_gen, uint64_t *out,
+                                         size_t max)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    return reims_vgpu_dirty_written_since(s->dirty, token, since_gen, out, max);
+}
+
 /* 1 = guest RAM, 0 = not (MMIO / ROM / unmapped). Mapper page-entry accept. */
 static int reims_vgpu_pci_is_ram_gpa(void *ctx, uint64_t gpa)
 {
@@ -1213,6 +1222,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
+        .guest_written_pages = reims_vgpu_pci_guest_written_pages,
     };
     s->dirty = reims_vgpu_dirty_new();
 

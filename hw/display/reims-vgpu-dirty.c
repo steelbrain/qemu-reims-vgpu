@@ -32,6 +32,14 @@ typedef struct ReimsVgpuDirtySlice {
 /* A tracked page set: one mapping incarnation's guest storage. */
 typedef struct ReimsVgpuDirtySet {
     uint64_t *pages;        /* sorted, deduplicated, page-aligned */
+    /*
+     * Parallel to `pages`: the value `gen` took at the harvest that last saw
+     * this page written, or 0 for a page never seen written. A set-level
+     * generation can only say "something in here moved", which forces a reader
+     * holding a whole-surface copy to discard all of it; this is what lets it
+     * discard exactly the pages that moved.
+     */
+    uint64_t *page_gen;
     size_t count;
     uint64_t page_size;
     uint64_t gen;           /* 0 until armed */
@@ -82,6 +90,7 @@ static void reims_vgpu_dirty_set_free(gpointer p)
     ReimsVgpuDirtySet *s = p;
 
     g_free(s->pages);
+    g_free(s->page_gen);
     g_free(s);
 }
 
@@ -185,6 +194,7 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
 
     s = g_new0(ReimsVgpuDirtySet, 1);
     s->pages = pages;
+    s->page_gen = g_new0(uint64_t, n);
     s->count = n;
     s->page_size = page_size;
 
@@ -240,6 +250,50 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
     d->reads_since_harvest++;
     qemu_mutex_unlock(&d->lock);
     return gen;
+}
+
+int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
+                                       uint64_t since_gen, uint64_t *out,
+                                       size_t max)
+{
+    ReimsVgpuDirtySet *s;
+    int64_t found = 0;
+    size_t p;
+
+    if (!d || token == 0 || out == NULL) {
+        return -1;
+    }
+    qemu_mutex_lock(&d->lock);
+    s = g_hash_table_lookup(d->sets, &token);
+    /*
+     * `since_gen == 0` is a caller that never recorded a readable observation,
+     * and `s->gen == 0` is a set still inside its startup window. Neither can
+     * be compared against a page stamp, and both mean the same thing to the
+     * caller as an unknown token does.
+     */
+    if (!s || s->gen == 0 || since_gen == 0) {
+        qemu_mutex_unlock(&d->lock);
+        return -1;
+    }
+    for (p = 0; p < s->count; p++) {
+        if (s->page_gen[p] <= since_gen) {
+            continue;
+        }
+        if ((size_t)found == max) {
+            /* Truncation would read as "these pages and no others". */
+            qemu_mutex_unlock(&d->lock);
+            return -1;
+        }
+        out[found++] = s->pages[p];
+    }
+    /*
+     * Counted like reims_vgpu_dirty_gen(): a caller asking this question is a
+     * consumer of the report, so the next harvest has something to tell it and
+     * must not be skipped.
+     */
+    d->reads_since_harvest++;
+    qemu_mutex_unlock(&d->lock);
+    return found;
 }
 
 /*
@@ -316,6 +370,7 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
 {
     ReimsVgpuDirtySlice slices[REIMS_VGPU_DIRTY_MAX_SLICES];
     g_autoptr(GArray) written = NULL;
+    g_autoptr(GArray) hit = NULL;
     GHashTableIter it;
     gpointer key, val;
     uint64_t lo, hi;
@@ -361,6 +416,13 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     memory_global_dirty_log_sync(false);
 
     written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
+    /*
+     * Indices of the current set's written pages. Held across the generation
+     * update because the value to stamp them with is the generation this
+     * harvest produces, which is not known until every page has been read.
+     * Reused between sets so the harvest allocates once, not once per mapping.
+     */
+    hit = g_array_new(FALSE, FALSE, sizeof(size_t));
     qemu_mutex_lock(&d->lock);
     d->harvests++;
     d->reads_since_harvest = 0;
@@ -370,6 +432,7 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
         bool any = false;
         size_t p;
 
+        g_array_set_size(hit, 0);
         for (p = 0; p < s->count; p++) {
             uint64_t gpa = s->pages[p];
             int si = reims_vgpu_dirty_slice_of(slices, n, gpa);
@@ -377,16 +440,20 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
             /*
              * Outside the window this harvest cut, or not RAM this device can
              * read a bitmap for. Both mean the host cannot say the page is
-             * unwritten, and that reads as written.
+             * unwritten, and that reads as written — per page as well as for
+             * the set, so a per-page reader is no less conservative than the
+             * generation is.
              */
             if (si < 0 || !slices[si].mr) {
                 any = true;
+                g_array_append_val(hit, p);
                 continue;
             }
             if (reims_vgpu_dirty_page_written(&slices[si], gpa, s->page_size)) {
                 ReimsVgpuDirtyWritten rec = { gpa, s->page_size };
 
                 any = true;
+                g_array_append_val(hit, p);
                 /* Recorded for the clear pass, which must not run until every
                  * set has read the bit — otherwise the first set harvested
                  * would consume the report of every set sharing the page. */
@@ -401,6 +468,18 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
             s->gen = 1;
         } else if (any) {
             s->gen++;
+        }
+        /*
+         * Stamp after the generation, and only once it is readable. A page
+         * stamped during the startup window would carry a generation no reader
+         * can have recorded, and would then read as written forever.
+         */
+        if (s->gen != 0) {
+            guint h;
+
+            for (h = 0; h < hit->len; h++) {
+                s->page_gen[g_array_index(hit, size_t, h)] = s->gen;
+            }
         }
     }
     qemu_mutex_unlock(&d->lock);
