@@ -978,6 +978,15 @@ static void reims_vgpu_mmio_iosfc_write(void *opaque, hwaddr offset, uint64_t da
         return;
     }
     trace_reims_vgpu_mmio_iosfc_write(offset, data);
+    /*
+     * The same reason as the gfx path, and both are needed: this shim exposes
+     * two guest-facing register windows, and either can be the write that hands
+     * the device work. Harvesting on only one would leave the guest-write
+     * witness a whole submission stale on whichever rail the guest happens to
+     * use. Cheap when nothing has read a generation since the last harvest, so
+     * covering both costs a predicate, not a sync.
+     */
+    reims_vgpu_dirty_harvest(s->dirty);
     if (reims_vgpu_qemu_iosfc_write(s->rust_handle, offset, data, size) !=
         REIMS_VGPU_QEMU_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
