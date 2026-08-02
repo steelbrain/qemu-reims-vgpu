@@ -200,12 +200,32 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
 
     qemu_mutex_lock(&d->lock);
     /*
-     * Two harvests, not one. The first harvest after this call is the one that
-     * may still be turning logging on for these pages, so writes older than it
-     * were never recorded; only from the second is "no write observed" a fact
-     * about the guest rather than about this device's own startup.
+     * One harvest, and a second only if that harvest has to turn logging on.
+     *
+     * This used to be an unconditional two, because "the first harvest after
+     * this call is the one that may still be turning logging on for these
+     * pages, so writes older than it were never recorded". That reason is
+     * right, and it is a reason about the *first* set to name a region — not
+     * about every set. Guest RAM is one MemoryRegion, so once any surface has
+     * been tracked, logging is already on for every later one, no harvest ever
+     * enables anything, and the second harvest was waiting for something that
+     * had already happened.
+     *
+     * It is not free to wait. While the set is unarmed its generation reads
+     * back 0, `HostOps::guest_write_gen` maps that to "cannot tell", the
+     * type-11 LOAD elision refuses with `t11_gw_ref_no_stamp`, and every draw
+     * onto that surface pays a whole-frame seed read out of guest pages plus a
+     * whole-frame staging upload. The window is counted in harvests and
+     * harvests are driven by guest doorbells, so on a quiet desktop it lasts as
+     * long as the guest stays quiet — which is exactly when a draw arriving
+     * into it is a visible hitch (measured at 12-65 ms per draw, against
+     * 0.2 ms driven).
+     *
+     * The second harvest is still taken when it is owed: `reims_vgpu_dirty_harvest`
+     * pushes every set still waiting when it had to enable logging, so a set
+     * created before the region was logged arms exactly as late as it used to.
      */
-    s->arm_at = d->harvests + 2;
+    s->arm_at = d->harvests + 1;
     if (d->hi == 0) {
         d->lo = pages[0];
         d->hi = pages[n - 1] + page_size;
@@ -426,6 +446,33 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     qemu_mutex_lock(&d->lock);
     d->harvests++;
     d->reads_since_harvest = 0;
+    /*
+     * This harvest turned logging on for a region, so the sync above is the
+     * first one that saw it and writes older than it were never recorded. Every
+     * set still inside its arming window is therefore not yet covered by a
+     * complete sync, whichever region it named: push it to the next harvest.
+     *
+     * This is what lets `reims_vgpu_dirty_track` arm at +1 instead of +2. The
+     * +2 was paying for this case on every set; this pays for it on the sets it
+     * actually applies to, which after the first surface of a boot is none.
+     *
+     * The test is `s->gen == 0` — never armed — and not `d->harvests <
+     * s->arm_at`. A set created at harvest H carries `arm_at = H + 1`, and
+     * `d->harvests` is already H + 1 here, so the second test is false for
+     * exactly the set that needs pushing. `s->gen` leaves 0 only in the arming
+     * block below and never returns to it, so it is the durable spelling of
+     * "this set has not been armed yet".
+     */
+    if (enabled_any) {
+        g_hash_table_iter_init(&it, d->sets);
+        while (g_hash_table_iter_next(&it, &key, &val)) {
+            ReimsVgpuDirtySet *s = val;
+
+            if (s->gen == 0) {
+                s->arm_at = d->harvests + 1;
+            }
+        }
+    }
     g_hash_table_iter_init(&it, d->sets);
     while (g_hash_table_iter_next(&it, &key, &val)) {
         ReimsVgpuDirtySet *s = val;

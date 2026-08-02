@@ -35,10 +35,12 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d);
  * Returns a non-zero opaque token, or 0 when the set cannot be tracked.
  * Safe from any thread.
  *
- * The token's generation reads back as 0 ("cannot tell") until two harvests
- * have passed, because writes that happened before this device turned dirty
- * logging on for the pages' regions were never recorded and must not be
- * mistaken for their absence.
+ * The token's generation reads back as 0 ("cannot tell") until one harvest has
+ * passed, and until two when that harvest was the one that turned dirty logging
+ * on for the pages' regions: writes older than the enable were never recorded
+ * and must not be mistaken for their absence. Guest RAM is one MemoryRegion, so
+ * after the first tracked surface of a boot no harvest enables anything and the
+ * window is one.
  */
 uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
                                 size_t count, size_t page_size);
