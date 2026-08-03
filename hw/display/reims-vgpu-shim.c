@@ -119,6 +119,20 @@ static InputButton reims_vgpu_shim_button(uint32_t code, bool *ok)
     }
 }
 
+bool reims_vgpu_shim_scanout_may_paint(uint64_t rust_handle, uint32_t mapping_id)
+{
+    uint32_t may = 0;
+
+    if (rust_handle == 0) {
+        return false;
+    }
+    if (reims_vgpu_qemu_scanout_may_paint(rust_handle, mapping_id, &may) !=
+        REIMS_VGPU_QEMU_OK) {
+        return false;
+    }
+    return may != 0;
+}
+
 void reims_vgpu_shim_input_key(QemuConsole *con, uint32_t evdev, bool down)
 {
     if (!con) {

@@ -453,18 +453,7 @@ static void reims_vgpu_pci_apply_scanout(ReimsVGPUPCIState *s, uint32_t mapping_
                                   uint32_t width, uint32_t height,
                                   uint32_t generation)
 {
-    uint32_t mid = 0;
-    uint32_t kind = reims_vgpu_pci_console_feed(s, &mid, NULL, NULL, NULL);
-
-    /*
-     * _PRODUCT: the compositor owns the console, so every present paints.
-     * _EARLY: only the latched front may paint. A clear-only present HostAction
-     * naming some other mapping must not steal the surface from the firmware
-     * console underneath it.
-     * _FIRMWARE: the guest is still on BAR1 / efi_fb; nothing here paints.
-     */
-    if (kind == REIMS_VGPU_CONSOLE_FEED_FIRMWARE ||
-        (kind == REIMS_VGPU_CONSOLE_FEED_EARLY && mid != mapping_id)) {
+    if (!reims_vgpu_shim_scanout_may_paint(s->rust_handle, mapping_id)) {
         return;
     }
     (void)reims_vgpu_pci_paint_scanout(s, mapping_id, width, height, generation);

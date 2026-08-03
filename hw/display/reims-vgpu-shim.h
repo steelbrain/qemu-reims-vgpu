@@ -58,6 +58,17 @@ int reims_vgpu_shim_is_ram_gpa(void *ctx, uint64_t gpa);
 int reims_vgpu_shim_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len);
 
 /*
+ * May a present naming `mapping_id` paint the host console right now?
+ *
+ * The verdict comes from Rust whole; this only forwards it, and answers false
+ * for a device that has no handle or cannot answer. Do NOT rebuild it from
+ * `reims_vgpu_qemu_console_feed`'s kind and mapping id — that reconstruction is
+ * what the two shims had drifted on, x86 gating and arm64 painting every
+ * present it was handed.
+ */
+bool reims_vgpu_shim_scanout_may_paint(uint64_t rust_handle, uint32_t mapping_id);
+
+/*
  * Host-owned-window input: replay a neutral Rust input action through the
  * QEMU input subsystem. Input routes to the guest's active handlers
  * (usb-kbd / usb-tablet) independent of any display, so these work with

@@ -504,6 +504,15 @@ static void reims_vgpu_mmio_apply_scanout(ReimsVGPUMMIOState *s,
     if (width == 0 || height == 0) {
         return;
     }
+    /*
+     * Console ownership, from Rust. This shim used to paint every present it was
+     * handed while the PCI shim gated on the same question, so a pre-boundary
+     * present naming an unlatched mapping stole the firmware console here and
+     * was refused there — one rule, one pathway holding it.
+     */
+    if (!reims_vgpu_shim_scanout_may_paint(s->rust_handle, mapping_id)) {
+        return;
+    }
 
     /*
      * One surface path. There used to be two: reims_vgpu_mmio_set_gpu_mode
