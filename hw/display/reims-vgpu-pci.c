@@ -46,7 +46,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUPCIState, REIMS_VGPU_PCI)
 #define REIMS_VGPU_PCI_EFI_W     1920u
 #define REIMS_VGPU_PCI_EFI_H     1080u
 #define REIMS_VGPU_PCI_EFI_BPP   4u
-#define REIMS_VGPU_PCI_MAX_DIM   8192u
 
 /* RAM-only GPA attrs — avoid re-entering BAR MMIO on bad PFNs (tahoe-x86). */
 static const MemTxAttrs reims_vgpu_ram_attrs = {
@@ -319,7 +318,7 @@ static void reims_vgpu_pci_set_mode(ReimsVGPUPCIState *s, uint32_t width,
                              uint32_t height)
 {
     if (width == 0 || height == 0 ||
-        width > REIMS_VGPU_PCI_MAX_DIM || height > REIMS_VGPU_PCI_MAX_DIM) {
+        width > REIMS_VGPU_MAX_SCANOUT_DIM || height > REIMS_VGPU_MAX_SCANOUT_DIM) {
         return;
     }
     if (s->surface &&

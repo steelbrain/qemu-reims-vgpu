@@ -68,7 +68,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUMMIOState, REIMS_VGPU_MMIO)
 /* EFI boot mode dimensions (contract / model::regs). */
 #define REIMS_VGPU_MMIO_EFI_W  1920u
 #define REIMS_VGPU_MMIO_EFI_H  1080u
-#define REIMS_VGPU_MMIO_MAX_DIM 8192u
+
 /* Rust device/window action poll cadence (250 Hz, non-blocking). */
 #define REIMS_VGPU_MMIO_WINDOW_POLL_MS 4
 
@@ -488,7 +488,7 @@ static void reims_vgpu_mmio_set_mode(ReimsVGPUMMIOState *s, uint32_t width,
                                   uint32_t height)
 {
     if (width == 0 || height == 0 ||
-        width > REIMS_VGPU_MMIO_MAX_DIM || height > REIMS_VGPU_MMIO_MAX_DIM) {
+        width > REIMS_VGPU_MAX_SCANOUT_DIM || height > REIMS_VGPU_MAX_SCANOUT_DIM) {
         return;
     }
     if (s->surface &&
