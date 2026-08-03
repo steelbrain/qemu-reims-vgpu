@@ -20,3 +20,7 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# LLVM coverage artifacts (see scripts/runtime-dead in the parent repo).
+*.profraw
+*.profdata
