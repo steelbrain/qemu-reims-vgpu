@@ -47,11 +47,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUPCIState, REIMS_VGPU_PCI)
 #define REIMS_VGPU_PCI_EFI_H     1080u
 #define REIMS_VGPU_PCI_EFI_BPP   4u
 
-/* RAM-only GPA attrs — avoid re-entering BAR MMIO on bad PFNs (tahoe-x86). */
-static const MemTxAttrs reims_vgpu_ram_attrs = {
-    .memory = true,
-};
-
 struct ReimsVGPUPCIState {
     PCIDevice parent_obj;
 
@@ -95,29 +90,6 @@ struct ReimsVGPUPCIState {
 };
 
 /* ---------- HostOps (GPA R/W + BH; Linux has no map_pages / xreg) ---------- */
-
-static int reims_vgpu_pci_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len)
-{
-    MemTxResult r;
-
-    if (!buf || len == 0) {
-        return 0;
-    }
-    r = address_space_read(&address_space_memory, gpa, reims_vgpu_ram_attrs, buf, len);
-    return r == MEMTX_OK ? 0 : -1;
-}
-
-static int reims_vgpu_pci_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
-                             size_t len)
-{
-    MemTxResult r;
-
-    if (!buf || len == 0) {
-        return 0;
-    }
-    r = address_space_write(&address_space_memory, gpa, reims_vgpu_ram_attrs, buf, len);
-    return r == MEMTX_OK ? 0 : -1;
-}
 
 static int reims_vgpu_pci_read_xreg(void *ctx, uint32_t index, uint64_t *out)
 {
@@ -911,8 +883,8 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .abi_version = REIMS_VGPU_QEMU_ABI_VERSION,
         .struct_size = sizeof(ReimsVgpuHostOps),
         .ctx = s,
-        .read_gpa = reims_vgpu_pci_read_gpa,
-        .write_gpa = reims_vgpu_pci_write_gpa,
+        .read_gpa = reims_vgpu_shim_read_gpa,
+        .write_gpa = reims_vgpu_shim_write_gpa,
         .mono_ns = reims_vgpu_shim_mono_ns,
         .schedule_bh = reims_vgpu_pci_schedule_bh,
         .read_kva = reims_vgpu_shim_read_kva,

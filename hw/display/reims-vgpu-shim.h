@@ -25,12 +25,23 @@
 #include "qemu/typedefs.h"
 
 /*
- * The three below match HostOps function-pointer signatures, so both shims'
+ * The five below match HostOps function-pointer signatures, so both shims'
  * host_ops tables point at them directly; `ctx` is accepted and ignored.
  */
 
 /* Host monotonic clock in nanoseconds. */
 uint64_t reims_vgpu_shim_mono_ns(void *ctx);
+
+/*
+ * Guest-physical byte access. Both use RAM-only transaction attrs, so a GPA
+ * that resolves to a device is rejected rather than performed — a guest page
+ * entry pointing at one of our own BARs must not re-enter device MMIO from
+ * inside a Rust call. Return 0 on success (including an empty request), -1 on
+ * a failed transaction.
+ */
+int reims_vgpu_shim_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len);
+int reims_vgpu_shim_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
+                              size_t len);
 
 /* 1 = guest RAM, 0 = not (MMIO / ROM / unmapped). Mapper page-entry accept. */
 int reims_vgpu_shim_is_ram_gpa(void *ctx, uint64_t gpa);

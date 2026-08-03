@@ -163,32 +163,6 @@ static int reims_vgpu_mmio_window_main_loop(void)
 
 /* ---------- HostOps (only host services; apple-gfx equivalents) ---------- */
 
-static int reims_vgpu_mmio_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf,
-                                 size_t len)
-{
-    MemTxResult r;
-
-    if (!buf || len == 0) {
-        return 0;
-    }
-    r = address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED,
-                           buf, len);
-    return r == MEMTX_OK ? 0 : -1;
-}
-
-static int reims_vgpu_mmio_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
-                                  size_t len)
-{
-    MemTxResult r;
-
-    if (!buf || len == 0) {
-        return 0;
-    }
-    r = address_space_write(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED,
-                            buf, len);
-    return r == MEMTX_OK ? 0 : -1;
-}
-
 /*
  * Guest X-register read for the iosfc mapper directed handoff
  * (x19 mapper device, x21 request type, x22 MappingInternal*). Must be
@@ -977,8 +951,8 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
         .abi_version = REIMS_VGPU_QEMU_ABI_VERSION,
         .struct_size = sizeof(ReimsVgpuHostOps),
         .ctx = s,
-        .read_gpa = reims_vgpu_mmio_read_gpa,
-        .write_gpa = reims_vgpu_mmio_write_gpa,
+        .read_gpa = reims_vgpu_shim_read_gpa,
+        .write_gpa = reims_vgpu_shim_write_gpa,
         .mono_ns = reims_vgpu_shim_mono_ns,
         .schedule_bh = reims_vgpu_mmio_schedule_bh,
         .read_kva = reims_vgpu_shim_read_kva,

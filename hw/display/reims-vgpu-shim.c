@@ -22,6 +22,45 @@ uint64_t reims_vgpu_shim_mono_ns(void *ctx)
     return (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_HOST);
 }
 
+/*
+ * RAM-only attrs. `memory = 1` makes the address space reject a translation
+ * that resolves to a device rather than RAM (MEMTX_ACCESS_ERROR) instead of
+ * performing it. Every GPA reaching read/write_gpa came from a guest-supplied
+ * page-entry list, so an entry pointing at one of our own BARs would otherwise
+ * re-enter this device's MMIO handler from inside a Rust call that already
+ * holds the device lock. Failing closed turns that into a visible decline.
+ */
+static const MemTxAttrs reims_vgpu_shim_ram_attrs = {
+    .memory = true,
+};
+
+int reims_vgpu_shim_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len)
+{
+    MemTxResult r;
+
+    (void)ctx;
+    if (!buf || len == 0) {
+        return 0;
+    }
+    r = address_space_read(&address_space_memory, gpa,
+                           reims_vgpu_shim_ram_attrs, buf, len);
+    return r == MEMTX_OK ? 0 : -1;
+}
+
+int reims_vgpu_shim_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
+                              size_t len)
+{
+    MemTxResult r;
+
+    (void)ctx;
+    if (!buf || len == 0) {
+        return 0;
+    }
+    r = address_space_write(&address_space_memory, gpa,
+                            reims_vgpu_shim_ram_attrs, buf, len);
+    return r == MEMTX_OK ? 0 : -1;
+}
+
 int reims_vgpu_shim_is_ram_gpa(void *ctx, uint64_t gpa)
 {
     hwaddr xlat, plen = 1;
