@@ -718,6 +718,7 @@ static bool reims_vgpu_mmio_fb_update(void *opaque)
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t generation = 0;
+    uint32_t kind = 0;
     uint8_t *dst;
     uint32_t stride;
     int rc;
@@ -735,11 +736,12 @@ static bool reims_vgpu_mmio_fb_update(void *opaque)
         reims_vgpu_mmio_deliver_actions(s);
     }
 
-    rc = reims_vgpu_qemu_early_scanout_target(s->rust_handle, &mapping_id, &width,
-                                       &height, &generation);
-    if (rc == REIMS_VGPU_QEMU_OK && mapping_id != 0 && width > 0 && height > 0) {
+    rc = reims_vgpu_qemu_console_feed(s->rust_handle, &kind, &mapping_id, &width,
+                                      &height, &generation);
+    if (rc == REIMS_VGPU_QEMU_OK && kind == REIMS_VGPU_CONSOLE_FEED_EARLY) {
         /*
-         * Early boot only (Rust returns None after first DisplaySwap).
+         * Early boot only (_EARLY ends at the first DisplaySwap, and Rust
+         * guarantees a paintable mapping and geometry with it).
          * Never resize from the refresh path. First paint may establish size;
          * later size changes only via ScanoutUpdate HostAction.
          */

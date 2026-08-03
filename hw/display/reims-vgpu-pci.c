@@ -412,18 +412,25 @@ static bool reims_vgpu_pci_copy_early_console(ReimsVGPUPCIState *s)
     return reims_vgpu_pci_copy_gop_fb(s);
 }
 
-/* True once Rust has seen DisplaySwap (frame_flush_seen). */
-static bool reims_vgpu_pci_present_boundary(ReimsVGPUPCIState *s)
+/*
+ * Ask Rust who owns the console. C holds no rule of its own here: the three-way
+ * this used to assemble from two queries is product policy and now lives at
+ * `device_console_feed`. `out_*` are filled only for _EARLY.
+ */
+static uint32_t reims_vgpu_pci_console_feed(ReimsVGPUPCIState *s, uint32_t *out_mid,
+                                            uint32_t *out_w, uint32_t *out_h,
+                                            uint32_t *out_gen)
 {
-    uint32_t seen = 0;
+    uint32_t kind = REIMS_VGPU_CONSOLE_FEED_FIRMWARE;
 
     if (s->rust_handle == 0) {
-        return false;
+        return REIMS_VGPU_CONSOLE_FEED_FIRMWARE;
     }
-    if (reims_vgpu_qemu_present_boundary_seen(s->rust_handle, &seen) != REIMS_VGPU_QEMU_OK) {
-        return false;
+    if (reims_vgpu_qemu_console_feed(s->rust_handle, &kind, out_mid, out_w, out_h,
+                                     out_gen) != REIMS_VGPU_QEMU_OK) {
+        return REIMS_VGPU_CONSOLE_FEED_FIRMWARE;
     }
-    return seen != 0;
+    return kind;
 }
 
 /*
@@ -470,56 +477,23 @@ static bool reims_vgpu_pci_paint_scanout(ReimsVGPUPCIState *s, uint32_t mapping_
     return false;
 }
 
-/* True when Rust has a pre-boundary latched early front (protocol state). */
-static bool reims_vgpu_pci_early_scanout_latched(ReimsVGPUPCIState *s,
-                                          uint32_t *out_mid, uint32_t *out_w,
-                                          uint32_t *out_h, uint32_t *out_gen)
-{
-    uint32_t mid = 0, w = 0, h = 0, gen = 0;
-
-    if (s->rust_handle == 0) {
-        return false;
-    }
-    if (reims_vgpu_qemu_early_scanout_target(s->rust_handle, &mid, &w, &h, &gen)
-        != REIMS_VGPU_QEMU_OK) {
-        return false;
-    }
-    if (mid == 0 || w == 0 || h == 0) {
-        return false;
-    }
-    if (out_mid) {
-        *out_mid = mid;
-    }
-    if (out_w) {
-        *out_w = w;
-    }
-    if (out_h) {
-        *out_h = h;
-    }
-    if (out_gen) {
-        *out_gen = gen;
-    }
-    return true;
-}
-
 static void reims_vgpu_pci_apply_scanout(ReimsVGPUPCIState *s, uint32_t mapping_id,
                                   uint32_t width, uint32_t height,
                                   uint32_t generation)
 {
-    /*
-     * Contract:
-     * - Pre-boundary: only paint when HostAction matches the latched early
-     *   front (type-11 writeback logo+pill). Clear-only present HostActions
-     *   must not steal the QEMU surface from BAR1/efi PE log console.
-     * - Post-boundary (frame_flush_seen): product present owns the console.
-     */
-    if (!reims_vgpu_pci_present_boundary(s)) {
-        uint32_t mid = 0, w = 0, h = 0, gen = 0;
+    uint32_t mid = 0;
+    uint32_t kind = reims_vgpu_pci_console_feed(s, &mid, NULL, NULL, NULL);
 
-        if (!reims_vgpu_pci_early_scanout_latched(s, &mid, &w, &h, &gen) ||
-            mid != mapping_id) {
-            return;
-        }
+    /*
+     * _PRODUCT: the compositor owns the console, so every present paints.
+     * _EARLY: only the latched front may paint. A clear-only present HostAction
+     * naming some other mapping must not steal the surface from the firmware
+     * console underneath it.
+     * _FIRMWARE: the guest is still on BAR1 / efi_fb; nothing here paints.
+     */
+    if (kind == REIMS_VGPU_CONSOLE_FEED_FIRMWARE ||
+        (kind == REIMS_VGPU_CONSOLE_FEED_EARLY && mid != mapping_id)) {
+        return;
     }
     (void)reims_vgpu_pci_paint_scanout(s, mapping_id, width, height, generation);
 }
@@ -699,7 +673,7 @@ static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
 static bool reims_vgpu_pci_fb_update(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
-    bool boundary;
+    uint32_t kind, mid = 0, w = 0, h = 0, gen = 0;
 
     if (!s->con) {
         return true;
@@ -710,37 +684,28 @@ static bool reims_vgpu_pci_fb_update(void *opaque)
         reims_vgpu_pci_deliver_actions(s);
     }
 
-    /*
-     * Host-console ownership (contract state only):
-     *   !frame_flush_seen && no early front latch → BAR1 / efi_fb (UEFI+PE log)
-     *   !frame_flush_seen && early_scanout_target  → product early paint (logo+pill)
-     *   frame_flush_seen                          → product present owns console
-     * No content/sparsity/boot-stage sticky cutover. Early latch is protocol
-     * (type-11 front writeback same-geom), not a screenshot heuristic.
-     */
-    boundary = reims_vgpu_pci_present_boundary(s);
-    if (!boundary) {
-        uint32_t mid = 0, w = 0, h = 0, gen = 0;
-        bool early = reims_vgpu_pci_early_scanout_latched(s, &mid, &w, &h, &gen);
+    /* Host-console ownership is Rust's call; this only paints what it names. */
+    kind = reims_vgpu_pci_console_feed(s, &mid, &w, &h, &gen);
 
-        if (early) {
-            /* Re-pull latched front (archive fb_update early path). */
-            if (reims_vgpu_pci_paint_scanout(s, mid, w, h, gen)) {
-                /* painted */
-            } else if (s->new_frame_ready && s->surface) {
-                qemu_console_update_full(s->con);
-                s->new_frame_ready = false;
-            }
-        } else {
-            if (reims_vgpu_pci_copy_early_console(s)) {
-                qemu_console_update_full(s->con);
-                s->new_frame_ready = false;
-            }
+    if (kind == REIMS_VGPU_CONSOLE_FEED_EARLY) {
+        /* Re-pull the latched front (archive fb_update early path). */
+        if (reims_vgpu_pci_paint_scanout(s, mid, w, h, gen)) {
+            return true;
         }
+    } else if (kind == REIMS_VGPU_CONSOLE_FEED_FIRMWARE) {
+        if (reims_vgpu_pci_copy_early_console(s)) {
+            qemu_console_update_full(s->con);
+            s->new_frame_ready = false;
+        }
+        /* Return either way. A failed firmware copy must NOT fall through to
+         * the re-push below: the pending frame there is a product one, and
+         * pushing it while Rust says the firmware console owns the screen is
+         * the pre-boundary steal this feed exists to prevent. */
         return true;
     }
 
-    /* Post-boundary: HostAction apply_scanout paints; re-push if pending. */
+    /* Nothing painted this tick — re-push the last frame if one is pending.
+     * _PRODUCT reaches here every tick: apply_scanout does that painting. */
     if (s->new_frame_ready && s->surface) {
         qemu_console_update_full(s->con);
         s->new_frame_ready = false;
