@@ -15,28 +15,24 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-#include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "qemu/aio.h"
 #include "qemu/thread.h"
 #include "qapi/error.h"
-#include "hw/core/cpu.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pcie.h"
 #include "qom/object.h"
-#include "exec/cpu-common.h"
 #include "system/address-spaces.h"
-#include "system/hw_accel.h"
 #include "system/memory.h"
 #include "system/runstate.h"
 #include "ui/console.h"
 #include "ui/surface.h"
-#include "ui/input.h"
 #include "trace.h"
 #include "reims_vgpu_qemu_abi.h"
 #include "reims-vgpu-dirty.h"
+#include "reims-vgpu-shim.h"
 
 #define TYPE_REIMS_VGPU_PCI "reims-vgpu-pci"
 OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUPCIState, REIMS_VGPU_PCI)
@@ -122,25 +118,6 @@ static int reims_vgpu_pci_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
     }
     r = address_space_write(&address_space_memory, gpa, reims_vgpu_ram_attrs, buf, len);
     return r == MEMTX_OK ? 0 : -1;
-}
-
-static uint64_t reims_vgpu_pci_mono_ns(void *ctx)
-{
-    return (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_HOST);
-}
-
-static int reims_vgpu_pci_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len)
-{
-    CPUState *cs = current_cpu;
-
-    if (!buf || len == 0) {
-        return 0;
-    }
-    if (!cs) {
-        return -2;
-    }
-    cpu_synchronize_state(cs);
-    return cpu_memory_rw_debug(cs, kva, buf, len, false) == 0 ? 0 : -1;
 }
 
 static int reims_vgpu_pci_read_xreg(void *ctx, uint32_t index, uint64_t *out)
@@ -292,22 +269,6 @@ static int64_t reims_vgpu_pci_guest_written_pages(void *ctx, uint64_t token,
     ReimsVGPUPCIState *s = ctx;
 
     return reims_vgpu_dirty_written_since(s->dirty, token, since_gen, out, max);
-}
-
-/* 1 = guest RAM, 0 = not (MMIO / ROM / unmapped). Mapper page-entry accept. */
-static int reims_vgpu_pci_is_ram_gpa(void *ctx, uint64_t gpa)
-{
-    hwaddr xlat, plen = 1;
-    MemoryRegion *mr;
-    int ok;
-
-    (void)ctx;
-    rcu_read_lock();
-    mr = address_space_translate(&address_space_memory, gpa, &xlat, &plen, true,
-                                 MEMTXATTRS_UNSPECIFIED);
-    ok = mr && memory_region_is_ram(mr) && plen >= 1;
-    rcu_read_unlock();
-    return ok ? 1 : 0;
 }
 
 static void reims_vgpu_pci_bh(void *opaque);
@@ -568,80 +529,6 @@ static void reims_vgpu_pci_apply_scanout(ReimsVGPUPCIState *s, uint32_t mapping_
 }
 
 /*
- * Host-owned-window input: replay a neutral Rust input action through the QEMU
- * input subsystem. Input routes to the guest's active handlers (usb-kbd /
- * usb-tablet) independent of any display, so these work with -display none.
- * All business logic (platform key -> evdev, scroll delta -> wheel notches,
- * coordinate origin) lives in Rust; the shim only translates the neutral wire
- * form into the QEMU input ABI (which owns the QEMU-side keycode/button enums).
- */
-static InputButton reims_vgpu_pci_button(uint32_t code, bool *ok)
-{
-    *ok = true;
-    switch (code) {
-    case REIMS_VGPU_BUTTON_LEFT:
-        return INPUT_BUTTON_LEFT;
-    case REIMS_VGPU_BUTTON_MIDDLE:
-        return INPUT_BUTTON_MIDDLE;
-    case REIMS_VGPU_BUTTON_RIGHT:
-        return INPUT_BUTTON_RIGHT;
-    case REIMS_VGPU_BUTTON_WHEEL_UP:
-        return INPUT_BUTTON_WHEEL_UP;
-    case REIMS_VGPU_BUTTON_WHEEL_DOWN:
-        return INPUT_BUTTON_WHEEL_DOWN;
-    case REIMS_VGPU_BUTTON_SIDE:
-        return INPUT_BUTTON_SIDE;
-    case REIMS_VGPU_BUTTON_EXTRA:
-        return INPUT_BUTTON_EXTRA;
-    case REIMS_VGPU_BUTTON_WHEEL_LEFT:
-        return INPUT_BUTTON_WHEEL_LEFT;
-    case REIMS_VGPU_BUTTON_WHEEL_RIGHT:
-        return INPUT_BUTTON_WHEEL_RIGHT;
-    default:
-        *ok = false;
-        return INPUT_BUTTON_LEFT;
-    }
-}
-
-static void reims_vgpu_pci_input_key(ReimsVGPUPCIState *s, uint32_t evdev, bool down)
-{
-    if (!s->con) {
-        return;
-    }
-    /* QEMU maps the Linux evdev code to its qcode; unknown codes are dropped
-     * there, so no Reims VGPU-side keycode table is needed. */
-    qemu_input_event_send_key_linux(s->con, evdev, down);
-}
-
-static void reims_vgpu_pci_input_pointer_move(ReimsVGPUPCIState *s, uint32_t x,
-                                       uint32_t y, uint32_t w, uint32_t h)
-{
-    if (!s->con || w == 0 || h == 0) {
-        return;
-    }
-    /* Absolute pointer (usb-tablet): scale window pixels into the abs range. */
-    qemu_input_queue_abs(s->con, INPUT_AXIS_X, (int)x, 0, (int)w);
-    qemu_input_queue_abs(s->con, INPUT_AXIS_Y, (int)y, 0, (int)h);
-    qemu_input_event_sync();
-}
-
-static void reims_vgpu_pci_input_button(ReimsVGPUPCIState *s, uint32_t code, bool down)
-{
-    InputButton btn;
-    bool ok;
-
-    if (!s->con) {
-        return;
-    }
-    btn = reims_vgpu_pci_button(code, &ok);
-    if (!ok) {
-        return;
-    }
-    qemu_input_queue_btn(s->con, btn, down);
-    qemu_input_event_sync();
-}
-
-/*
  * Whether the host-owned window (kb host-window) is requested via REIMS_VGPU_WINDOW.
  * Presence enables it; 0/off/no/false explicitly disable so REIMS_VGPU_WINDOW=0 opts
  * out (vm/boot-x86.sh defaults it on for this device, unset to disable). Env
@@ -688,14 +575,14 @@ static void reims_vgpu_pci_apply_action(ReimsVGPUPCIState *s, const ReimsVgpuHos
         }
         break;
     case REIMS_VGPU_HOST_ACTION_INPUT_KEY:
-        reims_vgpu_pci_input_key(s, (uint32_t)a->a0, a->a1 != 0);
+        reims_vgpu_shim_input_key(s->con, (uint32_t)a->a0, a->a1 != 0);
         break;
     case REIMS_VGPU_HOST_ACTION_INPUT_POINTER_MOVE:
-        reims_vgpu_pci_input_pointer_move(s, (uint32_t)a->a0, (uint32_t)a->a1,
+        reims_vgpu_shim_input_pointer_move(s->con, (uint32_t)a->a0, (uint32_t)a->a1,
                                    (uint32_t)a->a2, (uint32_t)a->a3);
         break;
     case REIMS_VGPU_HOST_ACTION_INPUT_POINTER_BUTTON:
-        reims_vgpu_pci_input_button(s, (uint32_t)a->a0, a->a1 != 0);
+        reims_vgpu_shim_input_button(s->con, (uint32_t)a->a0, a->a1 != 0);
         break;
     case REIMS_VGPU_HOST_ACTION_WINDOW_CLOSED:
         /* The host window is the VM's display; closing it shuts the VM down. */
@@ -1065,13 +952,13 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .ctx = s,
         .read_gpa = reims_vgpu_pci_read_gpa,
         .write_gpa = reims_vgpu_pci_write_gpa,
-        .mono_ns = reims_vgpu_pci_mono_ns,
+        .mono_ns = reims_vgpu_shim_mono_ns,
         .schedule_bh = reims_vgpu_pci_schedule_bh,
-        .read_kva = reims_vgpu_pci_read_kva,
+        .read_kva = reims_vgpu_shim_read_kva,
         .read_xreg = reims_vgpu_pci_read_xreg,
         .map_pages = reims_vgpu_pci_map_pages,
         .unmap_pages = reims_vgpu_pci_unmap_pages,
-        .is_ram_gpa = reims_vgpu_pci_is_ram_gpa,
+        .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         .notify_actions = reims_vgpu_pci_notify_actions,
         /*
          * 1: this shim never allocates. map_pages refuses anything that is not
