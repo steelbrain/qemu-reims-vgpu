@@ -70,19 +70,6 @@ struct ReimsVGPUPCIState {
     DisplaySurface *surface;
     bool new_frame_ready;
 
-    /*
-     * Always-on console-ownership proxy state (/tmp/reims-vgpu-gop-console.log).
-     * Measures freeze class: host stops tracking guest log stream while serial
-     * continues. Not a product policy input — diagnosis only.
-     */
-    uint64_t gop_proxy_last_bar1_fp;
-    uint64_t gop_proxy_last_log_ns;
-    uint32_t gop_proxy_bar1_same;
-    uint32_t gop_proxy_ticks;
-    bool gop_proxy_last_boundary;
-    bool gop_proxy_last_use_bar1;
-    bool gop_proxy_have_sample;
-
     ReimsVgpuHostOps host_ops;
     /* Hypervisor dirty-bitmap adapter: the only witness for a write to a
      * surface's guest pages that no device operation made. */
@@ -483,118 +470,6 @@ static bool reims_vgpu_pci_present_boundary(ReimsVGPUPCIState *s)
 }
 
 /*
- * Cheap BAR1 content fingerprint (not a full hash): stride samples of BGRA
- * words so we can see whether the guest is still painting BAR1 after the host
- * stops showing it. Always-on proxy path only.
- */
-static uint64_t reims_vgpu_pci_bar1_fingerprint(ReimsVGPUPCIState *s, uint32_t *rgb_nz_out)
-{
-    const uint8_t *src;
-    uint32_t w = REIMS_VGPU_PCI_EFI_W;
-    uint32_t h = REIMS_VGPU_PCI_EFI_H;
-    uint32_t stride = w * REIMS_VGPU_PCI_EFI_BPP;
-    uint32_t rgb_nz = 0;
-    uint64_t fp = 14695981039346656037ULL; /* FNV-1a offset basis */
-    uint32_t y, x;
-
-    if (rgb_nz_out) {
-        *rgb_nz_out = 0;
-    }
-    if (!memory_region_is_ram(&s->fb_vram)) {
-        return 0;
-    }
-    src = memory_region_get_ram_ptr(&s->fb_vram);
-    if (!src) {
-        return 0;
-    }
-    /* Sample every 8th pixel on every 8th row — enough to catch text scroll. */
-    for (y = 0; y < h; y += 8) {
-        const uint32_t *row = (const uint32_t *)(src + (size_t)y * stride);
-        for (x = 0; x < w; x += 8) {
-            uint32_t px = row[x];
-            uint8_t b = px & 0xff;
-            uint8_t g = (px >> 8) & 0xff;
-            uint8_t r = (px >> 16) & 0xff;
-            if (r | g | b) {
-                rgb_nz++;
-            }
-            fp ^= (uint64_t)px;
-            fp *= 1099511628211ULL;
-        }
-    }
-    if (rgb_nz_out) {
-        *rgb_nz_out = rgb_nz;
-    }
-    return fp;
-}
-
-/*
- * Always-on GOP console ownership proxy.
- * Path: /tmp/reims-vgpu-gop-console.log
- * Grep: GOPCON
- *
- * Freeze class under test: host console stops tracking guest early-boot log
- * stream (user observation: stalls at serial "kdp_core zlib memory") while
- * software VGA would keep updating. Correlate this log with serial milestones
- * (scripts/gop-console-measure/) — do NOT use content as product cutover.
- *
- * Logs on: source/boundary/fingerprint change, else ≥250ms heartbeat.
- */
-static void reims_vgpu_pci_gop_console_proxy(ReimsVGPUPCIState *s, bool use_bar1,
-                                      bool boundary)
-{
-    uint64_t now = (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_HOST);
-    uint32_t rgb_nz = 0;
-    uint64_t bar1_fp = reims_vgpu_pci_bar1_fingerprint(s, &rgb_nz);
-    bool bar1_changed;
-    bool force;
-    FILE *f;
-
-    s->gop_proxy_ticks++;
-    bar1_changed = !s->gop_proxy_have_sample ||
-                   bar1_fp != s->gop_proxy_last_bar1_fp;
-    if (bar1_changed) {
-        s->gop_proxy_bar1_same = 0;
-    } else {
-        s->gop_proxy_bar1_same++;
-    }
-
-    force = !s->gop_proxy_have_sample ||
-            use_bar1 != s->gop_proxy_last_use_bar1 ||
-            boundary != s->gop_proxy_last_boundary ||
-            bar1_changed ||
-            (now - s->gop_proxy_last_log_ns) >= 250000000ULL; /* 250 ms */
-
-    if (!force) {
-        s->gop_proxy_last_bar1_fp = bar1_fp;
-        return;
-    }
-
-    f = fopen("/tmp/reims-vgpu-gop-console.log", "a");
-    if (f) {
-        fprintf(f,
-                "GOPCON mono_ns=%" PRIu64
-                " src=%s boundary=%u bar1_fp=%016" PRIx64
-                " bar1_changed=%u bar1_same=%u bar1_rgb_nz=%u ticks=%u\n",
-                now,
-                use_bar1 ? "bar1" : "product",
-                boundary ? 1u : 0u,
-                bar1_fp,
-                bar1_changed ? 1u : 0u,
-                s->gop_proxy_bar1_same,
-                rgb_nz,
-                s->gop_proxy_ticks);
-        fclose(f);
-    }
-
-    s->gop_proxy_last_bar1_fp = bar1_fp;
-    s->gop_proxy_last_log_ns = now;
-    s->gop_proxy_last_boundary = boundary;
-    s->gop_proxy_last_use_bar1 = use_bar1;
-    s->gop_proxy_have_sample = true;
-}
-
-/*
  * Paint a named guest mapping into the QEMU surface (pre- or post-boundary).
  * Pre-boundary early writebacks and post-boundary DisplaySwap both use this
  * path. Return true when the surface was updated.
@@ -959,9 +834,6 @@ static bool reims_vgpu_pci_fb_update(void *opaque)
      *   frame_flush_seen                          → product present owns console
      * No content/sparsity/boot-stage sticky cutover. Early latch is protocol
      * (type-11 front writeback same-geom), not a screenshot heuristic.
-     *
-     * Proxy (always-on, not a control input): reims_vgpu_pci_gop_console_proxy logs
-     * whether BAR1 content still changes after we leave it.
      */
     boundary = reims_vgpu_pci_present_boundary(s);
     if (!boundary) {
@@ -976,13 +848,11 @@ static bool reims_vgpu_pci_fb_update(void *opaque)
                 qemu_console_update_full(s->con);
                 s->new_frame_ready = false;
             }
-            reims_vgpu_pci_gop_console_proxy(s, false /* not BAR1 sole feed */, false);
         } else {
             if (reims_vgpu_pci_copy_early_console(s)) {
                 qemu_console_update_full(s->con);
                 s->new_frame_ready = false;
             }
-            reims_vgpu_pci_gop_console_proxy(s, true /* early console BAR1/efi */, false);
         }
         return true;
     }
@@ -992,8 +862,6 @@ static bool reims_vgpu_pci_fb_update(void *opaque)
         qemu_console_update_full(s->con);
         s->new_frame_ready = false;
     }
-    /* Still fingerprint BAR1 so we can see guest writes after cutover. */
-    reims_vgpu_pci_gop_console_proxy(s, false /* use_bar1 */, true);
     return true;
 }
 
@@ -1355,13 +1223,6 @@ static void reims_vgpu_pci_reset(DeviceState *dev)
     qemu_mutex_lock(&s->drain_mutex);
     s->drain_pending = false;
     qemu_mutex_unlock(&s->drain_mutex);
-    s->gop_proxy_last_bar1_fp = 0;
-    s->gop_proxy_last_log_ns = 0;
-    s->gop_proxy_bar1_same = 0;
-    s->gop_proxy_ticks = 0;
-    s->gop_proxy_last_boundary = false;
-    s->gop_proxy_last_use_bar1 = false;
-    s->gop_proxy_have_sample = false;
     s->new_frame_ready = false;
     reims_vgpu_pci_set_mode(s, REIMS_VGPU_PCI_EFI_W, REIMS_VGPU_PCI_EFI_H);
     if (s->surface && s->con) {
