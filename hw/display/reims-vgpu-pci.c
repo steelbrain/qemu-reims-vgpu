@@ -388,8 +388,6 @@ static bool reims_vgpu_pci_copy_early_console(ReimsVGPUPCIState *s)
     uint32_t dst_stride;
     uint32_t w = REIMS_VGPU_PCI_EFI_W;
     uint32_t h = REIMS_VGPU_PCI_EFI_H;
-    uint64_t gpa = 0;
-    uint32_t fb_stride = 0;
     int rc;
 
     if (!s->surface) {
@@ -407,8 +405,7 @@ static bool reims_vgpu_pci_copy_early_console(ReimsVGPUPCIState *s)
     if (s->rust_handle != 0) {
         dst = surface_data(s->surface);
         dst_stride = surface_stride(s->surface);
-        rc = reims_vgpu_qemu_efi_console_copy(s->rust_handle, dst, dst_stride, w, h,
-                                       &gpa, &fb_stride);
+        rc = reims_vgpu_qemu_efi_console_copy(s->rust_handle, dst, dst_stride, w, h);
         if (rc == REIMS_VGPU_QEMU_OK) {
             return true;
         }
