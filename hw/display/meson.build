@@ -120,6 +120,20 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
     else
       # Linux window backends are loaded by winit/ash-window at runtime.
       reims_vgpu_link_args = reims_vgpu_rust_sys_libs
+      # Runtime-dead measurement (scripts/runtime-dead). When the staticlib is
+      # built with -C instrument-coverage, its objects carry __llvm_prf_* but
+      # nothing that writes them: rustc bundles the profiler runtime into a
+      # final artifact, and this staticlib is not one — it is linked by QEMU.
+      # So the profile runtime is named here instead, whole-archive because no
+      # instrumented object references it and the linker would drop every
+      # member. REIMS_VGPU_COVERAGE holds the path to
+      # libclang_rt.profile-<arch>.a; unset (the default) changes nothing.
+      reims_vgpu_coverage_rt = run_command('sh', '-c',
+        'printf %s "$REIMS_VGPU_COVERAGE"', check: false).stdout().strip()
+      if reims_vgpu_coverage_rt != ''
+        reims_vgpu_link_args += ['-Wl,--whole-archive', reims_vgpu_coverage_rt,
+                                 '-Wl,--no-whole-archive']
+      endif
     endif
   else
     error('unknown REIMS_VGPU_BACKEND: ' + reims_vgpu_backend_kind + ' (metal | vulkan)')
