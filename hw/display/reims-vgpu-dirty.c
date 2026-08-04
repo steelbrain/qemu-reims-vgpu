@@ -16,13 +16,12 @@
 #include "reims-vgpu-dirty.h"
 
 /*
- * Contiguous slice of the tracked GPA window that translates into one
- * MemoryRegion. Guest RAM is a handful of regions, so one translation per
- * slice replaces one per page — the same reason reims_vgpu_*_map_pages walks
- * maximal runs.
+ * One guest-RAM range of the system address space. A tracked page is resolved
+ * against this table by address, so one entry serves every page that lands in
+ * it — the same reason reims_vgpu_*_map_pages walks maximal runs.
  */
 typedef struct ReimsVgpuDirtySlice {
-    MemoryRegion *mr;       /* NULL => not RAM; every page here reads written */
+    MemoryRegion *mr;
     uint64_t gpa;           /* first GPA covered */
     uint64_t len;           /* bytes covered */
     ram_addr_t ram_addr;    /* ram_addr_t of `gpa` */
@@ -58,15 +57,6 @@ struct ReimsVgpuDirty {
      * saving this device never collects.
      */
     GHashTable *logged;     /* MemoryRegion* -> itself */
-    /*
-     * Monotone hull of every GPA ever tracked. Only used to cut translation
-     * slices, never to clear bits — the clear is per written page, so a hull
-     * that grows to most of guest RAM costs one extra slice walk and nothing
-     * else. It never shrinks because a rescan on untrack would cost more than
-     * the walk it saves.
-     */
-    uint64_t lo;
-    uint64_t hi;            /* exclusive; 0 means nothing tracked */
     uint64_t harvests;
     /*
      * Generation reads since the last harvest. A harvest nothing has consumed
@@ -78,10 +68,12 @@ struct ReimsVgpuDirty {
 };
 
 /*
- * Bound on translation slices per harvest. Guest RAM is a handful of
- * MemoryRegions (below-4G / above-4G on x86, one on arm); a window needing
- * more than this is not a shape this device produces, and "written" is the
- * safe reading of a window it could not cut.
+ * Bound on guest-RAM ranges this device will resolve pages against. Both
+ * product machines present guest RAM as one MemoryRegion in a handful of
+ * ranges — three on x86 q35 (the two below the PCI hole and the one above
+ * 4 GiB), one on arm64 — so this is a ceiling on a shape neither pathway
+ * approaches rather than a budget. A machine with more ranges loses the tail,
+ * and every page there reads as written, which is the conservative answer.
  */
 #define REIMS_VGPU_DIRTY_MAX_SLICES 64
 
@@ -226,17 +218,6 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
      * created before the region was logged arms exactly as late as it used to.
      */
     s->arm_at = d->harvests + 1;
-    if (d->hi == 0) {
-        d->lo = pages[0];
-        d->hi = pages[n - 1] + page_size;
-    } else {
-        if (pages[0] < d->lo) {
-            d->lo = pages[0];
-        }
-        if (pages[n - 1] + page_size > d->hi) {
-            d->hi = pages[n - 1] + page_size;
-        }
-    }
     d->next_token++;
     token = d->next_token;
     g_hash_table_insert(d->sets, g_memdup2(&token, sizeof(token)), s);
@@ -316,37 +297,79 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
     return found;
 }
 
-/*
- * Cut [lo, hi) into MemoryRegion-contiguous slices. Returns the slice count,
- * or -1 when the window needs more slices than this device produces.
- */
-static int reims_vgpu_dirty_slice(uint64_t lo, uint64_t hi,
-                                  ReimsVgpuDirtySlice *out, int max)
+typedef struct ReimsVgpuDirtyRamScan {
+    ReimsVgpuDirtySlice *out;
+    int max;
+    int n;
+} ReimsVgpuDirtyRamScan;
+
+static bool reims_vgpu_dirty_ram_range(Int128 start, Int128 len,
+                                       const MemoryRegion *mr,
+                                       hwaddr offset_in_region, void *opaque)
 {
-    uint64_t cur = lo;
-    int n = 0;
+    ReimsVgpuDirtyRamScan *scan = opaque;
+    ReimsVgpuDirtySlice *sl;
+
+    if (!mr->ram || !int128_nz(len)) {
+        return false;
+    }
+    if (scan->n == scan->max) {
+        return true;
+    }
+    sl = &scan->out[scan->n++];
+    /*
+     * Dropping const: the FlatView hands out a const view of a region this
+     * harvest goes on to read a dirty bitmap for, turn logging on for, and
+     * clear bits in, all of which are non-const operations on a region the
+     * caller holds the BQL over.
+     */
+    sl->mr = (MemoryRegion *)mr;
+    sl->gpa = int128_get64(start);
+    sl->len = int128_get64(len);
+    sl->offset = offset_in_region;
+    sl->ram_addr = memory_region_get_ram_addr(sl->mr) + offset_in_region;
+    return false;
+}
+
+/*
+ * The guest-RAM ranges of the system address space. Returns how many were
+ * recorded.
+ *
+ * This asks the FlatView rather than reconstructing it, and the difference is
+ * not a simplification. It used to cut a monotone hull of every GPA ever
+ * tracked into slices by walking it with address_space_translate(), and that
+ * walk could not be made correct: address_space_translate_internal() clamps
+ * `plen` to the section *only when the section is RAM* (system/physmem.c). The
+ * first non-RAM byte in the hull therefore returned the whole remaining length,
+ * and the walk recorded one "not RAM" slice covering every guest page above it.
+ *
+ * On x86 q35 low RAM ends below the PCI hole and high RAM begins at 4 GiB, so
+ * one tracked page landing in low RAM while others sat above the hole put every
+ * page in high RAM into that slice. The harvest reads a page it cannot resolve
+ * as written — the conservative answer, and the right one for a page that is
+ * genuinely gone — so every tracked surface then reported itself permanently
+ * overwritten by the guest. The hull never shrank and the clear pass skipped
+ * unresolved pages, so nothing could undo it for the life of the VM.
+ *
+ * Downstream that is a guest-visible latch, not a slow path: every host-side
+ * copy of a surface is declared stale, the type-11 sampled rung refuses its
+ * resident and merges guest pages that never held the composite, and deferred
+ * render windows report `deferred_flush_clobber`. It reads as backdrops going
+ * transparent and popover geometry breaking, until the guest is rebooted.
+ *
+ * A range is kept whenever it is `ram`, including device BARs and flash. A
+ * tracked page that lands in one is a page this device must answer for rather
+ * than skip, and nothing turns logging on for a region until a tracked page
+ * resolves into it.
+ */
+static int reims_vgpu_dirty_ram_slices(ReimsVgpuDirtySlice *out, int max)
+{
+    ReimsVgpuDirtyRamScan scan = { out, max, 0 };
 
     RCU_READ_LOCK_GUARD();
-    while (cur < hi) {
-        hwaddr xlat, plen = hi - cur;
-        MemoryRegion *mr;
-
-        mr = address_space_translate(&address_space_memory, cur, &xlat, &plen,
-                                     true, MEMTXATTRS_UNSPECIFIED);
-        if (plen == 0 || n == max) {
-            return -1;
-        }
-        out[n].mr = (mr && memory_region_is_ram(mr)) ? mr : NULL;
-        out[n].gpa = cur;
-        out[n].len = plen;
-        out[n].offset = xlat;
-        out[n].ram_addr = out[n].mr
-            ? memory_region_get_ram_addr(out[n].mr) + xlat
-            : 0;
-        n++;
-        cur += plen;
-    }
-    return n;
+    flatview_for_each_range(address_space_to_flatview(&address_space_memory),
+                            reims_vgpu_dirty_ram_range, &scan);
+    return scan.n;
 }
 
 /* Which slice holds `gpa`, or -1. Slices are few and ordered, so a linear
@@ -389,11 +412,12 @@ static bool reims_vgpu_dirty_page_written(const ReimsVgpuDirtySlice *sl,
 void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
 {
     ReimsVgpuDirtySlice slices[REIMS_VGPU_DIRTY_MAX_SLICES];
+    bool logged[REIMS_VGPU_DIRTY_MAX_SLICES];
+    bool needs_log[REIMS_VGPU_DIRTY_MAX_SLICES];
     g_autoptr(GArray) written = NULL;
     g_autoptr(GArray) hit = NULL;
     GHashTableIter it;
     gpointer key, val;
-    uint64_t lo, hi;
     int n, i;
     bool enabled_any = false;
     guint w;
@@ -403,33 +427,28 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     }
 
     qemu_mutex_lock(&d->lock);
-    lo = d->lo;
-    hi = d->hi;
-    if (hi == 0 || d->reads_since_harvest == 0) {
+    if (g_hash_table_size(d->sets) == 0 || d->reads_since_harvest == 0) {
         qemu_mutex_unlock(&d->lock);
         return;
     }
     qemu_mutex_unlock(&d->lock);
 
+    n = reims_vgpu_dirty_ram_slices(slices, REIMS_VGPU_DIRTY_MAX_SLICES);
     /*
-     * Pass one names the regions. Enabling logging on a new one is a
-     * MemoryRegion transaction that rebuilds the flat view, so it happens
-     * outside the RCU section that named it, and the window is cut again
-     * against the view the transaction produced.
+     * Whether this device was already recording writes to each range when the
+     * sync below ran. Answered once per range rather than per page: the page
+     * loop runs over every page of every tracked set, and a hash lookup there
+     * is the harvest's inner loop.
+     *
+     * A range that is not logged yet is one whose bits mean nothing, so its
+     * pages read as written below and it is queued for logging afterwards.
+     * Enabling is deferred past the clear pass because memory_region_set_log()
+     * is a MemoryRegion transaction that rebuilds the flat view, which would
+     * leave this slice table describing a view that no longer exists.
      */
-    n = reims_vgpu_dirty_slice(lo, hi, slices, REIMS_VGPU_DIRTY_MAX_SLICES);
     for (i = 0; i < n; i++) {
-        MemoryRegion *mr = slices[i].mr;
-
-        if (mr && !g_hash_table_contains(d->logged, mr)) {
-            memory_region_ref(mr);
-            g_hash_table_add(d->logged, mr);
-            memory_region_set_log(mr, true, DIRTY_MEMORY_VGA);
-            enabled_any = true;
-        }
-    }
-    if (enabled_any) {
-        n = reims_vgpu_dirty_slice(lo, hi, slices, REIMS_VGPU_DIRTY_MAX_SLICES);
+        logged[i] = g_hash_table_contains(d->logged, slices[i].mr);
+        needs_log[i] = false;
     }
 
     /* One sync for every logged region, then only reads. */
@@ -446,33 +465,6 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     qemu_mutex_lock(&d->lock);
     d->harvests++;
     d->reads_since_harvest = 0;
-    /*
-     * This harvest turned logging on for a region, so the sync above is the
-     * first one that saw it and writes older than it were never recorded. Every
-     * set still inside its arming window is therefore not yet covered by a
-     * complete sync, whichever region it named: push it to the next harvest.
-     *
-     * This is what lets `reims_vgpu_dirty_track` arm at +1 instead of +2. The
-     * +2 was paying for this case on every set; this pays for it on the sets it
-     * actually applies to, which after the first surface of a boot is none.
-     *
-     * The test is `s->gen == 0` — never armed — and not `d->harvests <
-     * s->arm_at`. A set created at harvest H carries `arm_at = H + 1`, and
-     * `d->harvests` is already H + 1 here, so the second test is false for
-     * exactly the set that needs pushing. `s->gen` leaves 0 only in the arming
-     * block below and never returns to it, so it is the durable spelling of
-     * "this set has not been armed yet".
-     */
-    if (enabled_any) {
-        g_hash_table_iter_init(&it, d->sets);
-        while (g_hash_table_iter_next(&it, &key, &val)) {
-            ReimsVgpuDirtySet *s = val;
-
-            if (s->gen == 0) {
-                s->arm_at = d->harvests + 1;
-            }
-        }
-    }
     g_hash_table_iter_init(&it, d->sets);
     while (g_hash_table_iter_next(&it, &key, &val)) {
         ReimsVgpuDirtySet *s = val;
@@ -485,13 +477,19 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
             int si = reims_vgpu_dirty_slice_of(slices, n, gpa);
 
             /*
-             * Outside the window this harvest cut, or not RAM this device can
-             * read a bitmap for. Both mean the host cannot say the page is
-             * unwritten, and that reads as written — per page as well as for
-             * the set, so a per-page reader is no less conservative than the
-             * generation is.
+             * Not guest RAM this device can read a bitmap for, or RAM whose
+             * writes this device was not yet recording when the sync ran.
+             * Both mean the host cannot say the page is unwritten, and that
+             * reads as written — per page as well as for the set, so a
+             * per-page reader is no less conservative than the generation is.
              */
-            if (si < 0 || !slices[si].mr) {
+            if (si < 0) {
+                any = true;
+                g_array_append_val(hit, p);
+                continue;
+            }
+            if (!logged[si]) {
+                needs_log[si] = true;
                 any = true;
                 g_array_append_val(hit, p);
                 continue;
@@ -566,11 +564,61 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
             end = next.gpa + next.page_size;
             w++;
         }
-        if (si >= 0 && slices[si].mr) {
+        if (si >= 0) {
             memory_region_reset_dirty(
                 slices[si].mr, slices[si].offset + (first.gpa - slices[si].gpa),
                 end - first.gpa, DIRTY_MEMORY_VGA);
         }
         w++;
     }
+
+    /*
+     * Start recording writes to every region a tracked page resolved into and
+     * that was not being recorded for the sync above. Last, because this is a
+     * MemoryRegion transaction: it rebuilds the flat view, and the slice table
+     * the passes above and the clear below it used describes the old one.
+     *
+     * Nothing is missed by the delay. Every page in such a region already read
+     * as written, which is what a region with no recorded history has to say.
+     */
+    for (i = 0; i < n; i++) {
+        if (!needs_log[i]) {
+            continue;
+        }
+        memory_region_ref(slices[i].mr);
+        g_hash_table_add(d->logged, slices[i].mr);
+        memory_region_set_log(slices[i].mr, true, DIRTY_MEMORY_VGA);
+        enabled_any = true;
+    }
+    if (!enabled_any) {
+        return;
+    }
+    /*
+     * The sync above was the last one taken before this region started
+     * recording, so writes older than it were never recorded and their absence
+     * is not evidence. Every set still inside its arming window is therefore
+     * not yet covered by a complete sync, whichever region it named: push it to
+     * the next harvest.
+     *
+     * This is what lets `reims_vgpu_dirty_track` arm at +1 instead of +2. The
+     * +2 was paying for this case on every set; this pays for it on the sets it
+     * actually applies to, which after the first surface of a boot is none.
+     *
+     * The test is `s->gen == 0` — never armed — and not `d->harvests <
+     * s->arm_at`. A set created at harvest H carries `arm_at = H + 1`, and
+     * `d->harvests` is already H + 1 here, so the second test is false for
+     * exactly the set that needs pushing. `s->gen` leaves 0 only in the arming
+     * block above and never returns to it, so it is the durable spelling of
+     * "this set has not been armed yet".
+     */
+    qemu_mutex_lock(&d->lock);
+    g_hash_table_iter_init(&it, d->sets);
+    while (g_hash_table_iter_next(&it, &key, &val)) {
+        ReimsVgpuDirtySet *s = val;
+
+        if (s->gen == 0) {
+            s->arm_at = d->harvests + 1;
+        }
+    }
+    qemu_mutex_unlock(&d->lock);
 }
