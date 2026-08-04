@@ -67,13 +67,28 @@ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.
 
 if config_all_devices.has_key('CONFIG_REIMS_VGPU')
   # Thin QEMU C device links crates/reims-vgpu (Cargo staticlib). Backend is a
-  # configure-time choice (REIMS_VGPU_BACKEND=metal|vulkan, default metal) baked into
-  # the binary — one backend per boot, never a runtime env sniff.
+  # configure-time choice baked into the binary — one backend per boot, never a
+  # runtime env sniff.
   # Sources live in the parent repo, two directories above this vendored submodule.
   reims_vgpu_repo_dir = meson.global_source_root() / '..' / '..'
   reims_vgpu_abi_header_dir = reims_vgpu_repo_dir / 'crates' / 'reims-vgpu' / 'include'
-  reims_vgpu_backend_kind = run_command(find_program('sh'), '-c',
-    'printf %s "${REIMS_VGPU_BACKEND:-metal}"', check: true).stdout().strip()
+  # A meson option and not the environment, because meson re-runs this file
+  # whenever ninja decides the build is out of date — and that regeneration
+  # inherits ninja's environment, not the one the configure ran under. A build
+  # configured for Vulkan therefore silently became a Metal one the first time
+  # any meson.build changed under a plain `ninja`, and on Linux that build fails
+  # with twenty Rust errors from an Apple-only arm. An option is stored in the
+  # build directory and survives regeneration, which is the property this needs.
+  #
+  # `env` keeps `REIMS_VGPU_BACKEND` working for a caller that has not been
+  # taught the option yet, and it is only ever read on a real configure —
+  # `scripts/qemu-build` passes the option, so the fallback is not on the path
+  # any boot takes.
+  reims_vgpu_backend_kind = get_option('reims_vgpu_backend')
+  if reims_vgpu_backend_kind == 'env'
+    reims_vgpu_backend_kind = run_command(find_program('sh'), '-c',
+      'printf %s "${REIMS_VGPU_BACKEND:-metal}"', check: true).stdout().strip()
+  endif
   cargo = find_program('cargo')
   # Rust staticlib always needs these on Unix; Apple frameworks only on Darwin.
   reims_vgpu_rust_sys_libs = ['-lm', '-ldl', '-lpthread']
