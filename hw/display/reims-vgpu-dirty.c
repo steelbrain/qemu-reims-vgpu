@@ -419,7 +419,6 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     GHashTableIter it;
     gpointer key, val;
     int n, i;
-    bool enabled_any = false;
     guint w;
 
     if (!d) {
@@ -469,6 +468,7 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     while (g_hash_table_iter_next(&it, &key, &val)) {
         ReimsVgpuDirtySet *s = val;
         bool any = false;
+        bool unlogged = false;
         size_t p;
 
         g_array_set_size(hit, 0);
@@ -490,6 +490,7 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
             }
             if (!logged[si]) {
                 needs_log[si] = true;
+                unlogged = true;
                 any = true;
                 g_array_append_val(hit, p);
                 continue;
@@ -504,6 +505,22 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
                  * would consume the report of every set sharing the page. */
                 g_array_append_val(written, rec);
             }
+        }
+        /*
+         * Some page of this set sits in a region whose writes this device was
+         * not yet recording when the sync above ran, so writes older than it
+         * were never recorded and their absence is not evidence. Wait for a
+         * harvest that covered every page.
+         *
+         * This is what lets `reims_vgpu_dirty_track` arm at +1 instead of +2.
+         * The +2 was paying for this case on every set; this pays for it on the
+         * sets it applies to, which after the first surface of a boot is none.
+         * The test is `s->gen == 0` — never armed — because an already armed set
+         * must not be sent back through its startup window: its pages read as
+         * written above, which is the conservative answer and needs no help.
+         */
+        if (s->gen == 0 && unlogged) {
+            s->arm_at = d->harvests + 1;
         }
         if (d->harvests < s->arm_at) {
             /* Startup window: an absence of reports says nothing about the
@@ -576,10 +593,11 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
      * Start recording writes to every region a tracked page resolved into and
      * that was not being recorded for the sync above. Last, because this is a
      * MemoryRegion transaction: it rebuilds the flat view, and the slice table
-     * the passes above and the clear below it used describes the old one.
+     * every pass above it describes the old one.
      *
      * Nothing is missed by the delay. Every page in such a region already read
-     * as written, which is what a region with no recorded history has to say.
+     * as written — which is what a region with no recorded history has to say —
+     * and no set whose pages were among them armed on this harvest.
      */
     for (i = 0; i < n; i++) {
         if (!needs_log[i]) {
@@ -588,37 +606,5 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
         memory_region_ref(slices[i].mr);
         g_hash_table_add(d->logged, slices[i].mr);
         memory_region_set_log(slices[i].mr, true, DIRTY_MEMORY_VGA);
-        enabled_any = true;
     }
-    if (!enabled_any) {
-        return;
-    }
-    /*
-     * The sync above was the last one taken before this region started
-     * recording, so writes older than it were never recorded and their absence
-     * is not evidence. Every set still inside its arming window is therefore
-     * not yet covered by a complete sync, whichever region it named: push it to
-     * the next harvest.
-     *
-     * This is what lets `reims_vgpu_dirty_track` arm at +1 instead of +2. The
-     * +2 was paying for this case on every set; this pays for it on the sets it
-     * actually applies to, which after the first surface of a boot is none.
-     *
-     * The test is `s->gen == 0` — never armed — and not `d->harvests <
-     * s->arm_at`. A set created at harvest H carries `arm_at = H + 1`, and
-     * `d->harvests` is already H + 1 here, so the second test is false for
-     * exactly the set that needs pushing. `s->gen` leaves 0 only in the arming
-     * block above and never returns to it, so it is the durable spelling of
-     * "this set has not been armed yet".
-     */
-    qemu_mutex_lock(&d->lock);
-    g_hash_table_iter_init(&it, d->sets);
-    while (g_hash_table_iter_next(&it, &key, &val)) {
-        ReimsVgpuDirtySet *s = val;
-
-        if (s->gen == 0) {
-            s->arm_at = d->harvests + 1;
-        }
-    }
-    qemu_mutex_unlock(&d->lock);
 }
