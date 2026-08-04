@@ -26,6 +26,12 @@ typedef struct ReimsVgpuDirtySlice {
     uint64_t len;           /* bytes covered */
     ram_addr_t ram_addr;    /* ram_addr_t of `gpa` */
     hwaddr offset;          /* offset of `gpa` within mr */
+    /* Whether this device was already recording writes to the range when this
+     * harvest's sync ran, and whether a tracked page asked it to start. Held
+     * per slice rather than in parallel arrays because they are read in the
+     * page loop, which is the harvest's inner loop. */
+    bool logged;
+    bool needs_log;
 } ReimsVgpuDirtySlice;
 
 /* A tracked page set: one mapping incarnation's guest storage. */
@@ -57,6 +63,22 @@ struct ReimsVgpuDirty {
      * saving this device never collects.
      */
     GHashTable *logged;     /* MemoryRegion* -> itself */
+    /*
+     * The guest-RAM ranges of the system address space, rebuilt at the top of
+     * each harvest and owned across harvests only so the steady state does not
+     * allocate. Grown to whatever the flat view reports and never bounded: a
+     * range this table dropped would read as written for every page in it, for
+     * the life of the VM, with nothing to say so — which is precisely the
+     * failure the flat view walk replaced.
+     *
+     * Measured at 5 ranges on x86 q35 with this device, unchanged across a
+     * driven boot including the load phase. So this is not a table under
+     * pressure, and the growth is not there to serve a reach anyone has seen.
+     * It is here because the alternative to growing is dropping, and dropping
+     * is unobservable from the guest side and permanent.
+     */
+    ReimsVgpuDirtySlice *slices;
+    int slices_cap;
     uint64_t harvests;
     /*
      * Generation reads since the last harvest. A harvest nothing has consumed
@@ -66,16 +88,6 @@ struct ReimsVgpuDirty {
      */
     uint64_t reads_since_harvest;
 };
-
-/*
- * Bound on guest-RAM ranges this device will resolve pages against. Both
- * product machines present guest RAM as one MemoryRegion in a handful of
- * ranges — three on x86 q35 (the two below the PCI hole and the one above
- * 4 GiB), one on arm64 — so this is a ceiling on a shape neither pathway
- * approaches rather than a budget. A machine with more ranges loses the tail,
- * and every page there reads as written, which is the conservative answer.
- */
-#define REIMS_VGPU_DIRTY_MAX_SLICES 64
 
 static void reims_vgpu_dirty_set_free(gpointer p)
 {
@@ -115,6 +127,7 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
     }
     g_hash_table_destroy(d->logged);
     g_hash_table_destroy(d->sets);
+    g_free(d->slices);
     qemu_mutex_destroy(&d->lock);
     g_free(d);
 }
@@ -298,8 +311,7 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
 }
 
 typedef struct ReimsVgpuDirtyRamScan {
-    ReimsVgpuDirtySlice *out;
-    int max;
+    ReimsVgpuDirty *d;
     int n;
 } ReimsVgpuDirtyRamScan;
 
@@ -308,15 +320,19 @@ static bool reims_vgpu_dirty_ram_range(Int128 start, Int128 len,
                                        hwaddr offset_in_region, void *opaque)
 {
     ReimsVgpuDirtyRamScan *scan = opaque;
+    ReimsVgpuDirty *d = scan->d;
     ReimsVgpuDirtySlice *sl;
 
     if (!mr->ram || !int128_nz(len)) {
         return false;
     }
-    if (scan->n == scan->max) {
-        return true;
+    if (scan->n == d->slices_cap) {
+        d->slices_cap = d->slices_cap ? d->slices_cap * 2 : 16;
+        d->slices = g_renew(ReimsVgpuDirtySlice, d->slices, d->slices_cap);
     }
-    sl = &scan->out[scan->n++];
+    sl = &d->slices[scan->n++];
+    sl->logged = false;
+    sl->needs_log = false;
     /*
      * Dropping const: the FlatView hands out a const view of a region this
      * harvest goes on to read a dirty bitmap for, turn logging on for, and
@@ -361,10 +377,17 @@ static bool reims_vgpu_dirty_ram_range(Int128 start, Int128 len,
  * tracked page that lands in one is a page this device must answer for rather
  * than skip, and nothing turns logging on for a region until a tracked page
  * resolves into it.
+ *
+ * Every such range is recorded; the table grows to fit rather than stopping at
+ * a bound. A bound here is not a budget that costs latency when it binds — a
+ * dropped range makes every page in it read as written for the life of the VM,
+ * which is the same latch by a smaller door, and one no counter would name.
+ * Growth is amortized and the steady state reallocates nothing, because the
+ * table is owned across harvests and the flat view's shape does not churn.
  */
-static int reims_vgpu_dirty_ram_slices(ReimsVgpuDirtySlice *out, int max)
+static int reims_vgpu_dirty_ram_slices(ReimsVgpuDirty *d)
 {
-    ReimsVgpuDirtyRamScan scan = { out, max, 0 };
+    ReimsVgpuDirtyRamScan scan = { d, 0 };
 
     RCU_READ_LOCK_GUARD();
     flatview_for_each_range(address_space_to_flatview(&address_space_memory),
@@ -411,9 +434,7 @@ static bool reims_vgpu_dirty_page_written(const ReimsVgpuDirtySlice *sl,
 
 void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
 {
-    ReimsVgpuDirtySlice slices[REIMS_VGPU_DIRTY_MAX_SLICES];
-    bool logged[REIMS_VGPU_DIRTY_MAX_SLICES];
-    bool needs_log[REIMS_VGPU_DIRTY_MAX_SLICES];
+    ReimsVgpuDirtySlice *slices;
     g_autoptr(GArray) written = NULL;
     g_autoptr(GArray) hit = NULL;
     GHashTableIter it;
@@ -432,7 +453,8 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     }
     qemu_mutex_unlock(&d->lock);
 
-    n = reims_vgpu_dirty_ram_slices(slices, REIMS_VGPU_DIRTY_MAX_SLICES);
+    n = reims_vgpu_dirty_ram_slices(d);
+    slices = d->slices;
     /*
      * Whether this device was already recording writes to each range when the
      * sync below ran. Answered once per range rather than per page: the page
@@ -446,8 +468,7 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
      * leave this slice table describing a view that no longer exists.
      */
     for (i = 0; i < n; i++) {
-        logged[i] = g_hash_table_contains(d->logged, slices[i].mr);
-        needs_log[i] = false;
+        slices[i].logged = g_hash_table_contains(d->logged, slices[i].mr);
     }
 
     /* One sync for every logged region, then only reads. */
@@ -488,8 +509,8 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
                 g_array_append_val(hit, p);
                 continue;
             }
-            if (!logged[si]) {
-                needs_log[si] = true;
+            if (!slices[si].logged) {
+                slices[si].needs_log = true;
                 unlogged = true;
                 any = true;
                 g_array_append_val(hit, p);
@@ -600,11 +621,19 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
      * and no set whose pages were among them armed on this harvest.
      */
     for (i = 0; i < n; i++) {
-        if (!needs_log[i]) {
+        if (!slices[i].needs_log) {
             continue;
         }
-        memory_region_ref(slices[i].mr);
-        g_hash_table_add(d->logged, slices[i].mr);
-        memory_region_set_log(slices[i].mr, true, DIRTY_MEMORY_VGA);
+        /*
+         * One MemoryRegion can supply several ranges — on x86 q35 guest RAM is
+         * one region aliased below and above the PCI hole — so the insert is
+         * what decides, not the flag. g_hash_table_add() reports whether the
+         * key was new, which keeps the reference this table owns at one per
+         * region however many of its ranges asked.
+         */
+        if (g_hash_table_add(d->logged, slices[i].mr)) {
+            memory_region_ref(slices[i].mr);
+            memory_region_set_log(slices[i].mr, true, DIRTY_MEMORY_VGA);
+        }
     }
 }
