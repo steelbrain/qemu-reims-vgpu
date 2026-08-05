@@ -62,11 +62,27 @@ int reims_vgpu_shim_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len);
  *
  * The verdict comes from Rust whole; this only forwards it, and answers false
  * for a device that has no handle or cannot answer. Do NOT rebuild it from
- * `reims_vgpu_qemu_console_feed`'s kind and mapping id — that reconstruction is
+ * `reims_vgpu_shim_console_feed`'s kind and mapping id — that reconstruction is
  * what the two shims had drifted on, x86 gating and arm64 painting every
  * present it was handed.
  */
 bool reims_vgpu_shim_scanout_may_paint(uint64_t rust_handle, uint32_t mapping_id);
+
+/*
+ * Who owns the host console right now: a `REIMS_VGPU_CONSOLE_FEED_*`. The
+ * `out_*` are filled only for _EARLY, and are left untouched otherwise.
+ *
+ * A device that has no handle, or whose call does not return OK, is reported as
+ * _FIRMWARE. That is the answer, not a fallback: the pre-boundary firmware
+ * console is what owns the screen until Rust says otherwise, so failing closed
+ * is the only reading that cannot paint product pixels over it. The arm64 shim
+ * used to conflate "the call failed" with "not _EARLY" and fall through to its
+ * post-boundary re-push, which is the shim inventing a policy for "no answer" —
+ * `device_console_feed`'s own doc names that as the thing being removed.
+ */
+uint32_t reims_vgpu_shim_console_feed(uint64_t rust_handle, uint32_t *out_mid,
+                                      uint32_t *out_w, uint32_t *out_h,
+                                      uint32_t *out_gen);
 
 /*
  * Host-owned-window input: replay a neutral Rust input action through the

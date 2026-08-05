@@ -396,27 +396,6 @@ static bool reims_vgpu_pci_copy_early_console(ReimsVGPUPCIState *s)
 }
 
 /*
- * Ask Rust who owns the console. C holds no rule of its own here: the three-way
- * this used to assemble from two queries is product policy and now lives at
- * `device_console_feed`. `out_*` are filled only for _EARLY.
- */
-static uint32_t reims_vgpu_pci_console_feed(ReimsVGPUPCIState *s, uint32_t *out_mid,
-                                            uint32_t *out_w, uint32_t *out_h,
-                                            uint32_t *out_gen)
-{
-    uint32_t kind = REIMS_VGPU_CONSOLE_FEED_FIRMWARE;
-
-    if (s->rust_handle == 0) {
-        return REIMS_VGPU_CONSOLE_FEED_FIRMWARE;
-    }
-    if (reims_vgpu_qemu_console_feed(s->rust_handle, &kind, out_mid, out_w, out_h,
-                                     out_gen) != REIMS_VGPU_QEMU_OK) {
-        return REIMS_VGPU_CONSOLE_FEED_FIRMWARE;
-    }
-    return kind;
-}
-
-/*
  * Paint a named guest mapping into the QEMU surface (pre- or post-boundary).
  * Pre-boundary early writebacks and post-boundary DisplaySwap both use this
  * path. Return true when the surface was updated.
@@ -657,7 +636,7 @@ static bool reims_vgpu_pci_fb_update(void *opaque)
     }
 
     /* Host-console ownership is Rust's call; this only paints what it names. */
-    kind = reims_vgpu_pci_console_feed(s, &mid, &w, &h, &gen);
+    kind = reims_vgpu_shim_console_feed(s->rust_handle, &mid, &w, &h, &gen);
 
     if (kind == REIMS_VGPU_CONSOLE_FEED_EARLY) {
         /* Re-pull the latched front (archive fb_update early path). */

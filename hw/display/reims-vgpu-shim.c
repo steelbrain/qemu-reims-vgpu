@@ -133,6 +133,22 @@ bool reims_vgpu_shim_scanout_may_paint(uint64_t rust_handle, uint32_t mapping_id
     return may != 0;
 }
 
+uint32_t reims_vgpu_shim_console_feed(uint64_t rust_handle, uint32_t *out_mid,
+                                      uint32_t *out_w, uint32_t *out_h,
+                                      uint32_t *out_gen)
+{
+    uint32_t kind = REIMS_VGPU_CONSOLE_FEED_FIRMWARE;
+
+    if (rust_handle == 0) {
+        return REIMS_VGPU_CONSOLE_FEED_FIRMWARE;
+    }
+    if (reims_vgpu_qemu_console_feed(rust_handle, &kind, out_mid, out_w, out_h,
+                                     out_gen) != REIMS_VGPU_QEMU_OK) {
+        return REIMS_VGPU_CONSOLE_FEED_FIRMWARE;
+    }
+    return kind;
+}
+
 void reims_vgpu_shim_input_key(QemuConsole *con, uint32_t evdev, bool down)
 {
     if (!con) {

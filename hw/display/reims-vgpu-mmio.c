@@ -479,40 +479,29 @@ static void reims_vgpu_mmio_set_mode(ReimsVGPUMMIOState *s, uint32_t width,
 }
 
 /*
- * Scanout apply = apple-gfx modeChangeHandler + encode path, thin:
- *   - HostAction carries guest-presented surface size (PG modeChangeHandler's
- *     sizeInPixels from the named IOSurface — not a host size heuristic).
- *   - set_mode(w,h) is exact, like apple-gfx.m set_mode.
- *   - Copy fills that surface; do not invent or clamp dimensions in C.
+ * Paint a named guest mapping into the QEMU surface, at the geometry the caller
+ * was handed:
+ *   - that geometry is the guest-presented surface size (PG modeChangeHandler's
+ *     sizeInPixels from the named IOSurface — not a host size heuristic), so
+ *     set_mode(w,h) is exact, like apple-gfx.m set_mode;
+ *   - the copy fills that surface; do not invent or clamp dimensions in C.
+ *
+ * Returns whether the surface now holds a frame worth showing. Unlike the PCI
+ * shim's twin this does not push the console itself — see the newFrame note at
+ * the tail, which is a measurement of this pathway and not of that one.
  */
-static void reims_vgpu_mmio_apply_scanout(ReimsVGPUMMIOState *s,
-                                       const ReimsVgpuHostAction *a)
+static bool reims_vgpu_mmio_paint_scanout(ReimsVGPUMMIOState *s,
+                                          uint32_t mapping_id, uint32_t width,
+                                          uint32_t height, uint32_t generation)
 {
-    uint32_t mapping_id = (uint32_t)a->a0;
-    uint32_t width = (uint32_t)a->a1;
-    uint32_t height = (uint32_t)a->a2;
-    uint32_t generation = (uint32_t)a->a3;
     uint8_t *dst;
     uint32_t stride;
     int rc;
 
-    if (s->rust_handle == 0 || !s->con) {
-        return;
-    }
     /* Zero size is not a present; skip (framework would not mode-change to 0). */
     if (width == 0 || height == 0) {
-        return;
+        return false;
     }
-    /*
-     * Console ownership, from Rust. This shim used to paint every present it was
-     * handed while the PCI shim gated on the same question, so a pre-boundary
-     * present naming an unlatched mapping stole the firmware console here and
-     * was refused there — one rule, one pathway holding it.
-     */
-    if (!reims_vgpu_shim_scanout_may_paint(s->rust_handle, mapping_id)) {
-        return;
-    }
-
     /*
      * One surface path. There used to be two: reims_vgpu_mmio_set_gpu_mode
      * allocated an alignment-negotiated buffer, attached it as the
@@ -524,7 +513,7 @@ static void reims_vgpu_mmio_apply_scanout(ReimsVGPUMMIOState *s,
      */
     reims_vgpu_mmio_set_mode(s, width, height);
     if (!s->surface) {
-        return;
+        return false;
     }
 
     dst = surface_data(s->surface);
@@ -535,7 +524,7 @@ static void reims_vgpu_mmio_apply_scanout(ReimsVGPUMMIOState *s,
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: scanout_copy failed mapping=%u %ux%u rc=%d\n",
                       TYPE_REIMS_VGPU_MMIO, mapping_id, width, height, rc);
-        return;
+        return false;
     }
     if (rc == REIMS_VGPU_QEMU_OK) {
         trace_reims_vgpu_mmio_scanout(mapping_id, width, height);
@@ -546,9 +535,33 @@ static void reims_vgpu_mmio_apply_scanout(ReimsVGPUMMIOState *s,
      * pending_frames coalesce) — not update_full on every ScanoutUpdate.
      * Rapid dual-mid DisplaySwaps overwrite surface pixels with the latest
      * +0x188 retain; one vsync shows the latest finished present, not every
-     * lagging double-buffer half (logo thrash under hover).
+     * lagging double-buffer half (logo thrash under hover). An EMPTY copy is
+     * ready too: the surface still holds the front it last painted.
      */
-    s->new_frame_ready = true;
+    return true;
+}
+
+static void reims_vgpu_mmio_apply_scanout(ReimsVGPUMMIOState *s,
+                                       const ReimsVgpuHostAction *a)
+{
+    uint32_t mapping_id = (uint32_t)a->a0;
+
+    if (s->rust_handle == 0 || !s->con) {
+        return;
+    }
+    /*
+     * Console ownership, from Rust. This shim used to paint every present it was
+     * handed while the PCI shim gated on the same question, so a pre-boundary
+     * present naming an unlatched mapping stole the firmware console here and
+     * was refused there — one rule, one pathway holding it.
+     */
+    if (!reims_vgpu_shim_scanout_may_paint(s->rust_handle, mapping_id)) {
+        return;
+    }
+    if (reims_vgpu_mmio_paint_scanout(s, mapping_id, (uint32_t)a->a1,
+                                      (uint32_t)a->a2, (uint32_t)a->a3)) {
+        s->new_frame_ready = true;
+    }
 }
 
 static void reims_vgpu_mmio_apply_cursor(ReimsVGPUMMIOState *s,
@@ -700,70 +713,58 @@ static bool reims_vgpu_mmio_fb_update(void *opaque)
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t generation = 0;
-    uint32_t kind = 0;
-    uint8_t *dst;
-    uint32_t stride;
-    int rc;
+    uint32_t kind;
 
-    if (s->rust_handle == 0 || !s->con) {
+    if (!s->con) {
         return true;
     }
 
     /*
-     * Archive poll_tick subset: re-drive ONLINE once enable mask (+0x104 bit 2)
-     * is published, so createDisplayAttributes consumes TimingElements (1440).
-     * May deliver ScanoutUpdate HostActions (guest present → frame ready).
+     * Re-drive ONLINE once the enable mask (+0x104 bit 2) is published, so
+     * createDisplayAttributes consumes TimingElements. May deliver ScanoutUpdate
+     * HostActions (guest present → frame ready).
      */
-    if (reims_vgpu_qemu_device_poll(s->rust_handle) == REIMS_VGPU_QEMU_OK) {
+    if (s->rust_handle != 0 &&
+        reims_vgpu_qemu_device_poll(s->rust_handle) == REIMS_VGPU_QEMU_OK) {
         reims_vgpu_mmio_deliver_actions(s);
     }
 
-    rc = reims_vgpu_qemu_console_feed(s->rust_handle, &kind, &mapping_id, &width,
-                                      &height, &generation);
-    if (rc == REIMS_VGPU_QEMU_OK && kind == REIMS_VGPU_CONSOLE_FEED_EARLY) {
+    /* Host-console ownership is Rust's call; this only paints what it names. */
+    kind = reims_vgpu_shim_console_feed(s->rust_handle, &mapping_id, &width,
+                                        &height, &generation);
+
+    if (kind == REIMS_VGPU_CONSOLE_FEED_EARLY) {
         /*
-         * Early boot only (_EARLY ends at the first DisplaySwap, and Rust
-         * guarantees a paintable mapping and geometry with it).
-         * Never resize from the refresh path. First paint may establish size;
-         * later size changes only via ScanoutUpdate HostAction.
+         * _EARLY ends at the first DisplaySwap, and Rust guarantees a paintable
+         * mapping and geometry with it — so paint at the geometry it named
+         * rather than at whatever the current surface happens to be. This shim
+         * used to hold the opposite rule ("never resize from the refresh path"),
+         * which is a decode rule living in C: `device_console_feed`'s own doc
+         * records that both shims re-tested the geometry and that neither
+         * should. An _EARLY whose size differed from the surface repainted
+         * nothing here, forever, while the PCI shim resized and painted it.
          */
-        if (s->surface &&
-            (surface_width(s->surface) != width ||
-             surface_height(s->surface) != height)) {
-            /* Hold last surface until guest present renames size. */
-            if (s->new_frame_ready) {
-                qemu_console_update_full(s->con);
-                s->new_frame_ready = false;
-            }
-            return true;
-        }
-        if (!s->surface) {
-            reims_vgpu_mmio_set_mode(s, width, height);
-        }
-        if (!s->surface) {
-            return true;
-        }
-        width = surface_width(s->surface);
-        height = surface_height(s->surface);
-        dst = surface_data(s->surface);
-        stride = surface_stride(s->surface);
-        /*
-         * Archive scanout gen-cache: pass observed generation so Unchanged
-         * skips full re-copy when front is quiet (not generation 0 always).
-         */
-        rc = reims_vgpu_qemu_scanout_copy(s->rust_handle, mapping_id, dst, stride,
-                                   width, height, generation);
-        if (rc == REIMS_VGPU_QEMU_OK) {
-            s->new_frame_ready = true;
-        }
-        if (s->new_frame_ready) {
+        if (reims_vgpu_mmio_paint_scanout(s, mapping_id, width, height,
+                                          generation)) {
             qemu_console_update_full(s->con);
             s->new_frame_ready = false;
         }
         return true;
     }
+    if (kind == REIMS_VGPU_CONSOLE_FEED_FIRMWARE) {
+        /*
+         * The guest is still on its firmware console and there is no BAR1 GOP on
+         * this pathway to copy from, so nothing is painted. Return rather than
+         * fall through: the pending frame below is a product one, and pushing it
+         * while Rust says the firmware console owns the screen is the
+         * pre-boundary steal this feed exists to prevent.
+         */
+        return true;
+    }
 
-    /* Post-boundary: hostPresentCount re-show of guest-finished frame only. */
+    /* Nothing painted this tick — re-push the last frame if one is pending.
+     * _PRODUCT reaches here every tick: apply_scanout does that painting, and
+     * this is the hostPresentCount re-show of a guest-finished frame. */
     if (s->new_frame_ready && s->surface) {
         qemu_console_update_full(s->con);
         s->new_frame_ready = false;
