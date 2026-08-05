@@ -639,10 +639,19 @@ static bool reims_vgpu_pci_fb_update(void *opaque)
     kind = reims_vgpu_shim_console_feed(s->rust_handle, &mid, &w, &h, &gen);
 
     if (kind == REIMS_VGPU_CONSOLE_FEED_EARLY) {
-        /* Re-pull the latched front (archive fb_update early path). */
-        if (reims_vgpu_pci_paint_scanout(s, mid, w, h, gen)) {
-            return true;
-        }
+        /* Re-pull the latched front (archive fb_update early path).
+         *
+         * Return either way, for the same reason the firmware arm below states:
+         * a failed paint must NOT fall through to the re-push, whose pending
+         * frame is a product one. _EARLY means Rust says the early console owns
+         * the screen, so pushing a product frame here is the same pre-boundary
+         * steal, and this arm used to do it while the arm64 shim returned.
+         *
+         * No console update here: unlike the arm64 shim's, this
+         * `paint_scanout` already calls `qemu_console_update_full` and clears
+         * `new_frame_ready` itself on the path that returns true. */
+        (void)reims_vgpu_pci_paint_scanout(s, mid, w, h, gen);
+        return true;
     } else if (kind == REIMS_VGPU_CONSOLE_FEED_FIRMWARE) {
         if (reims_vgpu_pci_copy_early_console(s)) {
             qemu_console_update_full(s->con);
