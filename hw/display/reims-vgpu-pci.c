@@ -38,14 +38,17 @@
 #define TYPE_REIMS_VGPU_PCI "reims-vgpu-pci"
 OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUPCIState, REIMS_VGPU_PCI)
 
-/* BAR0 = full gfx window (16 KiB); control block at +0x1000. */
-#define REIMS_VGPU_PCI_BAR_SIZE  0x4000
-/* BAR1 = linear UEFI GOP framebuffer (BGRA8 1920×1080 + headroom). */
+/*
+ * BAR0 = full gfx window; control block at +0x1000. The size is the shared
+ * REIMS_VGPU_GFX_MMIO_SIZE — Rust bounds its register store against the same
+ * number, and a private copy here is a window the guest can address past it.
+ */
+/* BAR1 = linear UEFI GOP framebuffer (BGRA8 at the EFI boot mode + headroom). */
 #define REIMS_VGPU_PCI_FB_SIZE   (16u * 1024u * 1024u)
 #define REIMS_VGPU_PCI_VENDOR    0x106B
 #define REIMS_VGPU_PCI_DEVICE    0xEEEE
-#define REIMS_VGPU_PCI_EFI_W     1920u
-#define REIMS_VGPU_PCI_EFI_H     1080u
+/* BAR1's own pixel size, not a shared constant: it describes this shim's GOP
+ * layout, which Rust reaches only through efi_console_copy's explicit stride. */
 #define REIMS_VGPU_PCI_EFI_BPP   4u
 
 struct ReimsVGPUPCIState {
@@ -324,8 +327,8 @@ static bool reims_vgpu_pci_copy_gop_fb(ReimsVGPUPCIState *s)
     uint8_t *dst;
     uint32_t dst_stride;
     uint32_t src_stride;
-    uint32_t w = REIMS_VGPU_PCI_EFI_W;
-    uint32_t h = REIMS_VGPU_PCI_EFI_H;
+    uint32_t w = REIMS_VGPU_EFI_BOOT_WIDTH;
+    uint32_t h = REIMS_VGPU_EFI_BOOT_HEIGHT;
     uint32_t y;
 
     if (!s->surface || !memory_region_is_ram(&s->fb_vram)) {
@@ -365,8 +368,8 @@ static bool reims_vgpu_pci_copy_early_console(ReimsVGPUPCIState *s)
 {
     uint8_t *dst;
     uint32_t dst_stride;
-    uint32_t w = REIMS_VGPU_PCI_EFI_W;
-    uint32_t h = REIMS_VGPU_PCI_EFI_H;
+    uint32_t w = REIMS_VGPU_EFI_BOOT_WIDTH;
+    uint32_t h = REIMS_VGPU_EFI_BOOT_HEIGHT;
     int rc;
 
     if (!s->surface) {
@@ -830,7 +833,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
 
     memory_region_init_io(&s->iomem_gfx, OBJECT(s), &reims_vgpu_pci_gfx_ops, s,
                           TYPE_REIMS_VGPU_PCI ".gfx",
-                          REIMS_VGPU_PCI_BAR_SIZE);
+                          REIMS_VGPU_GFX_MMIO_SIZE);
     /* 32-bit non-prefetch BAR (16 KiB control window). Live 2026-07-13: 64-bit
      * BAR behind pcie-root-port caused Apple efiboot STOP 0x15; keep 32-bit. */
     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->iomem_gfx);
@@ -956,10 +959,10 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
     s->shutdown_notifier_registered = true;
 
     s->con = qemu_graphic_console_create(DEVICE(pdev), 0, &reims_vgpu_pci_fb_ops, s);
-    reims_vgpu_pci_set_mode(s, REIMS_VGPU_PCI_EFI_W, REIMS_VGPU_PCI_EFI_H);
+    reims_vgpu_pci_set_mode(s, REIMS_VGPU_EFI_BOOT_WIDTH, REIMS_VGPU_EFI_BOOT_HEIGHT);
     if (s->surface) {
         memset(surface_data(s->surface), 0,
-               (size_t)surface_stride(s->surface) * REIMS_VGPU_PCI_EFI_H);
+               (size_t)surface_stride(s->surface) * REIMS_VGPU_EFI_BOOT_HEIGHT);
         qemu_console_update_full(s->con);
     }
     if (s->con) {
@@ -979,8 +982,8 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
      * feature returns ERR_STATE here and QEMU's own display stays in charge.
      */
     if (reims_vgpu_pci_window_requested()) {
-        int wrc = reims_vgpu_qemu_window_start(s->rust_handle, REIMS_VGPU_PCI_EFI_W,
-                                        REIMS_VGPU_PCI_EFI_H);
+        int wrc = reims_vgpu_qemu_window_start(s->rust_handle, REIMS_VGPU_EFI_BOOT_WIDTH,
+                                        REIMS_VGPU_EFI_BOOT_HEIGHT);
         if (wrc != REIMS_VGPU_QEMU_OK) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "%s: host window unavailable (rc=%d); "
@@ -999,8 +1002,8 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
             if (fb) {
                 reims_vgpu_qemu_window_set_early_fb(
                     s->rust_handle, fb,
-                    REIMS_VGPU_PCI_EFI_W * REIMS_VGPU_PCI_EFI_BPP,
-                    REIMS_VGPU_PCI_EFI_W, REIMS_VGPU_PCI_EFI_H);
+                    REIMS_VGPU_EFI_BOOT_WIDTH * REIMS_VGPU_PCI_EFI_BPP,
+                    REIMS_VGPU_EFI_BOOT_WIDTH, REIMS_VGPU_EFI_BOOT_HEIGHT);
             }
         }
     }
@@ -1047,10 +1050,10 @@ static void reims_vgpu_pci_reset(DeviceState *dev)
     s->drain_pending = false;
     qemu_mutex_unlock(&s->drain_mutex);
     s->new_frame_ready = false;
-    reims_vgpu_pci_set_mode(s, REIMS_VGPU_PCI_EFI_W, REIMS_VGPU_PCI_EFI_H);
+    reims_vgpu_pci_set_mode(s, REIMS_VGPU_EFI_BOOT_WIDTH, REIMS_VGPU_EFI_BOOT_HEIGHT);
     if (s->surface && s->con) {
         memset(surface_data(s->surface), 0,
-               (size_t)surface_stride(s->surface) * REIMS_VGPU_PCI_EFI_H);
+               (size_t)surface_stride(s->surface) * REIMS_VGPU_EFI_BOOT_HEIGHT);
         qemu_console_set_cursor(s->con, cursor_builtin_hidden());
         qemu_console_set_mouse(s->con, 0, 0, false);
         s->new_frame_ready = true;

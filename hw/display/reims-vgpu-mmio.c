@@ -60,14 +60,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUMMIOState, REIMS_VGPU_MMIO)
 
 /*
  * Window sizes match the live Reims VGPU contract / apple-gfx-mmio:
- * gfx = 16 KiB, iosfc = 64 KiB.
+ * gfx = 16 KiB, iosfc = 64 KiB. The gfx size is the shared
+ * REIMS_VGPU_GFX_MMIO_SIZE — Rust bounds its register store against the same
+ * number and a private copy here is a window the guest can address past it.
+ * The iosfc size stays local; Rust keeps no per-offset state for that rail, so
+ * mirroring it would create a source of truth nothing checks.
  */
-#define REIMS_VGPU_MMIO_GFX_MMIO_SIZE   0x4000
 #define REIMS_VGPU_MMIO_IOSFC_MMIO_SIZE 0x10000
-
-/* EFI boot mode dimensions (contract / model::regs). */
-#define REIMS_VGPU_MMIO_EFI_W  1920u
-#define REIMS_VGPU_MMIO_EFI_H  1080u
 
 /* Rust device/window action poll cadence (250 Hz, non-blocking). */
 #define REIMS_VGPU_MMIO_WINDOW_POLL_MS 4
@@ -917,7 +916,7 @@ static void reims_vgpu_mmio_init(Object *obj)
      */
     memory_region_init_io(&s->iomem_gfx, obj, &reims_vgpu_mmio_gfx_ops, s,
                           TYPE_REIMS_VGPU_MMIO ".gfx",
-                          REIMS_VGPU_MMIO_GFX_MMIO_SIZE);
+                          REIMS_VGPU_GFX_MMIO_SIZE);
     memory_region_init_io(&s->iomem_iosfc, obj, &reims_vgpu_mmio_iosfc_ops, s,
                           TYPE_REIMS_VGPU_MMIO ".iosfc",
                           REIMS_VGPU_MMIO_IOSFC_MMIO_SIZE);
@@ -1007,18 +1006,18 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
      * cocoa window is not zero-sized before the first present.
      */
     s->con = qemu_graphic_console_create(dev, 0, &reims_vgpu_mmio_fb_ops, s);
-    reims_vgpu_mmio_set_mode(s, REIMS_VGPU_MMIO_EFI_W, REIMS_VGPU_MMIO_EFI_H);
+    reims_vgpu_mmio_set_mode(s, REIMS_VGPU_EFI_BOOT_WIDTH, REIMS_VGPU_EFI_BOOT_HEIGHT);
     if (s->surface) {
         memset(surface_data(s->surface), 0,
-               (size_t)surface_stride(s->surface) * REIMS_VGPU_MMIO_EFI_H);
+               (size_t)surface_stride(s->surface) * REIMS_VGPU_EFI_BOOT_HEIGHT);
         qemu_console_update_full(s->con);
     }
     /* Hidden software cursor until the guest sends a glyph/show. */
     qemu_console_set_cursor(s->con, cursor_builtin_hidden());
     qemu_console_set_mouse(s->con, 0, 0, false);
 
-    rc = reims_vgpu_qemu_window_start(s->rust_handle, REIMS_VGPU_MMIO_EFI_W,
-                               REIMS_VGPU_MMIO_EFI_H);
+    rc = reims_vgpu_qemu_window_start(s->rust_handle, REIMS_VGPU_EFI_BOOT_WIDTH,
+                               REIMS_VGPU_EFI_BOOT_HEIGHT);
     if (rc == REIMS_VGPU_QEMU_OK) {
         s->poll_timer = timer_new_ms(QEMU_CLOCK_HOST,
                                      reims_vgpu_mmio_poll_tick, s);
@@ -1083,10 +1082,10 @@ static void reims_vgpu_mmio_reset(DeviceState *dev)
     s->new_frame_ready = false;
 
     /* Restore EFI black surface. */
-    reims_vgpu_mmio_set_mode(s, REIMS_VGPU_MMIO_EFI_W, REIMS_VGPU_MMIO_EFI_H);
+    reims_vgpu_mmio_set_mode(s, REIMS_VGPU_EFI_BOOT_WIDTH, REIMS_VGPU_EFI_BOOT_HEIGHT);
     if (s->surface && s->con) {
         memset(surface_data(s->surface), 0,
-               (size_t)surface_stride(s->surface) * REIMS_VGPU_MMIO_EFI_H);
+               (size_t)surface_stride(s->surface) * REIMS_VGPU_EFI_BOOT_HEIGHT);
         qemu_console_set_cursor(s->con, cursor_builtin_hidden());
         qemu_console_set_mouse(s->con, 0, 0, false);
         s->new_frame_ready = true;
