@@ -226,15 +226,15 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
     size_t i;
 
     if (!s || !gpas || count == 0 || !out_ptr ||
-        count > SIZE_MAX / REIMS_VGPU_GUEST_PAGE_SIZE) {
+        count > SIZE_MAX / REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E) {
         return -1;
     }
-    view_len = (mach_vm_size_t)count * REIMS_VGPU_GUEST_PAGE_SIZE;
+    view_len = (mach_vm_size_t)count * REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E;
     hvas = g_new(uint8_t *, count);
 
     rcu_read_lock();
     for (i = 0; i < count; i++) {
-        hwaddr xlat, plen = REIMS_VGPU_GUEST_PAGE_SIZE;
+        hwaddr xlat, plen = REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E;
         MemoryRegion *mr;
         uint8_t *hva;
 
@@ -242,11 +242,11 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
                                      &xlat, &plen, true,
                                      MEMTXATTRS_UNSPECIFIED);
         if (!mr || !memory_region_is_ram(mr) ||
-            plen < REIMS_VGPU_GUEST_PAGE_SIZE) {
+            plen < REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E) {
             goto fail;
         }
         hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
-        if (((uintptr_t)hva & (REIMS_VGPU_GUEST_PAGE_SIZE - 1)) != 0) {
+        if (((uintptr_t)hva & (REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E - 1)) != 0) {
             goto fail;
         }
         hvas[i] = hva;
@@ -254,7 +254,7 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
     rcu_read_unlock();
 
     for (i = 1; i < count; i++) {
-        if (hvas[i] != hvas[0] + i * REIMS_VGPU_GUEST_PAGE_SIZE) {
+        if (hvas[i] != hvas[0] + i * REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E) {
             break;
         }
     }
@@ -271,10 +271,10 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
         return -1;
     }
     for (i = 0; i < count; i++) {
-        mach_vm_address_t dst = view + i * REIMS_VGPU_GUEST_PAGE_SIZE;
+        mach_vm_address_t dst = view + i * REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E;
         vm_prot_t cur_prot, max_prot;
 
-        kr = mach_vm_remap(mach_task_self(), &dst, REIMS_VGPU_GUEST_PAGE_SIZE, 0,
+        kr = mach_vm_remap(mach_task_self(), &dst, REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E, 0,
                            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
                            mach_task_self(),
                            (mach_vm_address_t)(uintptr_t)hvas[i], FALSE,
