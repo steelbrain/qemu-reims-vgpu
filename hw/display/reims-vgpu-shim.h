@@ -23,6 +23,8 @@
 #include <stdbool.h>
 
 #include "qemu/typedefs.h"
+/* ReimsVgpuGuestRamRegion, for the span enumeration below. */
+#include "reims_vgpu_qemu_abi.h"
 
 /*
  * The five below match HostOps function-pointer signatures, so both shims'
@@ -45,6 +47,20 @@ int reims_vgpu_shim_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
 
 /* 1 = guest RAM, 0 = not (MMIO / ROM / unmapped). Mapper page-entry accept. */
 int reims_vgpu_shim_is_ram_gpa(void *ctx, uint64_t gpa);
+
+/*
+ * Where guest RAM lives in this process, as stable (gpa_base, host_va, len)
+ * spans. See the ReimsVgpuHostOps.guest_ram_regions comment in
+ * reims_vgpu_qemu_abi.h for the contract; this is the one implementation of it
+ * and both shims point their table entry straight at it.
+ *
+ * Bus-independent by construction: it reads the system address space and
+ * nothing from the device. Writing it once is not a line-count argument — the
+ * two shims run on different hosts, so a second copy is a divergence that shows
+ * up on exactly the pathway nobody is booting.
+ */
+int reims_vgpu_shim_guest_ram_regions(void *ctx, ReimsVgpuGuestRamRegion *out,
+                                      size_t max);
 
 /*
  * Guest kernel VA -> host buffer, for MappingInternal / page-table walks.

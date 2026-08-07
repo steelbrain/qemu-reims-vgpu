@@ -885,6 +885,13 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
          * which the attach type changes.
          */
         .dmabuf_for_pages = reims_vgpu_pci_dmabuf_for_pages,
+        /*
+         * Where guest RAM lives. Shared with the sysbus shim and identical on
+         * both: it reads the system address space, which the attach type does
+         * not change. Unlike map_pages it never builds a view, so there is no
+         * bus-specific lifetime for a shim to own.
+         */
+        .guest_ram_regions = reims_vgpu_shim_guest_ram_regions,
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         .notify_actions = reims_vgpu_pci_notify_actions,
         /*

@@ -76,6 +76,129 @@ int reims_vgpu_shim_is_ram_gpa(void *ctx, uint64_t gpa)
     return ok ? 1 : 0;
 }
 
+/*
+ * Coalescing state for one guest_ram_regions walk.
+ *
+ * `found` counts every span the walk produced, including the ones past the
+ * caller's `max`. That is the difference between a caller that learns its array
+ * was short and one that imports part of the guest's RAM and never finds out.
+ */
+typedef struct ReimsVgpuRamScan {
+    ReimsVgpuGuestRamRegion *out;
+    size_t max;
+    size_t found;
+    bool pending;
+    uint64_t gpa;
+    uint64_t hva;
+    uint64_t len;
+} ReimsVgpuRamScan;
+
+static void reims_vgpu_ram_scan_flush(ReimsVgpuRamScan *scan)
+{
+    if (!scan->pending) {
+        return;
+    }
+    if (scan->found < scan->max) {
+        scan->out[scan->found].gpa_base = scan->gpa;
+        scan->out[scan->found].host_va = scan->hva;
+        scan->out[scan->found].len = scan->len;
+    }
+    scan->found++;
+    scan->pending = false;
+}
+
+static bool reims_vgpu_ram_scan_range(Int128 start, Int128 len,
+                                      const MemoryRegion *mr,
+                                      hwaddr offset_in_region, void *opaque)
+{
+    ReimsVgpuRamScan *scan = opaque;
+    uint64_t gpa, bytes, hva;
+    void *ptr;
+
+    /*
+     * ROM and ROMD ranges are RAM-backed but the guest cannot store into them,
+     * and a ram_device is somebody else's mapping (a VFIO BAR) rather than
+     * guest memory. Reporting any of the three would hand the GPU write access
+     * to bytes the guest believes are fixed, or does not own at all.
+     */
+    if (!mr || !memory_region_is_ram(mr) || mr->readonly ||
+        memory_region_is_romd(mr) || memory_region_is_ram_device(mr)) {
+        reims_vgpu_ram_scan_flush(scan);
+        return false;
+    }
+    /*
+     * An Int128 that does not fit a uint64_t cannot be a mapping in this
+     * process's address space, so it is not a span anything could import.
+     */
+    if (int128_gethi(start) != 0 || int128_gethi(len) != 0) {
+        reims_vgpu_ram_scan_flush(scan);
+        return false;
+    }
+    gpa = int128_get64(start);
+    bytes = int128_get64(len);
+    if (bytes == 0) {
+        return false;
+    }
+    ptr = memory_region_get_ram_ptr(mr);
+    if (!ptr) {
+        reims_vgpu_ram_scan_flush(scan);
+        return false;
+    }
+    hva = (uint64_t)(uintptr_t)ptr + (uint64_t)offset_in_region;
+
+    /*
+     * Merge only when the next range continues this one in *both* address
+     * spaces. A board that splits one RAMBlock across several flat ranges then
+     * costs one span, while two blocks that abut in GPA but not in host VA stay
+     * separate — merging those would make an offset inside the span name the
+     * wrong host bytes, which is exactly the failure importing a RAMBlock at a
+     * time exists to avoid.
+     */
+    if (scan->pending && scan->gpa + scan->len == gpa &&
+        scan->hva + scan->len == hva && scan->len <= UINT64_MAX - bytes) {
+        scan->len += bytes;
+        return false;
+    }
+    reims_vgpu_ram_scan_flush(scan);
+    scan->pending = true;
+    scan->gpa = gpa;
+    scan->hva = hva;
+    scan->len = bytes;
+    return false;
+}
+
+int reims_vgpu_shim_guest_ram_regions(void *ctx, ReimsVgpuGuestRamRegion *out,
+                                      size_t max)
+{
+    ReimsVgpuRamScan scan = { 0 };
+
+    (void)ctx;
+    if (!out || max == 0) {
+        return REIMS_VGPU_GUEST_RAM_ERR_ARGS;
+    }
+    scan.out = out;
+    scan.max = max;
+
+    rcu_read_lock();
+    flatview_for_each_range(address_space_to_flatview(&address_space_memory),
+                            reims_vgpu_ram_scan_range, &scan);
+    rcu_read_unlock();
+    reims_vgpu_ram_scan_flush(&scan);
+
+    if (scan.found == 0) {
+        return REIMS_VGPU_GUEST_RAM_ERR_NO_RAM;
+    }
+    /*
+     * A span count that does not fit the return type is not a machine anyone
+     * runs. Reporting it as "no RAM" would be a lie, so it is the argument
+     * refusal: the caller asked for an answer this return value cannot carry.
+     */
+    if (scan.found > (size_t)INT_MAX) {
+        return REIMS_VGPU_GUEST_RAM_ERR_ARGS;
+    }
+    return (int)scan.found;
+}
+
 int reims_vgpu_shim_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len)
 {
     CPUState *cs = current_cpu;

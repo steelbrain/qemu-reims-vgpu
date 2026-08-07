@@ -968,6 +968,19 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
         .read_xreg = reims_vgpu_mmio_read_xreg,
         .map_pages = reims_vgpu_mmio_map_pages,
         .unmap_pages = reims_vgpu_mmio_unmap_pages,
+        /*
+         * Where guest RAM lives. The same implementation the PCI shim points
+         * at: it reads the system address space and never builds a view, so the
+         * mach_vm_remap lifetime this shim owns for map_pages does not apply
+         * and there is nothing bus-specific left to hold.
+         *
+         * This is also why the import rail does not re-open the retention that
+         * map_pages_stable below refuses. An import is over the RAMBlock these
+         * spans name, never over a packed remap view, and a fragmented surface
+         * is several offsets inside one span rather than a view somebody has to
+         * keep alive until teardown.
+         */
+        .guest_ram_regions = reims_vgpu_shim_guest_ram_regions,
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         /*
          * 0: a fragmented list gets a packed mach_vm_remap view whose lifetime
