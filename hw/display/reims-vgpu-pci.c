@@ -32,7 +32,6 @@
 #include "trace.h"
 #include "reims_vgpu_qemu_abi.h"
 #include "reims-vgpu-dirty.h"
-#include "reims-vgpu-dmabuf.h"
 #include "reims-vgpu-shim.h"
 
 #define TYPE_REIMS_VGPU_PCI "reims-vgpu-pci"
@@ -198,13 +197,6 @@ static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t coun
 fail:
     rcu_read_unlock();
     return -1;
-}
-
-static int reims_vgpu_pci_dmabuf_for_pages(void *ctx, const uint64_t *gpas,
-                                           size_t count, size_t page_size)
-{
-    (void)ctx;
-    return reims_vgpu_dmabuf_for_pages(gpas, count, page_size);
 }
 
 static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
@@ -879,12 +871,6 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .read_xreg = reims_vgpu_pci_read_xreg,
         .map_pages = reims_vgpu_pci_map_pages,
         .unmap_pages = reims_vgpu_pci_unmap_pages,
-        /*
-         * Guest pages as a dma-buf. Shared with the sysbus shim: the export is
-         * a property of the host kernel and the RAMBlock backing, neither of
-         * which the attach type changes.
-         */
-        .dmabuf_for_pages = reims_vgpu_pci_dmabuf_for_pages,
         /*
          * Where guest RAM lives. Shared with the sysbus shim and identical on
          * both: it reads the system address space, which the attach type does

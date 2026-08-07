@@ -987,6 +987,10 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
          * the caller owns and ends through unmap_pages. Only a pointer that
          * needs no release at all may claim 1, and this shim cannot promise
          * that without knowing the run was host-contiguous.
+         *
+         * The GPU rail does not read this and must not: it imports the spans
+         * guest_ram_regions names, which are RAMBlock mappings this shim never
+         * built and never releases.
          */
         .map_pages_stable = 0,
         .track_guest_writes = reims_vgpu_mmio_track_guest_writes,
