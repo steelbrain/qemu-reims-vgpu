@@ -44,6 +44,32 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUPCIState, REIMS_VGPU_PCI)
  */
 /* BAR1 = linear UEFI GOP framebuffer (BGRA8 at the EFI boot mode + headroom). */
 #define REIMS_VGPU_PCI_FB_SIZE   (16u * 1024u * 1024u)
+/*
+ * These two IDs are what the guest's paravirt GPU driver matches on, and the
+ * match decides which Metal plugin the guest loads. That has a consequence on
+ * macOS 26 that is worth stating here, because it is invisible from this file
+ * and it is not a defect anything on this side can repair.
+ *
+ * The guest ships two personalities for one paravirt GPU:
+ *
+ *   - one matching an IOPCIDevice on exactly these IDs, whose Metal plugin
+ *     descends from Metal's IOAccelerator device base class;
+ *   - one matching a *device-tree* node by name, on an ARM platform provider,
+ *     whose Metal plugin descends from the IOGPUFamily device base class.
+ *
+ * Only the second plugin implements the device-architecture property that
+ * Metal's binary-archive loader asserts on. On macOS 26 the icon-rendering
+ * path loads a precompiled binary archive, so on this pathway that assert
+ * fires and the icon renderers abort — repeatedly, since each icon re-render
+ * retries. The other personality cannot be reached from here at any PCI
+ * identity: it requires an ARM platform provider that does not exist on an
+ * x86_64 guest, and its kext declares a dependency on the ARM platform driver.
+ *
+ * So this is structural to the PCI pathway rather than a value to tune. Do not
+ * spend a boot probing device-info keys for it — the capability table is not in
+ * that code path at all. Changing these IDs does not reach the other
+ * personality; it only stops the driver matching us.
+ */
 #define REIMS_VGPU_PCI_VENDOR    0x106B
 #define REIMS_VGPU_PCI_DEVICE    0xEEEE
 /* BAR1's own pixel size, not a shared constant: it describes this shim's GOP
