@@ -26,6 +26,7 @@
 #include "qom/object.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "system/ramblock.h"
 #include "system/runstate.h"
 #include "ui/console.h"
 #include "ui/surface.h"
@@ -36,6 +37,11 @@
 
 #define TYPE_REIMS_VGPU_PCI "reims-vgpu-pci"
 OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUPCIState, REIMS_VGPU_PCI)
+
+typedef struct ReimsVGPUPCIPageView {
+    void *ptr;
+    size_t len;
+} ReimsVGPUPCIPageView;
 
 /*
  * BAR0 = full gfx window; control block at +0x1000. The size is the shared
@@ -94,6 +100,10 @@ struct ReimsVGPUPCIState {
      * surface's guest pages that no device operation made. */
     ReimsVgpuDirty *dirty;
     uint64_t rust_handle;
+    /* Stable packed aliases over file-backed guest pages. They remain mapped
+     * until the Rust/Vulkan backend is destroyed, so a submitted GPU read can
+     * never outlive the host address it names. */
+    GArray *page_views;
 
     /* Ordered Rust FIFO/render drain owner. The AIO BH only applies completed
      * HostActions; it never translates shaders or waits for GPU work. */
@@ -132,14 +142,14 @@ static int reims_vgpu_pci_read_xreg(void *ctx, uint32_t index, uint64_t *out)
 static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t count,
                              void **out_ptr)
 {
+    ReimsVGPUPCIState *s = ctx;
     /* x86 guest page granularity (host-pointer import view stride). */
     const hwaddr page = (hwaddr)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
     uint8_t *base = NULL;
     MemoryRegion *base_mr = NULL;
     size_t i;
 
-    (void)ctx;
-    if (!gpas || count == 0 || !out_ptr) {
+    if (!s || !gpas || count == 0 || !out_ptr || count > SIZE_MAX / page) {
         return -1;
     }
 
@@ -222,7 +232,75 @@ static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t coun
 
 fail:
     rcu_read_unlock();
-    return -1;
+
+    /*
+     * A task GVA is linear even when its guest-physical pages are not. When
+     * guest RAM is shared file-backed memory, recreate that virtual shape with
+     * one MAP_SHARED view. This is an alias, not a copy: guest CPU writes and
+     * GPU reads still address the same pages.
+     *
+     * Reserve the complete range first, then replace it page by page. A failed
+     * page tears down the whole reservation, so callers never receive a
+     * partially packed view.
+     */
+    {
+        size_t total = count * page;
+        uint8_t *view = mmap(NULL, total, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ReimsVGPUPCIPageView held;
+
+        if (view == MAP_FAILED) {
+            return -1;
+        }
+        rcu_read_lock();
+        for (i = 0; i < count; i++) {
+            hwaddr xlat, plen = page;
+            MemoryRegion *mr;
+            uint8_t *hva;
+            RAMBlock *rb;
+            ram_addr_t rb_offset;
+            ram_addr_t fd_offset;
+            int fd;
+            void *mapped;
+
+            mr = address_space_translate(&address_space_memory, gpas[i],
+                                         &xlat, &plen, true,
+                                         MEMTXATTRS_UNSPECIFIED);
+            if (!mr || !memory_region_is_ram(mr) || plen < page) {
+                goto alias_fail_locked;
+            }
+            hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+            rb = qemu_ram_block_from_host(hva, false, &rb_offset);
+            if (!rb || !qemu_ram_is_shared(rb)) {
+                goto alias_fail_locked;
+            }
+            fd = qemu_ram_get_fd(rb);
+            if (fd < 0 || rb_offset > RAM_ADDR_MAX - qemu_ram_get_fd_offset(rb)) {
+                goto alias_fail_locked;
+            }
+            fd_offset = qemu_ram_get_fd_offset(rb) + rb_offset;
+            if ((fd_offset & (page - 1)) != 0) {
+                goto alias_fail_locked;
+            }
+            mapped = mmap(view + i * page, page, PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_FIXED, fd, fd_offset);
+            if (mapped == MAP_FAILED) {
+                goto alias_fail_locked;
+            }
+        }
+        rcu_read_unlock();
+
+        held.ptr = view;
+        held.len = total;
+        g_array_append_val(s->page_views, held);
+        *out_ptr = view;
+        return 0;
+
+alias_fail_locked:
+        rcu_read_unlock();
+        munmap(view, total);
+        return -1;
+    }
 }
 
 static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
@@ -230,8 +308,9 @@ static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
     (void)ctx;
     (void)ptr;
     (void)len;
-    /* Pointer is a direct alias of guest RAM (not an allocation) — nothing to
-     * free; guest RAM outlives the view. */
+    /* Direct RAMBlock pointers and packed aliases both stay valid for the
+     * device lifetime. Packed aliases are released together after the Rust
+     * backend has destroyed every Vulkan object that could name them. */
 }
 
 /*
@@ -907,17 +986,11 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         .notify_actions = reims_vgpu_pci_notify_actions,
         /*
-         * 1: this shim never allocates. map_pages refuses anything that is not
-         * a packed host-contiguous run and otherwise hands back
-         * memory_region_get_ram_ptr()+xlat — guest RAM itself, which outlives
-         * every caller — so unmap_pages has nothing to free and a caller may
-         * hold the pointer for the device lifetime.
-         *
-         * The flag used to also license retaining the pointer inside a cached
-         * VK_EXT_external_memory_host import. It does not any more: nothing
-         * imports guest pages. What is left is the narrower claim that no
-         * release is owed, which is why the MMIO shim answers 0 — it can hand
-         * out a mach_vm_remap view, and that one has to be released.
+         * 1: a direct RAMBlock pointer and a packed file-backed alias both
+         * remain valid until device teardown. unmap_pages therefore owes no
+         * per-view release, and a caller may retain either answer for the
+         * device lifetime. The MMIO shim answers 0 because its mach_vm_remap
+         * view has caller-owned lifetime instead.
          */
         .map_pages_stable = 1,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
@@ -1029,6 +1102,17 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
         s->shutdown_notifier_registered = false;
     }
     reims_vgpu_pci_stop_backend(s);
+    if (s->page_views) {
+        size_t i;
+
+        for (i = 0; i < s->page_views->len; i++) {
+            ReimsVGPUPCIPageView *view =
+                &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
+            munmap(view->ptr, view->len);
+        }
+        g_array_free(s->page_views, true);
+        s->page_views = NULL;
+    }
     /* After the drain thread is joined: reims_vgpu_dirty_free turns region
      * logging back off, and no tracked set may outlive the Rust device that
      * holds its token. */
@@ -1071,10 +1155,12 @@ static void reims_vgpu_pci_reset(DeviceState *dev)
 
 static void reims_vgpu_pci_instance_init(Object *obj)
 {
+    ReimsVGPUPCIState *s = REIMS_VGPU_PCI(obj);
     PCIDevice *pdev = PCI_DEVICE(obj);
 
     /* Required before realize so config space is PCIe-sized (4 KiB). */
     pdev->cap_present |= QEMU_PCI_CAP_EXPRESS;
+    s->page_views = g_array_new(false, false, sizeof(ReimsVGPUPCIPageView));
 }
 
 static void reims_vgpu_pci_class_init(ObjectClass *klass, const void *data)
