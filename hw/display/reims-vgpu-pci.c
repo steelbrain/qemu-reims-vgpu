@@ -164,6 +164,12 @@ static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t coun
      * Note: do **not** accept `hva == base + (gpas[i] - gpas[0])` for sparse
      * GPAs — that would return success while page i is not at base+i*page,
      * silently mis-aliasing multi-page views.
+     *
+     * Every success arm here answers REIMS_VGPU_MAP_PAGES_STABLE: the direct
+     * RAMBlock pointer is guest RAM itself, and the MAP_SHARED packed alias is
+     * held in `page_views` until teardown rather than released per call. The
+     * sysbus shim's remap view is the one that is transient, which is why the
+     * stability travels per call instead of as a field on the ops table.
      */
     rcu_read_lock();
 
@@ -198,7 +204,7 @@ static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t coun
                 if (((uintptr_t)hva & (page - 1)) == 0) {
                     rcu_read_unlock();
                     *out_ptr = hva;
-                    return 0;
+                    return REIMS_VGPU_MAP_PAGES_STABLE;
                 }
             }
         }
@@ -228,7 +234,7 @@ static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t coun
     rcu_read_unlock();
 
     *out_ptr = base;
-    return 0;
+    return REIMS_VGPU_MAP_PAGES_STABLE;
 
 fail:
     rcu_read_unlock();
@@ -294,7 +300,7 @@ fail:
         held.len = total;
         g_array_append_val(s->page_views, held);
         *out_ptr = view;
-        return 0;
+        return REIMS_VGPU_MAP_PAGES_STABLE;
 
 alias_fail_locked:
         rcu_read_unlock();
@@ -985,14 +991,6 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .guest_ram_regions = reims_vgpu_shim_guest_ram_regions,
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         .notify_actions = reims_vgpu_pci_notify_actions,
-        /*
-         * 1: a direct RAMBlock pointer and a packed file-backed alias both
-         * remain valid until device teardown. unmap_pages therefore owes no
-         * per-view release, and a caller may retain either answer for the
-         * device lifetime. The MMIO shim answers 0 because its mach_vm_remap
-         * view has caller-owned lifetime instead.
-         */
-        .map_pages_stable = 1,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,

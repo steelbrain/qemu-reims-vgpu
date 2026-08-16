@@ -200,15 +200,17 @@ static int reims_vgpu_mmio_read_xreg(void *ctx, uint32_t index, uint64_t *out)
  * guest memory directly, so there is exactly ONE copy of surface content.
  *
  * A host-contiguous page run returns its direct RAMBlock HVA, which is guest
- * RAM itself and outlives every view. A fragmented list gets one packed
- * mach_vm_remap view, which the caller owns and must release through
- * unmap_pages.
+ * RAM itself and outlives every view — REIMS_VGPU_MAP_PAGES_STABLE. A
+ * fragmented list gets one packed mach_vm_remap view, which the caller owns and
+ * must release through unmap_pages — REIMS_VGPU_MAP_PAGES_TRANSIENT.
  *
- * The view used to be retained for the whole device lifetime instead, because
- * Rust cached VK_EXT_external_memory_host imports over it and could re-read the
- * pages at any later point. Nothing imports guest pages now, so the retention
- * bought nothing and every fragmented map leaked a VA reservation until
- * teardown. `map_pages_stable` is 0 accordingly.
+ * The two answers come from one function on one host, which is why the
+ * stability is a return value and not a field. Retaining the remap view for the
+ * device lifetime would make both arms stable, and it is what this shim used to
+ * do; it leaked a VA reservation per fragmented map and bought nothing, because
+ * a fragmented view is not inside any RAMBlock span and so cannot be imported
+ * for the GPU anyway. The direct arm is the one worth reporting, and it is the
+ * arm a GPA-contiguous stretch always takes.
  *
  * Non-Darwin hosts: fail closed (no mach_vm); type-11 writeback uses GPA
  * copies through HostOps until a Linux aliasing path lands.
@@ -261,7 +263,7 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
     if (i == count) {
         *out_ptr = hvas[0];
         g_free(hvas);
-        return 0;
+        return REIMS_VGPU_MAP_PAGES_STABLE;
     }
 
     kr = mach_vm_allocate(mach_task_self(), &view, view_len,
@@ -291,7 +293,7 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
     view_entry.len = view_len;
     g_array_append_val(s->page_views, view_entry);
     g_free(hvas);
-    return 0;
+    return REIMS_VGPU_MAP_PAGES_TRANSIENT;
 
 fail:
     rcu_read_unlock();
@@ -982,17 +984,6 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
          */
         .guest_ram_regions = reims_vgpu_shim_guest_ram_regions,
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
-        /*
-         * 0: a fragmented list gets a packed mach_vm_remap view whose lifetime
-         * the caller owns and ends through unmap_pages. Only a pointer that
-         * needs no release at all may claim 1, and this shim cannot promise
-         * that without knowing the run was host-contiguous.
-         *
-         * The GPU rail does not read this and must not: it imports the spans
-         * guest_ram_regions names, which are RAMBlock mappings this shim never
-         * built and never releases.
-         */
-        .map_pages_stable = 0,
         .track_guest_writes = reims_vgpu_mmio_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_mmio_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_mmio_guest_write_gen,
