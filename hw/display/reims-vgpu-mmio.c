@@ -39,7 +39,6 @@
 #include "ui/surface.h"
 #include "trace.h"
 #include "reims_vgpu_qemu_abi.h"
-#include "reims-vgpu-dirty.h"
 #include "reims-vgpu-shim.h"
 
 /*
@@ -106,9 +105,6 @@ struct ReimsVGPUMMIOState {
 
     /* Filled at realize; address passed into Rust create. */
     ReimsVgpuHostOps host_ops;
-    /* Hypervisor dirty-bitmap adapter: the only witness for a write to a
-     * surface's guest pages that no device operation made. */
-    ReimsVgpuDirty *dirty;
     /* Opaque handle from reims_vgpu_qemu_device_create; 0 when unrealized. */
     uint64_t rust_handle;
     /*
@@ -372,43 +368,6 @@ static void reims_vgpu_mmio_free_page_views(ReimsVGPUMMIOState *s)
 #else
     (void)s;
 #endif
-}
-
-/*
- * Guest-write tracking. A surface's storage is plain guest RAM: the guest CPU
- * stores into it with no device operation, so nothing the Rust device counts
- * can witness such a store and every host-side copy of those pages is stale
- * from that instant. These three forward to the shared dirty-bitmap adapter.
- */
-static uint64_t reims_vgpu_mmio_track_guest_writes(void *ctx, const uint64_t *gpas,
-                                                   size_t count, size_t page_size)
-{
-    ReimsVGPUMMIOState *s = ctx;
-
-    return reims_vgpu_dirty_track(s->dirty, gpas, count, page_size);
-}
-
-static void reims_vgpu_mmio_untrack_guest_writes(void *ctx, uint64_t token)
-{
-    ReimsVGPUMMIOState *s = ctx;
-
-    reims_vgpu_dirty_untrack(s->dirty, token);
-}
-
-static uint64_t reims_vgpu_mmio_guest_write_gen(void *ctx, uint64_t token)
-{
-    ReimsVGPUMMIOState *s = ctx;
-
-    return reims_vgpu_dirty_gen(s->dirty, token);
-}
-
-static int64_t reims_vgpu_mmio_guest_written_pages(void *ctx, uint64_t token,
-                                         uint64_t since_gen, uint64_t *out,
-                                         size_t max)
-{
-    ReimsVGPUMMIOState *s = ctx;
-
-    return reims_vgpu_dirty_written_since(s->dirty, token, since_gen, out, max);
 }
 
 static void reims_vgpu_mmio_bh(void *opaque);
@@ -806,15 +765,6 @@ static void reims_vgpu_mmio_gfx_write(void *opaque, hwaddr offset, uint64_t data
         return;
     }
     trace_reims_vgpu_mmio_gfx_write(offset, data);
-    /*
-     * Before the register write, not after: this is the guest handing the
-     * device work, so every guest store ordered before the handoff must be
-     * observed before anything that work does can reuse a host-side copy of
-     * those pages. Harvesting here is also the only place it can happen — the
-     * accelerator's dirty-log sync needs the BQL, which a vCPU MMIO write
-     * holds and the drain thread must never take.
-     */
-    reims_vgpu_dirty_harvest(s->dirty);
     if (reims_vgpu_qemu_gfx_write(s->rust_handle, offset, data, size) != REIMS_VGPU_QEMU_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: gfx write failed offset=0x%" HWADDR_PRIx
@@ -856,15 +806,6 @@ static void reims_vgpu_mmio_iosfc_write(void *opaque, hwaddr offset, uint64_t da
         return;
     }
     trace_reims_vgpu_mmio_iosfc_write(offset, data);
-    /*
-     * The same reason as the gfx path, and both are needed: this shim exposes
-     * two guest-facing register windows, and either can be the write that hands
-     * the device work. Harvesting on only one would leave the guest-write
-     * witness a whole submission stale on whichever rail the guest happens to
-     * use. Cheap when nothing has read a generation since the last harvest, so
-     * covering both costs a predicate, not a sync.
-     */
-    reims_vgpu_dirty_harvest(s->dirty);
     if (reims_vgpu_qemu_iosfc_write(s->rust_handle, offset, data, size) !=
         REIMS_VGPU_QEMU_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -993,12 +934,7 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
          * built and never releases.
          */
         .map_pages_stable = 0,
-        .track_guest_writes = reims_vgpu_mmio_track_guest_writes,
-        .untrack_guest_writes = reims_vgpu_mmio_untrack_guest_writes,
-        .guest_write_gen = reims_vgpu_mmio_guest_write_gen,
-        .guest_written_pages = reims_vgpu_mmio_guest_written_pages,
     };
-    s->dirty = reims_vgpu_dirty_new();
 
     info = (ReimsVgpuQemuCreateInfo){
         .abi_version = REIMS_VGPU_QEMU_ABI_VERSION,
@@ -1074,10 +1010,6 @@ static void reims_vgpu_mmio_unrealize(DeviceState *dev)
         reims_vgpu_mmio_window_owner = NULL;
     }
 #endif
-    /* After the Rust device is destroyed: no tracked set may outlive the
-     * token holder, and the free turns region logging back off. */
-    reims_vgpu_dirty_free(s->dirty);
-    s->dirty = NULL;
     reims_vgpu_mmio_free_page_views(s);
     g_clear_pointer(&s->page_views, g_array_unref);
     if (s->con) {

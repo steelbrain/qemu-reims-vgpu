@@ -5,8 +5,8 @@
  * A service belongs here when its body reads nothing from the device state:
  * either it ignores the HostOps `ctx` entirely (host clock, address-space
  * queries, vCPU-relative reads) or it needs only the console, which the
- * caller passes explicitly. Anything that touches the bus object, the
- * per-device dirty tracker, or a bus-specific trace event stays in its shim.
+ * caller passes explicitly. Anything that touches the bus object or a
+ * bus-specific trace event stays in its shim.
  *
  * The point is not line count. A duplicated button table or address-space
  * predicate is a table that can drift, and a drift between the two shims is

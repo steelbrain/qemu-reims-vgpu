@@ -32,7 +32,6 @@
 #include "ui/surface.h"
 #include "trace.h"
 #include "reims_vgpu_qemu_abi.h"
-#include "reims-vgpu-dirty.h"
 #include "reims-vgpu-shim.h"
 
 #define TYPE_REIMS_VGPU_PCI "reims-vgpu-pci"
@@ -96,9 +95,6 @@ struct ReimsVGPUPCIState {
     bool new_frame_ready;
 
     ReimsVgpuHostOps host_ops;
-    /* Hypervisor dirty-bitmap adapter: the only witness for a write to a
-     * surface's guest pages that no device operation made. */
-    ReimsVgpuDirty *dirty;
     uint64_t rust_handle;
     /* Stable packed aliases over file-backed guest pages. They remain mapped
      * until the Rust/Vulkan backend is destroyed, so a submitted GPU read can
@@ -311,43 +307,6 @@ static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
     /* Direct RAMBlock pointers and packed aliases both stay valid for the
      * device lifetime. Packed aliases are released together after the Rust
      * backend has destroyed every Vulkan object that could name them. */
-}
-
-/*
- * Guest-write tracking. A surface's storage is plain guest RAM: the guest CPU
- * stores into it with no device operation, so nothing the Rust device counts
- * can witness such a store and every host-side copy of those pages is stale
- * from that instant. These three forward to the shared dirty-bitmap adapter.
- */
-static uint64_t reims_vgpu_pci_track_guest_writes(void *ctx, const uint64_t *gpas,
-                                                  size_t count, size_t page_size)
-{
-    ReimsVGPUPCIState *s = ctx;
-
-    return reims_vgpu_dirty_track(s->dirty, gpas, count, page_size);
-}
-
-static void reims_vgpu_pci_untrack_guest_writes(void *ctx, uint64_t token)
-{
-    ReimsVGPUPCIState *s = ctx;
-
-    reims_vgpu_dirty_untrack(s->dirty, token);
-}
-
-static uint64_t reims_vgpu_pci_guest_write_gen(void *ctx, uint64_t token)
-{
-    ReimsVGPUPCIState *s = ctx;
-
-    return reims_vgpu_dirty_gen(s->dirty, token);
-}
-
-static int64_t reims_vgpu_pci_guest_written_pages(void *ctx, uint64_t token,
-                                         uint64_t since_gen, uint64_t *out,
-                                         size_t max)
-{
-    ReimsVGPUPCIState *s = ctx;
-
-    return reims_vgpu_dirty_written_since(s->dirty, token, since_gen, out, max);
 }
 
 static void reims_vgpu_pci_bh(void *opaque);
@@ -803,18 +762,6 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
         return;
     }
     trace_reims_vgpu_pci_gfx_write(offset, data);
-    /*
-     * Before the register write, not after: this is the guest handing the
-     * device work, so every guest store ordered before the handoff must be
-     * observed before anything that work does can reuse a host-side copy of
-     * those pages. Harvesting here is also the only place it can happen — the
-     * accelerator's dirty-log sync needs the BQL, which a vCPU MMIO write
-     * holds and the drain thread must never take.
-     *
-     * Cheap when nothing is tracked or when nothing has read a generation
-     * since the last harvest, so a burst of register writes costs one sync.
-     */
-    reims_vgpu_dirty_harvest(s->dirty);
     if (reims_vgpu_qemu_gfx_write(s->rust_handle, offset, data, size) != REIMS_VGPU_QEMU_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: gfx write failed offset=0x%" HWADDR_PRIx
@@ -993,12 +940,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
          * view has caller-owned lifetime instead.
          */
         .map_pages_stable = 1,
-        .track_guest_writes = reims_vgpu_pci_track_guest_writes,
-        .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
-        .guest_write_gen = reims_vgpu_pci_guest_write_gen,
-        .guest_written_pages = reims_vgpu_pci_guest_written_pages,
     };
-    s->dirty = reims_vgpu_dirty_new();
 
     qemu_mutex_init(&s->drain_mutex);
     qemu_cond_init(&s->drain_cond);
@@ -1113,11 +1055,6 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
         g_array_free(s->page_views, true);
         s->page_views = NULL;
     }
-    /* After the drain thread is joined: reims_vgpu_dirty_free turns region
-     * logging back off, and no tracked set may outlive the Rust device that
-     * holds its token. */
-    reims_vgpu_dirty_free(s->dirty);
-    s->dirty = NULL;
     qemu_cond_destroy(&s->heartbeat_cond);
     qemu_mutex_destroy(&s->heartbeat_mutex);
     qemu_cond_destroy(&s->drain_cond);
