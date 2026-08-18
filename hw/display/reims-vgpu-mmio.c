@@ -533,7 +533,7 @@ static void reims_vgpu_mmio_apply_cursor(ReimsVGPUMMIOState *s,
         return;
     }
     trace_reims_vgpu_mmio_cursor(a->a0, a->a1, a->a2);
-    qemu_console_set_mouse(s->con, x, y, show);
+    reims_vgpu_shim_cursor_position(s->con, x, y, show);
 }
 
 /*
@@ -542,34 +542,7 @@ static void reims_vgpu_mmio_apply_cursor(ReimsVGPUMMIOState *s,
  */
 static void reims_vgpu_mmio_apply_cursor_glyph(ReimsVGPUMMIOState *s)
 {
-    ReimsVgpuCursorGlyphInfo info;
-    QEMUCursor *c;
-    g_autofree uint32_t *pixels = NULL;
-    int rc;
-
-    if (s->rust_handle == 0 || !s->con) {
-        return;
-    }
-    rc = reims_vgpu_qemu_cursor_glyph_info(s->rust_handle, &info);
-    if (rc != REIMS_VGPU_QEMU_OK || info.width == 0 || info.height == 0 ||
-        info.pixel_count == 0 ||
-        info.pixel_count != info.width * info.height) {
-        return;
-    }
-    pixels = g_new(uint32_t, info.pixel_count);
-    rc = reims_vgpu_qemu_cursor_glyph_copy(s->rust_handle, pixels, info.pixel_count);
-    if (rc != REIMS_VGPU_QEMU_OK) {
-        return;
-    }
-    c = cursor_alloc(info.width, info.height);
-    if (!c) {
-        return;
-    }
-    c->hot_x = info.hot_x;
-    c->hot_y = info.hot_y;
-    memcpy(c->data, pixels, (size_t)info.pixel_count * sizeof(uint32_t));
-    qemu_console_set_cursor(s->con, c);
-    cursor_unref(c);
+    (void)reims_vgpu_shim_apply_cursor_glyph(s->con, s->rust_handle);
 }
 
 static void reims_vgpu_mmio_apply_action(ReimsVGPUMMIOState *s,

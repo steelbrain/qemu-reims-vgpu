@@ -100,6 +100,10 @@ uint32_t reims_vgpu_shim_console_feed(uint64_t rust_handle, uint32_t *out_mid,
                                       uint32_t *out_w, uint32_t *out_h,
                                       uint32_t *out_gen);
 
+/* Apply bus-independent cursor actions to the QEMU console. */
+void reims_vgpu_shim_cursor_position(QemuConsole *con, int x, int y, bool show);
+bool reims_vgpu_shim_apply_cursor_glyph(QemuConsole *con, uint64_t rust_handle);
+
 /*
  * Host-owned-window input: replay a neutral Rust input action through the
  * QEMU input subsystem. Input routes to the guest's active handlers

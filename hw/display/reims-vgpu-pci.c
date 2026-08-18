@@ -547,9 +547,8 @@ static void reims_vgpu_pci_apply_action(ReimsVGPUPCIState *s, const ReimsVgpuHos
                               (uint32_t)a->a2, (uint32_t)a->a3);
         break;
     case REIMS_VGPU_HOST_ACTION_CURSOR:
-        if (s->con) {
-            qemu_console_set_mouse(s->con, (int)a->a0, (int)a->a1, a->a2 != 0);
-        }
+        reims_vgpu_shim_cursor_position(s->con, (int)a->a0, (int)a->a1,
+                                        a->a2 != 0);
         break;
     case REIMS_VGPU_HOST_ACTION_INPUT_KEY:
         reims_vgpu_shim_input_key(s->con, (uint32_t)a->a0, a->a1 != 0);
@@ -565,38 +564,9 @@ static void reims_vgpu_pci_apply_action(ReimsVGPUPCIState *s, const ReimsVgpuHos
         /* The host window is the VM's display; closing it shuts the VM down. */
         qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
         break;
-    case REIMS_VGPU_HOST_ACTION_CURSOR_GLYPH: {
-        ReimsVgpuCursorGlyphInfo info;
-        g_autofree uint32_t *pixels = NULL;
-        QEMUCursor *c;
-        int rc;
-
-        if (!s->con || s->rust_handle == 0) {
-            break;
-        }
-        rc = reims_vgpu_qemu_cursor_glyph_info(s->rust_handle, &info);
-        if (rc != REIMS_VGPU_QEMU_OK || info.width == 0 || info.height == 0 ||
-            info.pixel_count == 0 ||
-            info.pixel_count != info.width * info.height) {
-            break;
-        }
-        pixels = g_new(uint32_t, info.pixel_count);
-        rc = reims_vgpu_qemu_cursor_glyph_copy(s->rust_handle, pixels,
-                                        info.pixel_count);
-        if (rc != REIMS_VGPU_QEMU_OK) {
-            break;
-        }
-        c = cursor_alloc(info.width, info.height);
-        if (!c) {
-            break;
-        }
-        c->hot_x = info.hot_x;
-        c->hot_y = info.hot_y;
-        memcpy(c->data, pixels, (size_t)info.pixel_count * sizeof(uint32_t));
-        qemu_console_set_cursor(s->con, c);
-        cursor_unref(c);
+    case REIMS_VGPU_HOST_ACTION_CURSOR_GLYPH:
+        (void)reims_vgpu_shim_apply_cursor_glyph(s->con, s->rust_handle);
         break;
-    }
     case REIMS_VGPU_HOST_ACTION_TRACE:
     case REIMS_VGPU_HOST_ACTION_NONE:
     default:

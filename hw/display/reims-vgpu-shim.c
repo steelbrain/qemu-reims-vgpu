@@ -272,6 +272,49 @@ uint32_t reims_vgpu_shim_console_feed(uint64_t rust_handle, uint32_t *out_mid,
     return kind;
 }
 
+void reims_vgpu_shim_cursor_position(QemuConsole *con, int x, int y, bool show)
+{
+    if (con) {
+        qemu_console_set_mouse(con, x, y, show);
+    }
+}
+
+bool reims_vgpu_shim_apply_cursor_glyph(QemuConsole *con, uint64_t rust_handle)
+{
+    ReimsVgpuCursorGlyphInfo info;
+    g_autofree uint32_t *pixels = NULL;
+    QEMUCursor *cursor;
+    int rc;
+
+    if (!con || rust_handle == 0) {
+        return false;
+    }
+    rc = reims_vgpu_qemu_cursor_glyph_info(rust_handle, &info);
+    if (rc != REIMS_VGPU_QEMU_OK || info.width == 0 || info.height == 0 ||
+        info.pixel_count == 0 ||
+        (uint64_t)info.pixel_count !=
+            (uint64_t)info.width * (uint64_t)info.height) {
+        return false;
+    }
+    pixels = g_new(uint32_t, info.pixel_count);
+    rc = reims_vgpu_qemu_cursor_glyph_copy(rust_handle, pixels,
+                                            info.pixel_count);
+    if (rc != REIMS_VGPU_QEMU_OK) {
+        return false;
+    }
+    cursor = cursor_alloc(info.width, info.height);
+    if (!cursor) {
+        return false;
+    }
+    cursor->hot_x = info.hot_x;
+    cursor->hot_y = info.hot_y;
+    memcpy(cursor->data, pixels,
+           (size_t)info.pixel_count * sizeof(uint32_t));
+    qemu_console_set_cursor(con, cursor);
+    cursor_unref(cursor);
+    return true;
+}
+
 void reims_vgpu_shim_input_key(QemuConsole *con, uint32_t evdev, bool down)
 {
     if (!con) {
