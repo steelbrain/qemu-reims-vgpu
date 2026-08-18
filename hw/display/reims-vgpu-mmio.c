@@ -45,7 +45,7 @@
  * Guest X-regs and mach_vm page aliasing are Darwin product paths (arm guest
  * under HVF). TARGET_* macros are poisoned in common softmmu objects, so these
  * paths are gated on CONFIG_DARWIN only. On Linux/x86 the callbacks fail closed;
- * protocol/decode still runs through the Rust staticlib (Metal host stubs).
+ * protocol/decode still runs through the Rust staticlib.
  */
 #if defined(CONFIG_DARWIN)
 #include <dispatch/dispatch.h>
@@ -192,8 +192,7 @@ static int reims_vgpu_mmio_read_xreg(void *ctx, uint32_t index, uint64_t *out)
 /*
  * Contiguous host-VA view of guest 16 KiB pages — the ParavirtualizedGraphics
  * mapMemory model (mach_vm_remap of guest RAM into the framework's working
- * VA). The view aliases guest RAM: Metal render targets created on it write
- * guest memory directly, so there is exactly ONE copy of surface content.
+ * VA). The view aliases guest RAM so host imports can address the same bytes.
  *
  * A host-contiguous page run returns its direct RAMBlock HVA, which is guest
  * RAM itself and outlives every view. A fragmented list gets one packed

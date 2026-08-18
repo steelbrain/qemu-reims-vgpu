@@ -375,7 +375,7 @@ static void reims_vgpu_pci_set_mode(ReimsVGPUPCIState *s, uint32_t width,
 
 /*
  * Copy BAR1 linear BGRA8 into the QEMU DisplaySurface (UEFI GOP / OpenCore).
- * Used when the Metal/product present path has not yet latched a front buffer.
+ * Used when the product present path has not yet latched a front buffer.
  */
 static bool reims_vgpu_pci_copy_gop_fb(ReimsVGPUPCIState *s)
 {

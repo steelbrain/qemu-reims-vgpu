@@ -159,8 +159,7 @@ config MAC_PVG_PCI
 # Builds both:
 #   reims-vgpu-mmio       — sysbus (vmapple / arm)
 #   reims-vgpu-pci        — PCI (x86 Tahoe; vendor 0x106B / device 0xEEEE)
-# No arch dependency: Linux/x86 builds link the Metal host stubs / Vulkan so the
-# device + Rust staticlib stay in the link graph while real encode is filled in.
+# No arch dependency: both product devices link the same Vulkan staticlib.
 config REIMS_VGPU
     bool
     default y

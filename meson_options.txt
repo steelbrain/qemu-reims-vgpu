@@ -385,6 +385,3 @@ option('rust', type: 'feature', value: 'disabled',
        description: 'Rust support')
 option('strict_rust_lints', type: 'boolean', value: false,
        description: 'Enable stricter set of Rust warnings')
-
-option('reims_vgpu_backend', type : 'combo', choices : ['env', 'metal', 'vulkan'], value: 'env',
-       description: 'host GPU backend linked into the reims-vgpu staticlib')
