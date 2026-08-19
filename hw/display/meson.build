@@ -78,7 +78,7 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
   endif
   # host-window adds the Rust-owned winit + VkSurfaceKHR presentation window,
   # opt-in at runtime behind REIMS_VGPU_WINDOW.
-  reims_vgpu_cargo_features = '--no-default-features --features backend-vulkan,host-window'
+  reims_vgpu_cargo_features = '--no-default-features --features host-window'
   # ash loads the Vulkan loader at runtime; no link-time Vulkan dep.
   if host_os == 'darwin'
     # winit/raw-window-metal link against the native macOS windowing stack even
