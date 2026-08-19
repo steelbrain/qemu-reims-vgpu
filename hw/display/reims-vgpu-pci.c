@@ -96,9 +96,8 @@ struct ReimsVGPUPCIState {
 
     ReimsVgpuHostOps host_ops;
     uint64_t rust_handle;
-    /* Stable packed aliases over file-backed guest pages. They remain mapped
-     * until the Rust/Vulkan backend is destroyed, so a submitted GPU read can
-     * never outlive the host address it names. */
+    /* Stable packed aliases over file-backed guest pages. Rust retires each
+     * one only after the Vulkan objects and submissions that name it retire. */
     GArray *page_views;
 
     /* Ordered Rust FIFO/render drain owner. The AIO BH only applies completed
@@ -153,9 +152,9 @@ static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t coun
      * Packed contiguous host-VA view: guest RAM is already mmap'd in the QEMU
      * process. Callers (Rust map_pages consumers) treat page i as
      * `base + i * page` — so every GPA in the list must alias host VA at that
-     * packed offset (same RAMBlock, sequential host pages). Non-sequential /
-     * cross-MR / non-RAM lists return -1; callers multi-import maximal runs
-     * or fail closed (`not_contig`).
+     * packed offset. A directly contiguous RAMBlock span can be returned as-is;
+     * otherwise the file-backed guest pages are remapped below into one packed
+     * alias. Non-RAM or non-shareable pages are refused.
      *
      * Note: do **not** accept `hva == base + (gpas[i] - gpas[0])` for sparse
      * GPAs — that would return success while page i is not at base+i*page,
@@ -301,12 +300,23 @@ alias_fail_locked:
 
 static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
 {
-    (void)ctx;
-    (void)ptr;
+    ReimsVGPUPCIState *s = ctx;
+    size_t i;
+
     (void)len;
-    /* Direct RAMBlock pointers and packed aliases both stay valid for the
-     * device lifetime. Packed aliases are released together after the Rust
-     * backend has destroyed every Vulkan object that could name them. */
+    if (!s || !ptr || !s->page_views) {
+        return;
+    }
+    for (i = 0; i < s->page_views->len; i++) {
+        ReimsVGPUPCIPageView *view =
+            &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
+        if (view->ptr == ptr) {
+            munmap(view->ptr, view->len);
+            g_array_remove_index_fast(s->page_views, i);
+            return;
+        }
+    }
+    /* A pointer absent from page_views is the RAMBlock's own mapping. */
 }
 
 static void reims_vgpu_pci_bh(void *opaque);
@@ -903,11 +913,10 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         .notify_actions = reims_vgpu_pci_notify_actions,
         /*
-         * 1: a direct RAMBlock pointer and a packed file-backed alias both
-         * remain valid until device teardown. unmap_pages therefore owes no
-         * per-view release, and a caller may retain either answer for the
-         * device lifetime. The MMIO shim answers 0 because its mach_vm_remap
-         * view has caller-owned lifetime instead.
+         * 1: a direct RAMBlock pointer and a packed file-backed alias may both
+         * be retained by the backend. A packed alias remains valid until the
+         * matching unmap_pages after backend completion. The MMIO shim answers
+         * 0 because its mach_vm_remap view cannot be retained by the backend.
          */
         .map_pages_stable = 1,
     };
