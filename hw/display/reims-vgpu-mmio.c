@@ -906,6 +906,7 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
          * built and never releases.
          */
         .map_pages_stable = 0,
+        .map_pages_with_padding = NULL,
     };
 
     info = (ReimsVgpuQemuCreateInfo){

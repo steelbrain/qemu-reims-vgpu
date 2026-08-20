@@ -134,6 +134,86 @@ static int reims_vgpu_pci_read_xreg(void *ctx, uint32_t index, uint64_t *out)
     return -1;
 }
 
+static int reims_vgpu_pci_map_page_alias(ReimsVGPUPCIState *s,
+                                         const uint64_t *gpas,
+                                         size_t count, hwaddr page,
+                                         size_t total, void **out_ptr)
+{
+    size_t guest_len;
+    uint8_t *view;
+    size_t i;
+    ReimsVGPUPCIPageView held;
+
+    if (!s || !gpas || count == 0 || !out_ptr ||
+        count > SIZE_MAX / page) {
+        return -1;
+    }
+    guest_len = count * page;
+    if (total < guest_len || total % page != 0) {
+        return -1;
+    }
+    view = mmap(NULL, total, PROT_NONE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (view == MAP_FAILED) {
+        return -1;
+    }
+
+    rcu_read_lock();
+    for (i = 0; i < count; i++) {
+        hwaddr xlat, plen = page;
+        MemoryRegion *mr;
+        uint8_t *hva;
+        RAMBlock *rb;
+        ram_addr_t rb_offset;
+        ram_addr_t fd_offset;
+        int fd;
+        void *mapped;
+
+        mr = address_space_translate(&address_space_memory, gpas[i],
+                                     &xlat, &plen, true,
+                                     MEMTXATTRS_UNSPECIFIED);
+        if (!mr || !memory_region_is_ram(mr) || plen < page) {
+            goto fail_locked;
+        }
+        hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+        rb = qemu_ram_block_from_host(hva, false, &rb_offset);
+        if (!rb || !qemu_ram_is_shared(rb)) {
+            goto fail_locked;
+        }
+        fd = qemu_ram_get_fd(rb);
+        if (fd < 0 || rb_offset > RAM_ADDR_MAX - qemu_ram_get_fd_offset(rb)) {
+            goto fail_locked;
+        }
+        fd_offset = qemu_ram_get_fd_offset(rb) + rb_offset;
+        if ((fd_offset & (page - 1)) != 0) {
+            goto fail_locked;
+        }
+        mapped = mmap(view + i * page, page, PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_FIXED, fd, fd_offset);
+        if (mapped == MAP_FAILED) {
+            goto fail_locked;
+        }
+    }
+    rcu_read_unlock();
+
+    if (total > guest_len &&
+        mprotect(view + guest_len, total - guest_len,
+                 PROT_READ | PROT_WRITE) != 0) {
+        munmap(view, total);
+        return -1;
+    }
+    held.ptr = view;
+    held.len = total;
+    g_array_append_val(s->page_views, held);
+    *out_ptr = view;
+    return 0;
+
+fail_locked:
+    rcu_read_unlock();
+    munmap(view, total);
+    return -1;
+}
+
 static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t count,
                              void **out_ptr)
 {
@@ -238,64 +318,21 @@ fail:
      * page tears down the whole reservation, so callers never receive a
      * partially packed view.
      */
-    {
-        size_t total = count * page;
-        uint8_t *view = mmap(NULL, total, PROT_NONE,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        ReimsVGPUPCIPageView held;
+    return reims_vgpu_pci_map_page_alias(s, gpas, count, page,
+                                         count * page, out_ptr);
+}
 
-        if (view == MAP_FAILED) {
-            return -1;
-        }
-        rcu_read_lock();
-        for (i = 0; i < count; i++) {
-            hwaddr xlat, plen = page;
-            MemoryRegion *mr;
-            uint8_t *hva;
-            RAMBlock *rb;
-            ram_addr_t rb_offset;
-            ram_addr_t fd_offset;
-            int fd;
-            void *mapped;
+static int reims_vgpu_pci_map_pages_with_padding(void *ctx,
+                                                  const uint64_t *gpas,
+                                                  size_t count,
+                                                  size_t total_len,
+                                                  void **out_ptr)
+{
+    ReimsVGPUPCIState *s = ctx;
+    const hwaddr page = (hwaddr)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
 
-            mr = address_space_translate(&address_space_memory, gpas[i],
-                                         &xlat, &plen, true,
-                                         MEMTXATTRS_UNSPECIFIED);
-            if (!mr || !memory_region_is_ram(mr) || plen < page) {
-                goto alias_fail_locked;
-            }
-            hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
-            rb = qemu_ram_block_from_host(hva, false, &rb_offset);
-            if (!rb || !qemu_ram_is_shared(rb)) {
-                goto alias_fail_locked;
-            }
-            fd = qemu_ram_get_fd(rb);
-            if (fd < 0 || rb_offset > RAM_ADDR_MAX - qemu_ram_get_fd_offset(rb)) {
-                goto alias_fail_locked;
-            }
-            fd_offset = qemu_ram_get_fd_offset(rb) + rb_offset;
-            if ((fd_offset & (page - 1)) != 0) {
-                goto alias_fail_locked;
-            }
-            mapped = mmap(view + i * page, page, PROT_READ | PROT_WRITE,
-                          MAP_SHARED | MAP_FIXED, fd, fd_offset);
-            if (mapped == MAP_FAILED) {
-                goto alias_fail_locked;
-            }
-        }
-        rcu_read_unlock();
-
-        held.ptr = view;
-        held.len = total;
-        g_array_append_val(s->page_views, held);
-        *out_ptr = view;
-        return 0;
-
-alias_fail_locked:
-        rcu_read_unlock();
-        munmap(view, total);
-        return -1;
-    }
+    return reims_vgpu_pci_map_page_alias(s, gpas, count, page,
+                                         total_len, out_ptr);
 }
 
 static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
@@ -919,6 +956,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
          * 0 because its mach_vm_remap view cannot be retained by the backend.
          */
         .map_pages_stable = 1,
+        .map_pages_with_padding = reims_vgpu_pci_map_pages_with_padding,
     };
 
     qemu_mutex_init(&s->drain_mutex);
