@@ -1051,12 +1051,11 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         .notify_actions = reims_vgpu_pci_notify_actions,
         /*
-         * A result may be either a borrowed direct RAMBlock pointer or a
-         * caller-owned packed alias. The ABI has one device-wide lifetime bit,
-         * so advertise the stricter answer: callers release every result and
-         * unmap_pages ignores borrowed pointers that are absent from page_views.
+         * Every result remains valid until the caller explicitly retires it:
+         * direct RAMBlock pointers need no release, while packed aliases leave
+         * through unmap_pages after their Vulkan import has retired.
          */
-        .map_pages_stable = 0,
+        .map_pages_stable = 1,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
