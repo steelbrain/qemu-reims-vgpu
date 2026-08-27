@@ -105,6 +105,10 @@ struct ReimsVGPUPCIState {
      * unmap_pages when the Rust mapping lifetime ends, with device exit as the
      * final safety net. */
     GArray *page_views;
+    uint64_t page_view_live_bytes;
+    uint64_t page_view_live_pages;
+    uint64_t page_views_created;
+    uint64_t page_views_destroyed;
 
     /* Ordered Rust FIFO/render drain owner. The AIO BH only applies completed
      * HostActions; it never translates shaders or waits for GPU work. */
@@ -294,6 +298,9 @@ fail:
         held.ptr = view;
         held.len = total;
         g_array_append_val(s->page_views, held);
+        s->page_view_live_bytes += total;
+        s->page_view_live_pages += count;
+        s->page_views_created++;
         *out_ptr = view;
         return 0;
 
@@ -321,10 +328,31 @@ static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
             continue;
         }
         munmap(view->ptr, view->len);
+        s->page_view_live_bytes -= view->len;
+        s->page_view_live_pages -= view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
+        s->page_views_destroyed++;
         g_array_remove_index_fast(s->page_views, i);
         return;
     }
     /* A direct RAMBlock pointer is borrowed from QEMU and has no entry. */
+}
+
+static int reims_vgpu_pci_page_alias_census(
+    void *ctx, ReimsVgpuPageAliasCensus *out)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    if (!s || !s->page_views || !out) {
+        return -1;
+    }
+    *out = (ReimsVgpuPageAliasCensus) {
+        .live = s->page_views->len,
+        .live_bytes = s->page_view_live_bytes,
+        .live_pages = s->page_view_live_pages,
+        .created = s->page_views_created,
+        .destroyed = s->page_views_destroyed,
+    };
+    return 0;
 }
 
 /*
@@ -1010,6 +1038,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
         .guest_written_pages = reims_vgpu_pci_guest_written_pages,
+        .page_alias_census = reims_vgpu_pci_page_alias_census,
     };
     s->dirty = reims_vgpu_dirty_new();
 
@@ -1122,6 +1151,7 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
             ReimsVGPUPCIPageView *view =
                 &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
             munmap(view->ptr, view->len);
+            s->page_views_destroyed++;
         }
         g_array_free(s->page_views, true);
         s->page_views = NULL;
