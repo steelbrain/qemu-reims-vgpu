@@ -100,9 +100,10 @@ struct ReimsVGPUPCIState {
      * surface's guest pages that no device operation made. */
     ReimsVgpuDirty *dirty;
     uint64_t rust_handle;
-    /* Stable packed aliases over file-backed guest pages. They remain mapped
-     * until the Rust/Vulkan backend is destroyed, so a submitted GPU read can
-     * never outlive the host address it names. */
+    /* Caller-owned packed aliases over file-backed guest pages. Direct
+     * RAMBlock pointers never enter this list; constructed views leave through
+     * unmap_pages when the Rust mapping lifetime ends, with device exit as the
+     * final safety net. */
     GArray *page_views;
 
     /* Ordered Rust FIFO/render drain owner. The AIO BH only applies completed
@@ -305,12 +306,25 @@ alias_fail_locked:
 
 static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
 {
-    (void)ctx;
-    (void)ptr;
-    (void)len;
-    /* Direct RAMBlock pointers and packed aliases both stay valid for the
-     * device lifetime. Packed aliases are released together after the Rust
-     * backend has destroyed every Vulkan object that could name them. */
+    ReimsVGPUPCIState *s = ctx;
+    size_t i;
+
+    if (!s || !s->page_views || !ptr || len == 0) {
+        return;
+    }
+
+    for (i = 0; i < s->page_views->len; i++) {
+        ReimsVGPUPCIPageView *view =
+            &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
+
+        if (view->ptr != ptr || view->len != len) {
+            continue;
+        }
+        munmap(view->ptr, view->len);
+        g_array_remove_index_fast(s->page_views, i);
+        return;
+    }
+    /* A direct RAMBlock pointer is borrowed from QEMU and has no entry. */
 }
 
 /*
@@ -986,13 +1000,12 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         .notify_actions = reims_vgpu_pci_notify_actions,
         /*
-         * 1: a direct RAMBlock pointer and a packed file-backed alias both
-         * remain valid until device teardown. unmap_pages therefore owes no
-         * per-view release, and a caller may retain either answer for the
-         * device lifetime. The MMIO shim answers 0 because its mach_vm_remap
-         * view has caller-owned lifetime instead.
+         * A result may be either a borrowed direct RAMBlock pointer or a
+         * caller-owned packed alias. The ABI has one device-wide lifetime bit,
+         * so advertise the stricter answer: callers release every result and
+         * unmap_pages ignores borrowed pointers that are absent from page_views.
          */
-        .map_pages_stable = 1,
+        .map_pages_stable = 0,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
