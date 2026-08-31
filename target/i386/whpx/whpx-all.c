@@ -1057,6 +1057,20 @@ static int whpx_handle_msr_from_gpf(CPUState *cpu)
     return 0;
 }
 
+static void whpx_inject_back_pf(CPUState *cpu)
+{
+    WHV_VP_EXCEPTION_CONTEXT *ctx = &cpu->accel->exit_ctx.VpException;
+    WHV_REGISTER_VALUE reg = {};
+
+    reg.ExceptionEvent.EventPending = 1;
+    reg.ExceptionEvent.EventType = WHvX64PendingEventException;
+    reg.ExceptionEvent.DeliverErrorCode = ctx->ExceptionInfo.ErrorCodeValid;
+    reg.ExceptionEvent.Vector = ctx->ExceptionType;
+    reg.ExceptionEvent.ErrorCode = ctx->ErrorCode;
+    reg.ExceptionEvent.ExceptionParameter = ctx->ExceptionParameter;
+    whpx_set_reg(cpu, WHvRegisterPendingEvent, reg);
+}
+
 static void whpx_inject_back_gpf(CPUState *cpu)
 {
     WHV_VP_EXCEPTION_CONTEXT *ctx = &cpu->accel->exit_ctx.VpException;
@@ -1465,6 +1479,15 @@ static UINT64 whpx_get_default_exceptions(void)
     if (whpx->intercept_msr_gp) {
         intercepts |= 1UL << WHvX64ExceptionTypeGeneralProtectionFault;
     }
+
+    /*
+     * Always intercept page faults: the hypervisor delivers them to the
+     * guest only when the guest's fault path is mapped; early-boot guests
+     * with a page-fault-heavy init otherwise end up in a nested-fault storm
+     * and the VP dies with an UnrecoverableException. Intercepting and
+     * re-injecting the fault as a pending event keeps the guest in control.
+     */
+    intercepts |= 1UL << WHvX64ExceptionTypePageFault;
 
     return intercepts;
 }
@@ -2628,6 +2651,18 @@ int whpx_vcpu_run(CPUState *cpu)
             break;
         }
         case WHvRunVpExitReasonException:
+            if (vcpu->exit_ctx.VpException.ExceptionType ==
+                WHvX64ExceptionTypePageFault) {
+                /*
+                 * Deliver the #PF straight back to the guest as a pending
+                 * exception (mirrors the GPF handling): routing it through
+                 * EXCP_DEBUG loses the fault in the core when no debugger
+                 * is attached.
+                 */
+                whpx_inject_back_pf(cpu);
+                ret = 0;
+                break;
+            }
             if (vcpu->exit_ctx.VpException.ExceptionType ==
                 WHvX64ExceptionTypeGeneralProtectionFault) {
                 if (whpx_handle_msr_from_gpf(cpu)) {
