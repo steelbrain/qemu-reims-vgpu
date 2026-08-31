@@ -218,8 +218,9 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
      *
      * It is not free to wait. While the set is unarmed its generation reads
      * back 0, `HostOps::guest_write_gen` maps that to "cannot tell", the
-     * type-11 LOAD elision refuses with `t11_gw_ref_no_stamp`, and every draw
-     * onto that surface pays a whole-frame seed read out of guest pages plus a
+     * mapper-ref-texture LOAD elision refuses with `t11_gw_ref_no_stamp`, and
+     * every draw onto that surface pays a whole-frame seed read out of guest
+     * pages plus a
      * whole-frame staging upload. The window is counted in harvests and
      * harvests are driven by guest doorbells, so on a quiet desktop it lasts as
      * long as the guest stays quiet — which is exactly when a draw arriving
@@ -368,8 +369,9 @@ static bool reims_vgpu_dirty_ram_range(Int128 start, Int128 len,
  * unresolved pages, so nothing could undo it for the life of the VM.
  *
  * Downstream that is a guest-visible latch, not a slow path: every host-side
- * copy of a surface is declared stale, the type-11 sampled rung refuses its
- * resident and merges guest pages that never held the composite, and deferred
+ * copy of a surface is declared stale, the mapper-ref-texture sampled rung
+ * refuses its resident and merges guest pages that never held the composite,
+ * and deferred
  * render windows report `deferred_flush_clobber`. It reads as backdrops going
  * transparent and popover geometry breaking, until the guest is rebooted.
  *

@@ -210,8 +210,8 @@ static int reims_vgpu_mmio_read_xreg(void *ctx, uint32_t index, uint64_t *out)
  * bought nothing and every fragmented map leaked a VA reservation until
  * teardown. `map_pages_stable` is 0 accordingly.
  *
- * Non-Darwin hosts: fail closed (no mach_vm); type-11 writeback uses GPA
- * copies through HostOps until a Linux aliasing path lands.
+ * Non-Darwin hosts: fail closed (no mach_vm); mapper-ref-texture writeback
+ * uses GPA copies through HostOps until a Linux aliasing path lands.
  */
 static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
                                   size_t count, void **out_ptr,
