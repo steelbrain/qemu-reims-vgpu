@@ -1301,6 +1301,9 @@ static bool whpx_simulate_rdmsr(CPUState *cs)
     case MSR_IA32_SYSENTER_EIP:
         val = env->sysenter_eip;
         break;
+    case MSR_IA32_MISC_ENABLE:
+        val = env->msr_ia32_misc_enable;
+        break;
     default:
         error_report("WHPX: unknown msr 0x%x", msr);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
@@ -1329,6 +1332,9 @@ static bool whpx_simulate_wrmsr(CPUState *cs)
         break;
     case MSR_IA32_SYSENTER_EIP:
         env->sysenter_eip = data;
+        break;
+    case MSR_IA32_MISC_ENABLE:
+        env->msr_ia32_misc_enable = data;
         break;
     default:
         error_report("WHPX: unknown msr 0x%x val %llx", msr, data);
@@ -2444,6 +2450,21 @@ int whpx_vcpu_run(CPUState *cpu)
                         val = senv->sysenter_eip;
                         break;
                     }
+                }
+            }
+            /*
+             * macOS kexts probe IA32_MISC_ENABLE early; failing the
+             * read with #GP panics the boot. Mirror QEMU's TCG
+             * semantics: reads return the stored value, writes store
+             * it verbatim.
+             */
+            if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_MISC_ENABLE) {
+                CPUX86State *menv = &X86_CPU(cpu)->env;
+                is_known_msr = 1;
+                if (vcpu->exit_ctx.MsrAccess.AccessInfo.IsWrite) {
+                    menv->msr_ia32_misc_enable = val;
+                } else {
+                    val = menv->msr_ia32_misc_enable;
                 }
             }
             if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_APICBASE) {
