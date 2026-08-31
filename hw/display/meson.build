@@ -94,6 +94,12 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
   reims_vgpu_rust_sys_libs = ['-lm', '-ldl', '-lpthread']
   if host_os == 'darwin'
     reims_vgpu_rust_sys_libs += ['-liconv']
+  elif host_os == 'windows'
+    # mingw-w64: no libm/libdl to link; winit's native windowing stack and the
+    # sockets lib the Rust std target expects.
+    reims_vgpu_rust_sys_libs = ['-luser32', '-lgdi32', '-ldwmapi', '-lole32',
+                                '-lshell32', '-limm32', '-loleaut32', '-lws2_32',
+                                '-luserenv', '-lntdll', '-luxtheme']
   endif
   if reims_vgpu_backend_kind == 'metal'
     reims_vgpu_cargo_features = '--features backend-metal'
