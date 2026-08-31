@@ -248,6 +248,13 @@ static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t coun
 fail:
     rcu_read_unlock();
 
+#if defined(_WIN32)
+    /*
+     * No POSIX mmap on Windows: packed aliasing views are unavailable, so every
+     * scattered GVA mapping takes the product copying rails instead.
+     */
+    return -1;
+#else
     /*
      * A task GVA is linear even when its guest-physical pages are not. When
      * guest RAM is shared file-backed memory, recreate that virtual shape with
@@ -332,6 +339,7 @@ alias_fail_locked:
         munmap(view, total);
         return -1;
     }
+#endif
 }
 
 static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
@@ -1172,8 +1180,10 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
         for (i = 0; i < s->page_views->len; i++) {
             ReimsVGPUPCIPageView *view =
                 &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
+#ifndef _WIN32
             munmap(view->ptr, view->len);
             s->page_views_destroyed++;
+#endif
         }
         g_array_free(s->page_views, true);
         s->page_views = NULL;
