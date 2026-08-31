@@ -1292,13 +1292,21 @@ static bool whpx_simulate_rdmsr(CPUState *cs)
     uint64_t val = 0;
 
     switch (msr) {
+    case MSR_IA32_SYSENTER_CS:
+        val = env->sysenter_cs;
+        break;
+    case MSR_IA32_SYSENTER_ESP:
+        val = env->sysenter_esp;
+        break;
+    case MSR_IA32_SYSENTER_EIP:
+        val = env->sysenter_eip;
+        break;
     default:
         error_report("WHPX: unknown msr 0x%x", msr);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
         return 1;
         break;
     }
-
     RAX(env) = (uint32_t)val;
     RDX(env) = (uint32_t)(val >> 32);
 
@@ -1313,13 +1321,21 @@ static bool whpx_simulate_wrmsr(CPUState *cs)
     uint64_t data = ((uint64_t)EDX(env) << 32) | EAX(env);
 
     switch (msr) {
+    case MSR_IA32_SYSENTER_CS:
+        env->sysenter_cs = data;
+        break;
+    case MSR_IA32_SYSENTER_ESP:
+        env->sysenter_esp = data;
+        break;
+    case MSR_IA32_SYSENTER_EIP:
+        env->sysenter_eip = data;
+        break;
     default:
         error_report("WHPX: unknown msr 0x%x val %llx", msr, data);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
         return 1;
         break;
     }
-
     return 0;
 }
 
@@ -2390,6 +2406,46 @@ int whpx_vcpu_run(CPUState *cpu)
                 val = X86_CPU(cpu)->env.apic_bus_freq;
             }
 
+            /*
+             * The hypervisor intercepts guest accesses to the SYSENTER
+             * MSRs and reports them here. Keep the guest-visible values
+             * in env (the x86_emul fallback and reads both use them).
+             * The partition-side SYSENTER state is left alone: the
+             * hypervisor rejects programmatic updates to it for some
+             * values, and guests reach these MSRs through the emulated
+             * path in practice.
+             */
+            if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_SYSENTER_CS
+                || vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_SYSENTER_ESP
+                || vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_SYSENTER_EIP) {
+                CPUX86State *senv = &X86_CPU(cpu)->env;
+                is_known_msr = 1;
+                if (vcpu->exit_ctx.MsrAccess.AccessInfo.IsWrite) {
+                    switch (vcpu->exit_ctx.MsrAccess.MsrNumber) {
+                    case MSR_IA32_SYSENTER_CS:
+                        senv->sysenter_cs = val;
+                        break;
+                    case MSR_IA32_SYSENTER_ESP:
+                        senv->sysenter_esp = val;
+                        break;
+                    case MSR_IA32_SYSENTER_EIP:
+                        senv->sysenter_eip = val;
+                        break;
+                    }
+                } else {
+                    switch (vcpu->exit_ctx.MsrAccess.MsrNumber) {
+                    case MSR_IA32_SYSENTER_CS:
+                        val = senv->sysenter_cs;
+                        break;
+                    case MSR_IA32_SYSENTER_ESP:
+                        val = senv->sysenter_esp;
+                        break;
+                    case MSR_IA32_SYSENTER_EIP:
+                        val = senv->sysenter_eip;
+                        break;
+                    }
+                }
+            }
             if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_APICBASE) {
                 is_known_msr = 1;
                 if (val & MSR_IA32_APICBASE_RESERVED) {
