@@ -2691,6 +2691,15 @@ int whpx_vcpu_run(CPUState *cpu)
                 } else {
                     reg_values[2].Reg32 &= ~CPUID_EXT_OSXSAVE;
                 }
+
+                /*
+                 * The hypervisor's in-kernel LAPIC advertises TSC-deadline
+                 * support but faults on the corresponding LVT timer write
+                 * (observed: a guest writing 0x400dd to x2APIC MSR 0x832
+                 * takes #GP in lapic_init). Hide the bit so the guest falls
+                 * back to one-shot mode, which the LAPIC handles.
+                 */
+                reg_values[2].Reg32 &= ~CPUID_EXT_TSC_DEADLINE_TIMER;
             }
 
             hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
