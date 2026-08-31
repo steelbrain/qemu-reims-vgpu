@@ -66,9 +66,17 @@ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
 
 if config_all_devices.has_key('CONFIG_REIMS_VGPU')
-  # Thin QEMU C device links crates/reims-vgpu (Cargo staticlib). Backend is a
-  # configure-time choice baked into the binary — one backend per boot, never a
+  # Thin QEMU C device links crates/reims-vgpu (Cargo staticlib). Which backends
+  # are *linked in* is a configure-time choice baked into the binary, never a
   # runtime env sniff.
+  #
+  # `both` links both and lets the device pick between them at run time
+  # (REIMS_VGPU_RAIL). That is not a relaxation of the rule above — it is what
+  # makes the rule affordable. An Apple host reaches its GPU natively through
+  # Metal and through MoltenVK, and telling a metal2vulkan defect from a defect
+  # in this device means running the *same guest stream* both ways. With one
+  # backend per binary that comparison costs a rebuild, which changes the
+  # binary, the caches and the boot alongside the thing being measured.
   # Sources live in the parent repo, two directories above this vendored submodule.
   reims_vgpu_repo_dir = meson.global_source_root() / '..' / '..'
   reims_vgpu_abi_header_dir = reims_vgpu_repo_dir / 'crates' / 'reims-vgpu' / 'include'
@@ -156,8 +164,36 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
                                  '-Wl,--no-whole-archive']
       endif
     endif
+  elif reims_vgpu_backend_kind == 'both'
+    # Metal + Vulkan in one staticlib, chosen at run time. Apple only: the crate
+    # rejects backend-metal off macOS, because there is no host-stub Metal arm.
+    if host_os != 'darwin'
+      error('reims_vgpu_backend=both requires an Apple host (backend-metal has ' +
+            'no host-stub arm); use metal or vulkan')
+    endif
+    reims_vgpu_cargo_features = '--features backend-metal,backend-vulkan,host-window'
+    # The union of the two arms' frameworks, which on Darwin is the Vulkan list:
+    # it already names Metal, QuartzCore, Foundation and CoreGraphics for winit
+    # and raw-window-metal, so the Metal arm adds nothing to it. Spelled out in
+    # full rather than derived from the branch above, because a reader checking
+    # what this binary links should not have to evaluate two branches to find
+    # out, and because the day the two lists stop overlapping this must not
+    # silently drop one of them.
+    reims_vgpu_link_args = [
+      '-framework', 'AppKit',
+      '-framework', 'ApplicationServices',
+      '-framework', 'Carbon',
+      '-framework', 'CoreFoundation',
+      '-framework', 'CoreGraphics',
+      '-framework', 'CoreVideo',
+      '-framework', 'Foundation',
+      '-framework', 'Metal',
+      '-framework', 'QuartzCore',
+      '-lobjc',
+    ] + reims_vgpu_rust_sys_libs
   else
-    error('unknown REIMS_VGPU_BACKEND: ' + reims_vgpu_backend_kind + ' (metal | vulkan)')
+    error('unknown REIMS_VGPU_BACKEND: ' + reims_vgpu_backend_kind +
+          ' (metal | vulkan | both)')
   endif
   reims_vgpu_built = reims_vgpu_repo_dir / 'target' / 'release' / 'libreims_vgpu.a'
   reims_vgpu_a = custom_target('reims-vgpu-staticlib',

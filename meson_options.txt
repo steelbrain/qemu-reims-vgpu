@@ -386,5 +386,11 @@ option('rust', type: 'feature', value: 'disabled',
 option('strict_rust_lints', type: 'boolean', value: false,
        description: 'Enable stricter set of Rust warnings')
 
-option('reims_vgpu_backend', type : 'combo', choices : ['env', 'metal', 'vulkan'], value: 'env',
-       description: 'host GPU backend linked into the reims-vgpu staticlib')
+# "both" links Metal and Vulkan into one staticlib and picks between them at run
+# time through REIMS_VGPU_RAIL; Apple hosts only, since backend-metal has no
+# host-stub arm. See hw/display/meson.build for what that configuration is for.
+# The description stays one line: meson's lexer has no string continuation, and
+# a backslash here is a configure-time syntax error rather than a wrapped line.
+option('reims_vgpu_backend', type : 'combo',
+       choices : ['env', 'metal', 'vulkan', 'both'], value: 'env',
+       description: 'host GPU backend(s) linked into the reims-vgpu staticlib')
