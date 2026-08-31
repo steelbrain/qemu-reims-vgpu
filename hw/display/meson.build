@@ -110,13 +110,27 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
                                 '-luserenv', '-lntdll', '-luxtheme']
   endif
   if reims_vgpu_backend_kind == 'metal'
-    reims_vgpu_cargo_features = '--features backend-metal'
+    # host-window: the Metal rail presents through a Rust-owned winit window and
+    # a CAMetalLayer on its view, the same window the Vulkan rail fills through a
+    # swapchain. Which rail fills it is a run-time answer, so this feature is on
+    # for every arm that ships one; QEMU's own display is then unused and the
+    # boot passes -display none.
+    reims_vgpu_cargo_features = '--features backend-metal,host-window'
     if host_os == 'darwin'
+      # The same list as the vulkan and both arms below: winit's native
+      # windowing stack is what widened it past Metal + QuartzCore, and all
+      # three arms now carry a window. Spelled out in full rather than shared,
+      # for the reason the 'both' arm gives.
       reims_vgpu_link_args = [
-        '-framework', 'Metal',
-        '-framework', 'Foundation',
-        '-framework', 'QuartzCore',
+        '-framework', 'AppKit',
+        '-framework', 'ApplicationServices',
+        '-framework', 'Carbon',
+        '-framework', 'CoreFoundation',
         '-framework', 'CoreGraphics',
+        '-framework', 'CoreVideo',
+        '-framework', 'Foundation',
+        '-framework', 'Metal',
+        '-framework', 'QuartzCore',
         '-lobjc',
       ] + reims_vgpu_rust_sys_libs
     else
