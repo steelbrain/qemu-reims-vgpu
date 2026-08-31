@@ -214,7 +214,8 @@ static int reims_vgpu_mmio_read_xreg(void *ctx, uint32_t index, uint64_t *out)
  * copies through HostOps until a Linux aliasing path lands.
  */
 static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
-                                  size_t count, void **out_ptr)
+                                  size_t count, void **out_ptr,
+                                  ReimsVgpuMapPagesFailure *failure)
 {
 #if defined(CONFIG_DARWIN)
     ReimsVGPUMMIOState *s = ctx;
@@ -225,8 +226,17 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
     kern_return_t kr;
     size_t i;
 
-    if (!s || !gpas || count == 0 || !out_ptr ||
+    if (failure) {
+        *failure = (ReimsVgpuMapPagesFailure) {
+            .stage = REIMS_VGPU_MAP_PAGES_FAILURE_NONE,
+        };
+    }
+    if (!s || !gpas || count == 0 || !out_ptr || !failure ||
         count > SIZE_MAX / REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E) {
+        if (failure) {
+            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE;
+            failure->page_index = UINT64_MAX;
+        }
         return -1;
     }
     view_len = (mach_vm_size_t)count * REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E;
@@ -243,10 +253,14 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
                                      MEMTXATTRS_UNSPECIFIED);
         if (!mr || !memory_region_is_ram(mr) ||
             plen < REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E) {
+            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE;
+            failure->page_index = i;
             goto fail;
         }
         hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
         if (((uintptr_t)hva & (REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E - 1)) != 0) {
+            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE;
+            failure->page_index = i;
             goto fail;
         }
         hvas[i] = hva;
@@ -267,6 +281,7 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
     kr = mach_vm_allocate(mach_task_self(), &view, view_len,
                           VM_FLAGS_ANYWHERE);
     if (kr != KERN_SUCCESS) {
+        failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION;
         g_free(hvas);
         return -1;
     }
@@ -280,6 +295,8 @@ static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
                            (mach_vm_address_t)(uintptr_t)hvas[i], FALSE,
                            &cur_prot, &max_prot, VM_INHERIT_NONE);
         if (kr != KERN_SUCCESS) {
+            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+            failure->page_index = i;
             mach_vm_deallocate(mach_task_self(), view, view_len);
             g_free(hvas);
             return -1;
@@ -302,6 +319,11 @@ fail:
     (void)gpas;
     (void)count;
     (void)out_ptr;
+    if (failure) {
+        *failure = (ReimsVgpuMapPagesFailure) {
+            .stage = REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION,
+        };
+    }
     return -1;
 #endif
 }
