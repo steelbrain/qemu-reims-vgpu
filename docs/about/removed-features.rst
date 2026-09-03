@@ -1038,6 +1038,14 @@ initial RISC-V QEMU port. Its usage was always been unclear: users don't know
 what to expect from a CPU called 'any', and in fact the CPU does not do anything
 special that isn't already done by the default CPUs rv32/rv64.
 
+Power8E and Power8NVL CPUs (removed in 11.1)
+''''''''''''''''''''''''''''''''''''''''''''
+
+The Power8E and Power8NVL variants of Power8 are not really useful anymore
+in qemu, and are old and unmaintained.
+Hence, the CPUs as well as corresponding Power8NVL and Power8E PnvChips have
+been removed
+
 System accelerators
 -------------------
 
@@ -1233,7 +1241,7 @@ RISC-V default machine (removed in 11.1)
 ''''''''''''''''''''''''''''''''''''''''
 
 RISC-V used to define ``spike`` as the default machine if no machine option
-was given via the command line.  This happend because ``spike`` was the first
+was given via the command line.  This happened because ``spike`` was the first
 RISC-V machine implemented in QEMU and setting it as default was
 convenient at that time.  Now we have 7 riscv64 and 6 riscv32 machines
 and having ``spike`` as a default is no longer justified.

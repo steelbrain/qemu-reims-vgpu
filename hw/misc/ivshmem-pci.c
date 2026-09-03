@@ -26,7 +26,7 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
-#include "system/kvm.h"
+#include "system/accel-irq.h"
 #include "migration/blocker.h"
 #include "migration/vmstate.h"
 #include "qemu/error-report.h"
@@ -424,19 +424,19 @@ static void ivshmem_add_kvm_msi_virq(IVShmemState *s, int vector,
                                      Error **errp)
 {
     PCIDevice *pdev = PCI_DEVICE(s);
-    KVMRouteChange c;
+    AccelRouteChange c;
     int ret;
 
     IVSHMEM_DPRINTF("ivshmem_add_kvm_msi_virq vector:%d\n", vector);
     assert(!s->msi_vectors[vector].pdev);
 
-    c = kvm_irqchip_begin_route_changes(kvm_state);
+    c = accel_irqchip_begin_route_changes();
     ret = kvm_irqchip_add_msi_route(&c, vector, pdev);
     if (ret < 0) {
         error_setg(errp, "kvm_irqchip_add_msi_route failed");
         return;
     }
-    kvm_irqchip_commit_route_changes(&c);
+    accel_irqchip_commit_route_changes(&c);
 
     s->msi_vectors[vector].virq = ret;
     s->msi_vectors[vector].pdev = pdev;
@@ -938,6 +938,9 @@ static void ivshmem_exit(PCIDevice *dev)
     IVShmemState *s = IVSHMEM_COMMON(dev);
     int i;
 
+    qemu_chr_fe_set_handlers(&s->server_chr,
+                             NULL, NULL, NULL, NULL, NULL, NULL, true);
+
     migrate_del_blocker(&s->migration_blocker);
 
     if (memory_region_is_mapped(s->ivshmem_bar2)) {
@@ -966,6 +969,8 @@ static void ivshmem_exit(PCIDevice *dev)
             close_peer_eventfds(s, i);
         }
         g_free(s->peers);
+        s->peers = NULL;
+        s->nb_peers = 0;
     }
 
     if (ivshmem_has_feature(s, IVSHMEM_MSI)) {
@@ -973,6 +978,7 @@ static void ivshmem_exit(PCIDevice *dev)
     }
 
     g_free(s->msi_vectors);
+    s->msi_vectors = NULL;
 }
 
 static int ivshmem_pre_load(void *opaque)

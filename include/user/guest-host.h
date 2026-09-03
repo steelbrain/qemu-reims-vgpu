@@ -10,6 +10,7 @@
 
 #include "exec/vaddr.h"
 #include "user/guest-base.h"
+#include "hw/core/cpu.h"
 #include "accel/tcg/cpu-ops.h"
 
 /*
@@ -79,6 +80,7 @@ static inline bool guest_range_valid_untagged_vaddr(vaddr start, vaddr len)
 })
 
 #ifdef COMPILING_PER_TARGET
+#include "exec/abi_ptr.h"
 
 /*
  * These functions take the guest virtual address as an abi_ptr.  This

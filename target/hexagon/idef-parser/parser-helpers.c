@@ -1731,6 +1731,15 @@ void gen_load_cancel(Context *c, YYLTYPE *locp)
     OUT(c, locp, "}\n");
 }
 
+void gen_framecheck(Context *c, YYLTYPE *locp, HexValue *addr, HexValue *ea)
+{
+    HexValue addr_m = rvalue_materialize(c, locp, addr);
+    HexValue ea_m = rvalue_materialize(c, locp, ea);
+    addr_m = gen_rvalue_truncate(c, locp, &addr_m);
+    ea_m = gen_rvalue_truncate(c, locp, &ea_m);
+    OUT(c, locp, "gen_framecheck(ctx, ", &addr_m, ", ", &ea_m, ");\n");
+}
+
 void gen_load(Context *c, YYLTYPE *locp, HexValue *width,
               HexSignedness signedness, HexValue *ea, HexValue *dst)
 {
@@ -1761,7 +1770,7 @@ void gen_load(Context *c, YYLTYPE *locp, HexValue *width,
     if (signedness == SIGNED) {
         OUT(c, locp, " | MO_SIGN");
     }
-    OUT(c, locp, " | MO_LE);\n");
+    OUT(c, locp, " | MO_LE | MO_ALIGN);\n");
 }
 
 void gen_store(Context *c, YYLTYPE *locp, HexValue *width, HexValue *ea,

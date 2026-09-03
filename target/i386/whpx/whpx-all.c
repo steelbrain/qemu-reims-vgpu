@@ -273,6 +273,14 @@ typedef enum WhpxStepMode {
 
 static uint32_t max_vcpu_index;
 static WHV_PROCESSOR_XSAVE_FEATURES whpx_xsave_cap;
+/*
+ * Per-VP flag: the last WHvGetVirtualProcessorState(Xsave) succeeded, so the
+ * FP/SSE/AVX image in env is current. On hosts where the read fails hard
+ * (observed with Hyper-V on AMD), the stale env image must never be written
+ * back: a vm_stop/vm_start cycle would otherwise clobber live vector
+ * registers on every VP and corrupt the guest.
+ */
+static bool whpx_xsave_valid[4096];
 
 bool whpx_has_xsave(void)
 {
@@ -612,7 +620,8 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
          */
         whpx_set_xcrs(cpu);
 
-        if (whpx_is_xsave_enabled(cpu)) {
+        if (whpx_is_xsave_enabled(cpu) &&
+            whpx_xsave_valid[cpu->cpu_index]) {
             whpx_set_xsave_state(cpu);
         } else {
             whpx_set_legacy_fp_registers(cpu, level);
@@ -838,17 +847,27 @@ static int whpx_get_xsave_state(CPUState *cpu)
             xsavec_buf_len, &bytes_written);
     }
     if (FAILED(hr) || bytes_written == 0) {
-        error_report("failed to get xsave state: %s", strerror(errno));
-        return -errno;
+        static int reported;
+        qemu_vfree(xsavec_buf);
+        whpx_xsave_valid[cpu->cpu_index] = false;
+        if (reported++ < 4) {
+            error_report("WHPX: failed to get xsave state cpu%u hr=%08lx "
+                         "written=%u; env FP/AVX image is stale, "
+                         "write-back disabled", cpu->cpu_index,
+                         (unsigned long)hr, (unsigned)bytes_written);
+        }
+        return -1;
     }
 
     ret = decompact_xsave_area(xsavec_buf, xsavec_buf_len, env);
     qemu_vfree(xsavec_buf);
     if (ret < 0) {
+        whpx_xsave_valid[cpu->cpu_index] = false;
         error_report("failed to decompact xsave area");
         return ret;
     }
     x86_cpu_xrstor_all_areas(x86cpu, env->xsave_buf, env->xsave_buf_len);
+    whpx_xsave_valid[cpu->cpu_index] = true;
 
     return 0;
 }
@@ -1034,7 +1053,18 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
 
+    /*
+     * Device MMIO handlers run under the BQL in every other accelerator
+     * (KVM/TCG/HVF). This path ran BQL-free on WHPX, so device handlers that
+     * touch MemoryRegion state (dirty-log transactions, flatview queries)
+     * raced the main loop and other vCPUs. Take the BQL around the emulated
+     * access to restore the device model invariant. emulate_instruction never
+     * takes the BQL itself, so this cannot recurse, and every caller is a
+     * vCPU thread outside the BQL.
+     */
+    bql_lock();
     ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
+    bql_unlock();
     if (ret < 0) {
         error_report("failed to emulate mmio");
         return -1;
@@ -1055,6 +1085,20 @@ static int whpx_handle_msr_from_gpf(CPUState *cpu)
     }
 
     return 0;
+}
+
+static void whpx_inject_back_pf(CPUState *cpu)
+{
+    WHV_VP_EXCEPTION_CONTEXT *ctx = &cpu->accel->exit_ctx.VpException;
+    WHV_REGISTER_VALUE reg = {};
+
+    reg.ExceptionEvent.EventPending = 1;
+    reg.ExceptionEvent.EventType = WHvX64PendingEventException;
+    reg.ExceptionEvent.DeliverErrorCode = ctx->ExceptionInfo.ErrorCodeValid;
+    reg.ExceptionEvent.Vector = ctx->ExceptionType;
+    reg.ExceptionEvent.ErrorCode = ctx->ErrorCode;
+    reg.ExceptionEvent.ExceptionParameter = ctx->ExceptionParameter;
+    whpx_set_reg(cpu, WHvRegisterPendingEvent, reg);
 }
 
 static void whpx_inject_back_gpf(CPUState *cpu)
@@ -1278,13 +1322,24 @@ static bool whpx_simulate_rdmsr(CPUState *cs)
     uint64_t val = 0;
 
     switch (msr) {
+    case MSR_IA32_SYSENTER_CS:
+        val = env->sysenter_cs;
+        break;
+    case MSR_IA32_SYSENTER_ESP:
+        val = env->sysenter_esp;
+        break;
+    case MSR_IA32_SYSENTER_EIP:
+        val = env->sysenter_eip;
+        break;
+    case MSR_IA32_MISC_ENABLE:
+        val = env->msr_ia32_misc_enable;
+        break;
     default:
         error_report("WHPX: unknown msr 0x%x", msr);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
         return 1;
         break;
     }
-
     RAX(env) = (uint32_t)val;
     RDX(env) = (uint32_t)(val >> 32);
 
@@ -1299,13 +1354,24 @@ static bool whpx_simulate_wrmsr(CPUState *cs)
     uint64_t data = ((uint64_t)EDX(env) << 32) | EAX(env);
 
     switch (msr) {
+    case MSR_IA32_SYSENTER_CS:
+        env->sysenter_cs = data;
+        break;
+    case MSR_IA32_SYSENTER_ESP:
+        env->sysenter_esp = data;
+        break;
+    case MSR_IA32_SYSENTER_EIP:
+        env->sysenter_eip = data;
+        break;
+    case MSR_IA32_MISC_ENABLE:
+        env->msr_ia32_misc_enable = data;
+        break;
     default:
         error_report("WHPX: unknown msr 0x%x val %llx", msr, data);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
         return 1;
         break;
     }
-
     return 0;
 }
 
@@ -1465,6 +1531,15 @@ static UINT64 whpx_get_default_exceptions(void)
     if (whpx->intercept_msr_gp) {
         intercepts |= 1UL << WHvX64ExceptionTypeGeneralProtectionFault;
     }
+
+    /*
+     * Always intercept page faults: the hypervisor delivers them to the
+     * guest only when the guest's fault path is mapped; early-boot guests
+     * with a page-fault-heavy init otherwise end up in a nested-fault storm
+     * and the VP dies with an UnrecoverableException. Intercepting and
+     * re-injecting the fault as a pending event keeps the guest in control.
+     */
+    intercepts |= 1UL << WHvX64ExceptionTypePageFault;
 
     return intercepts;
 }
@@ -1851,11 +1926,6 @@ void whpx_apply_breakpoints(
 
         breakpoints->data[i].state = state;
     }
-}
-
-bool whpx_arch_supports_guest_debug(void) 
-{
-    return true;
 }
 
 void whpx_arch_destroy_vcpu(CPUState *cpu)
@@ -2271,7 +2341,7 @@ int whpx_vcpu_run(CPUState *cpu)
             }
         }
 
-        if (exclusive_step_mode != WHPX_STEP_NONE || cpu->singlestep_enabled) {
+        if (exclusive_step_mode != WHPX_STEP_NONE || cpu_single_stepping(cpu)) {
             whpx_vcpu_configure_single_stepping(cpu, true, NULL);
         }
 
@@ -2288,7 +2358,7 @@ int whpx_vcpu_run(CPUState *cpu)
             break;
         }
 
-        if (exclusive_step_mode != WHPX_STEP_NONE || cpu->singlestep_enabled) {
+        if (exclusive_step_mode != WHPX_STEP_NONE || cpu_single_stepping(cpu)) {
             whpx_vcpu_configure_single_stepping(cpu,
                 false,
                 &vcpu->exit_ctx.VpContext.Rflags);
@@ -2372,6 +2442,61 @@ int whpx_vcpu_run(CPUState *cpu)
                 val = X86_CPU(cpu)->env.apic_bus_freq;
             }
 
+            /*
+             * The hypervisor intercepts guest accesses to the SYSENTER
+             * MSRs and reports them here. Keep the guest-visible values
+             * in env (the x86_emul fallback and reads both use them).
+             * The partition-side SYSENTER state is left alone: the
+             * hypervisor rejects programmatic updates to it for some
+             * values, and guests reach these MSRs through the emulated
+             * path in practice.
+             */
+            if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_SYSENTER_CS
+                || vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_SYSENTER_ESP
+                || vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_SYSENTER_EIP) {
+                CPUX86State *senv = &X86_CPU(cpu)->env;
+                is_known_msr = 1;
+                if (vcpu->exit_ctx.MsrAccess.AccessInfo.IsWrite) {
+                    switch (vcpu->exit_ctx.MsrAccess.MsrNumber) {
+                    case MSR_IA32_SYSENTER_CS:
+                        senv->sysenter_cs = val;
+                        break;
+                    case MSR_IA32_SYSENTER_ESP:
+                        senv->sysenter_esp = val;
+                        break;
+                    case MSR_IA32_SYSENTER_EIP:
+                        senv->sysenter_eip = val;
+                        break;
+                    }
+                } else {
+                    switch (vcpu->exit_ctx.MsrAccess.MsrNumber) {
+                    case MSR_IA32_SYSENTER_CS:
+                        val = senv->sysenter_cs;
+                        break;
+                    case MSR_IA32_SYSENTER_ESP:
+                        val = senv->sysenter_esp;
+                        break;
+                    case MSR_IA32_SYSENTER_EIP:
+                        val = senv->sysenter_eip;
+                        break;
+                    }
+                }
+            }
+            /*
+             * macOS kexts probe IA32_MISC_ENABLE early; failing the
+             * read with #GP panics the boot. Mirror QEMU's TCG
+             * semantics: reads return the stored value, writes store
+             * it verbatim.
+             */
+            if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_MISC_ENABLE) {
+                CPUX86State *menv = &X86_CPU(cpu)->env;
+                is_known_msr = 1;
+                if (vcpu->exit_ctx.MsrAccess.AccessInfo.IsWrite) {
+                    menv->msr_ia32_misc_enable = val;
+                } else {
+                    val = menv->msr_ia32_misc_enable;
+                }
+            }
             if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_APICBASE) {
                 is_known_msr = 1;
                 if (val & MSR_IA32_APICBASE_RESERVED) {
@@ -2617,6 +2742,15 @@ int whpx_vcpu_run(CPUState *cpu)
                 } else {
                     reg_values[2].Reg32 &= ~CPUID_EXT_OSXSAVE;
                 }
+
+                /*
+                 * The hypervisor's in-kernel LAPIC advertises TSC-deadline
+                 * support but faults on the corresponding LVT timer write
+                 * (observed: a guest writing 0x400dd to x2APIC MSR 0x832
+                 * takes #GP in lapic_init). Hide the bit so the guest falls
+                 * back to one-shot mode, which the LAPIC handles.
+                 */
+                reg_values[2].Reg32 &= ~CPUID_EXT_TSC_DEADLINE_TIMER;
             }
 
             hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
@@ -2633,6 +2767,18 @@ int whpx_vcpu_run(CPUState *cpu)
             break;
         }
         case WHvRunVpExitReasonException:
+            if (vcpu->exit_ctx.VpException.ExceptionType ==
+                WHvX64ExceptionTypePageFault) {
+                /*
+                 * Deliver the #PF straight back to the guest as a pending
+                 * exception (mirrors the GPF handling): routing it through
+                 * EXCP_DEBUG loses the fault in the core when no debugger
+                 * is attached.
+                 */
+                whpx_inject_back_pf(cpu);
+                ret = 0;
+                break;
+            }
             if (vcpu->exit_ctx.VpException.ExceptionType ==
                 WHvX64ExceptionTypeGeneralProtectionFault) {
                 if (whpx_handle_msr_from_gpf(cpu)) {
@@ -2653,7 +2799,7 @@ int whpx_vcpu_run(CPUState *cpu)
                 cpu->exception_index = EXCP_DEBUG;
             } else if ((vcpu->exit_ctx.VpException.ExceptionType ==
                         WHvX64ExceptionTypeDebugTrapOrFault) &&
-                       !cpu->singlestep_enabled) {
+                       !cpu_single_stepping(cpu)) {
                 /*
                  * Just finished stepping over a breakpoint, but the
                  * gdb does not expect us to do single-stepping.
@@ -3026,7 +3172,7 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
     WHV_PROCESSOR_FEATURES_BANKS processor_features;
     WHV_PROCESSOR_PERFMON_FEATURES perfmon_features;
 
-    UINT32 cpuidExitList[] = {0x0, 0x1, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
+    UINT32 cpuidExitList[] = {0x0, 0x1, 0x4, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
         0x40000000, 0x40000001, 0x40000010, 0x80000000, 0x80000001,
         0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
         0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
@@ -3342,6 +3488,8 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
 
     whpx_memory_init();
     whpx_init_emu();
+
+    as->gdbstub.sstep_flags = SSTEP_ENABLE;
 
     return 0;
 
