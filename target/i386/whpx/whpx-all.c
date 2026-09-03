@@ -273,6 +273,14 @@ typedef enum WhpxStepMode {
 
 static uint32_t max_vcpu_index;
 static WHV_PROCESSOR_XSAVE_FEATURES whpx_xsave_cap;
+/*
+ * Per-VP flag: the last WHvGetVirtualProcessorState(Xsave) succeeded, so the
+ * FP/SSE/AVX image in env is current. On hosts where the read fails hard
+ * (observed with Hyper-V on AMD), the stale env image must never be written
+ * back: a vm_stop/vm_start cycle would otherwise clobber live vector
+ * registers on every VP and corrupt the guest.
+ */
+static bool whpx_xsave_valid[4096];
 
 bool whpx_has_xsave(void)
 {
@@ -612,7 +620,8 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
          */
         whpx_set_xcrs(cpu);
 
-        if (whpx_is_xsave_enabled(cpu)) {
+        if (whpx_is_xsave_enabled(cpu) &&
+            whpx_xsave_valid[cpu->cpu_index]) {
             whpx_set_xsave_state(cpu);
         } else {
             whpx_set_legacy_fp_registers(cpu, level);
@@ -838,17 +847,27 @@ static int whpx_get_xsave_state(CPUState *cpu)
             xsavec_buf_len, &bytes_written);
     }
     if (FAILED(hr) || bytes_written == 0) {
-        error_report("failed to get xsave state: %s", strerror(errno));
-        return -errno;
+        static int reported;
+        qemu_vfree(xsavec_buf);
+        whpx_xsave_valid[cpu->cpu_index] = false;
+        if (reported++ < 4) {
+            error_report("WHPX: failed to get xsave state cpu%u hr=%08lx "
+                         "written=%u; env FP/AVX image is stale, "
+                         "write-back disabled", cpu->cpu_index,
+                         (unsigned long)hr, (unsigned)bytes_written);
+        }
+        return -1;
     }
 
     ret = decompact_xsave_area(xsavec_buf, xsavec_buf_len, env);
     qemu_vfree(xsavec_buf);
     if (ret < 0) {
+        whpx_xsave_valid[cpu->cpu_index] = false;
         error_report("failed to decompact xsave area");
         return ret;
     }
     x86_cpu_xrstor_all_areas(x86cpu, env->xsave_buf, env->xsave_buf_len);
+    whpx_xsave_valid[cpu->cpu_index] = true;
 
     return 0;
 }
@@ -1034,7 +1053,18 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
 
+    /*
+     * Device MMIO handlers run under the BQL in every other accelerator
+     * (KVM/TCG/HVF). This path ran BQL-free on WHPX, so device handlers that
+     * touch MemoryRegion state (dirty-log transactions, flatview queries)
+     * raced the main loop and other vCPUs. Take the BQL around the emulated
+     * access to restore the device model invariant. emulate_instruction never
+     * takes the BQL itself, so this cannot recurse, and every caller is a
+     * vCPU thread outside the BQL.
+     */
+    bql_lock();
     ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
+    bql_unlock();
     if (ret < 0) {
         error_report("failed to emulate mmio");
         return -1;
