@@ -209,6 +209,12 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
     error('unknown REIMS_VGPU_BACKEND: ' + reims_vgpu_backend_kind +
           ' (metal | vulkan | both)')
   endif
+  if get_option('reims_vgpu_dmabuf_experiment')
+    if reims_vgpu_backend_kind != 'vulkan' or host_os != 'linux' or host_machine.cpu_family() != 'x86_64'
+      error('DMA-BUF experiment requires Linux x86_64 Vulkan')
+    endif
+    reims_vgpu_cargo_features += ',experimental-dmabuf'
+  endif
   reims_vgpu_built = reims_vgpu_repo_dir / 'target' / 'release' / 'libreims_vgpu.a'
   reims_vgpu_a = custom_target('reims-vgpu-staticlib',
     output: 'libreims_vgpu.a',
