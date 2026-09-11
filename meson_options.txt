@@ -394,3 +394,5 @@ option('strict_rust_lints', type: 'boolean', value: false,
 option('reims_vgpu_backend', type : 'combo',
        choices : ['env', 'metal', 'vulkan', 'both'], value: 'env',
        description: 'host GPU backend(s) linked into the reims-vgpu staticlib')
+
+option('reims_vgpu_dmabuf_experiment', type: 'boolean', value: false, description: 'Build the serialized Linux DMA-BUF packed-buffer experiment')

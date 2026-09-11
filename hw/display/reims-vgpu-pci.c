@@ -144,6 +144,53 @@ static int reims_vgpu_pci_read_xreg(void *ctx, uint32_t index, uint64_t *out)
     return -1;
 }
 
+/* Resolve backing only; Rust owns exporter policy and descriptor lifetime. */
+static int reims_vgpu_pci_shared_page_backing(void *ctx, const uint64_t *gpas,
+        size_t count, size_t page, ReimsVgpuSharedPage *out)
+{
+#if defined(__linux__) && defined(__x86_64__)
+    if (!ctx || !gpas || !out || !count || page != 4096) {
+        return -1;
+    }
+    rcu_read_lock();
+    for (size_t i = 0; i < count; i++) {
+        hwaddr xlat, plen = page;
+        ram_addr_t rb_offset;
+        MemoryRegion *mr;
+        RAMBlock *rb;
+        uint8_t *hva;
+        int fd;
+        if (gpas[i] & (page - 1)) {
+            goto failed;
+        }
+        mr = address_space_translate(&address_space_memory, gpas[i], &xlat,
+                                     &plen, true, MEMTXATTRS_UNSPECIFIED);
+        if (!mr || !memory_region_is_ram(mr) || plen < page) {
+            goto failed;
+        }
+        hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+        rb = qemu_ram_block_from_host(hva, false, &rb_offset);
+        if (!rb || !qemu_ram_is_shared(rb) ||
+            rb_offset > RAM_ADDR_MAX - qemu_ram_get_fd_offset(rb)) {
+            goto failed;
+        }
+        fd = qemu_ram_get_fd(rb);
+        if (fd < 0) {
+            goto failed;
+        }
+        out[i] = (ReimsVgpuSharedPage) {
+            .fd = fd, .reserved = 0,
+            .offset = qemu_ram_get_fd_offset(rb) + rb_offset,
+        };
+    }
+    rcu_read_unlock();
+    return 0;
+failed:
+    rcu_read_unlock();
+#endif
+    return -1;
+}
+
 static int reims_vgpu_pci_map_pages(void *ctx, const uint64_t *gpas, size_t count,
                              void **out_ptr, ReimsVgpuMapPagesFailure *failure)
 {
@@ -1069,6 +1116,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
         .guest_written_pages = reims_vgpu_pci_guest_written_pages,
         .page_alias_census = reims_vgpu_pci_page_alias_census,
+        .shared_page_backing = reims_vgpu_pci_shared_page_backing,
     };
     s->dirty = reims_vgpu_dirty_new();
 
