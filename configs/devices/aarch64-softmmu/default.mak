@@ -9,4 +9,7 @@ include ../arm-softmmu/default.mak
 # CONFIG_XLNX_VERSAL=n
 # CONFIG_SBSA_REF=n
 # CONFIG_NPCM8XX=n
-CONFIG_VMAPPLE=y
+
+# Selected by default when HVF and apple-gfx (pvg) are enabled; uncomment it
+# to keep it out of the build.
+# CONFIG_VMAPPLE=n

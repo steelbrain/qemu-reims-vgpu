@@ -16,6 +16,7 @@ config VMAPPLE
     bool
     depends on ARM
     depends on HVF
+    depends on MAC_PVG
     default y if ARM
     imply PCI_DEVICES
     select ARM_GICV3
