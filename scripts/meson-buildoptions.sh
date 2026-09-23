@@ -74,6 +74,9 @@ meson_options_help() {
   printf "%s\n" '  --localstatedir=VALUE    Localstate data directory [/var/local]'
   printf "%s\n" '  --mandir=VALUE           Manual page directory [share/man]'
   printf "%s\n" '  --prefix=VALUE           Installation prefix [/usr/local]'
+  printf "%s\n" '  --pvg-framework=VALUE    directory of a ParavirtualizedGraphics.framework'
+  printf "%s\n" '                           built from source, with an @rpath install name,'
+  printf "%s\n" '                           for apple-gfx to link'
   printf "%s\n" '  --qemu-ga-distro=VALUE   second path element in qemu-ga registry entries'
   printf "%s\n" '                           [Linux]'
   printf "%s\n" '  --qemu-ga-manufacturer=VALUE'
@@ -456,6 +459,7 @@ _meson_option_parse() {
     --prefix=*) quote_sh "-Dprefix=$2" ;;
     --enable-pvg) printf "%s" -Dpvg=enabled ;;
     --disable-pvg) printf "%s" -Dpvg=disabled ;;
+    --pvg-framework=*) quote_sh "-Dpvg_framework=$2" ;;
     --enable-qatzip) printf "%s" -Dqatzip=enabled ;;
     --disable-qatzip) printf "%s" -Dqatzip=disabled ;;
     --enable-qcow1) printf "%s" -Dqcow1=enabled ;;

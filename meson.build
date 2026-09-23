@@ -864,8 +864,68 @@ elif host_os == 'darwin'
   coref = dependency('appleframeworks', modules: 'CoreFoundation')
   iokit = dependency('appleframeworks', modules: 'IOKit', required: false)
   host_dsosuf = '.dylib'
-  pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
-                   required: get_option('pvg'))
+  # apple-gfx links a ParavirtualizedGraphics.framework built from source,
+  # never the system's; pvg_framework is the directory holding it. -F there
+  # finds its Headers and its binary, and the directory is the rpath. The
+  # framework's install name has to be @rpath-relative: a binary records the
+  # install name of each dylib it links and dyld loads that path, so linking
+  # one that kept the system's (/System/Library/Frameworks/...) would load
+  # the system's copy at run time.
+  pvg_framework = get_option('pvg_framework')
+  if get_option('pvg').allowed() and pvg_framework == ''
+    if get_option('pvg').enabled()
+      error('pvg needs pvg_framework (configure --pvg-framework=DIR), the ' +
+            'directory holding a ParavirtualizedGraphics.framework built ' +
+            'from source: paravirt-decompile builds one into ' +
+            'build/qemu-framework with `make qemu-framework`')
+    endif
+  elif get_option('pvg').allowed()
+    if not fs.is_absolute(pvg_framework)
+      error('pvg_framework must be an absolute path, since it is also the ' +
+            'rpath: ' + pvg_framework)
+    endif
+    pvg_bundle = pvg_framework / 'ParavirtualizedGraphics.framework'
+    pvg_binary = pvg_bundle / 'ParavirtualizedGraphics'
+    if not (fs.is_file(pvg_binary) and
+            fs.is_file(pvg_bundle / 'Headers' / 'ParavirtualizedGraphics.h'))
+      error('pvg_framework: ' + pvg_framework + ' holds no ' +
+            'ParavirtualizedGraphics.framework with a binary and Headers; ' +
+            'paravirt-decompile builds one with `make qemu-framework`')
+    endif
+    # otool -D prints "<path>:" or "<path> (architecture <arch>):", then the
+    # install name, per slice, or a complaint such as "<path>: is not an
+    # object file"
+    pvg_ids = []
+    foreach line : run_command(find_program('otool'), '-D', pvg_binary,
+                               check: true).stdout().strip().split('\n')
+      if line.startswith(pvg_binary + ': ')
+        error('pvg_framework: ' + line)
+      elif not (line.startswith(pvg_binary) and line.endswith(':'))
+        pvg_ids += line
+      endif
+    endforeach
+    if pvg_ids.length() == 0
+      error('pvg_framework: ' + pvg_binary + ' has no install name: it is ' +
+            'not a dylib')
+    endif
+    foreach id : pvg_ids
+      if not id.startswith('@rpath/')
+        error('pvg_framework: ' + pvg_binary + ' has the install name ' +
+              id + ', which QEMU would record and dyld load in its place. ' +
+              'Build the @rpath variant: paravirt-decompile\'s ' +
+              '`make qemu-framework`')
+      endif
+    endforeach
+    metal = dependency('appleframeworks', modules: 'Metal',
+                       required: get_option('pvg'))
+    if metal.found()
+      pvg = declare_dependency(
+        compile_args: ['-F' + pvg_framework],
+        link_args: ['-F' + pvg_framework, '-framework', 'ParavirtualizedGraphics',
+                    '-Wl,-rpath,' + pvg_framework],
+        dependencies: metal)
+    endif
+  endif
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
             cc.find_library('nsl'),
@@ -5078,6 +5138,9 @@ if host_os == 'freebsd'
 endif
 if host_os == 'darwin'
   summary_info += {'ParavirtualizedGraphics support': pvg}
+  if pvg.found()
+    summary_info += {'ParavirtualizedGraphics framework': pvg_framework}
+  endif
 endif
 summary_info += {'valgrind':          valgrind}
 summary(summary_info, bool_yn: true, section: 'Dependencies')

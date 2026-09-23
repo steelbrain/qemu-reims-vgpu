@@ -18,6 +18,13 @@ To run the vmapple machine model, you need to
    machine. Note that newer versions than 12.x are currently NOT supported on
    the guest side. I will assume that you installed it using the
    `macosvm <https://github.com/s-u/macosvm>`__ CLI.
+ * Build QEMU with apple-gfx, which the machine's display needs. It links a
+   ParavirtualizedGraphics.framework built from source, not the system's:
+   pass ``--enable-pvg --pvg-framework=DIR``, where ``DIR`` is the absolute
+   path of the directory holding a ``ParavirtualizedGraphics.framework``
+   whose install name starts with ``@rpath/``. paravirt-decompile's
+   ``make qemu-framework`` builds one; its ``make qemu`` builds that and QEMU
+   together. Without pvg the vmapple machine is left out of the build.
 
 First, we need to extract the UUID from the virtual machine that you installed. You can do this
 by running the shell script in contrib/vmapple/uuid.sh on the macosvm.json file.
