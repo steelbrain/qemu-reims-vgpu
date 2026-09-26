@@ -18,7 +18,15 @@
 #include "apple-gfx.h"
 #include "trace.h"
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+/* PGDeviceSpec.h's PCI facts, which reims_vgpu.h does not carry. */
+#define PG_PCI_BAR_MMIO 0
+#define PG_PCI_MAX_MSI_VECTORS 1
+#define PG_PCI_VENDOR_ID 0x106b
+#define PG_PCI_DEVICE_ID 0xeeee
+#else
 #import <ParavirtualizedGraphics/ParavirtualizedGraphics.h>
+#endif
 
 OBJECT_DECLARE_SIMPLE_TYPE(AppleGFXPCIState, APPLE_GFX_PCI)
 
@@ -30,6 +38,14 @@ struct AppleGFXPCIState {
 
 static const char *apple_gfx_pci_option_rom_path = NULL;
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+static void apple_gfx_init_option_rom_path(void)
+{
+    /* The library keeps the string: nothing to release (NULL: no ROM). */
+    const char *option_rom_path = rvg_option_rom_path();
+    apple_gfx_pci_option_rom_path = g_strdup(option_rom_path);
+}
+#else
 static void apple_gfx_init_option_rom_path(void)
 {
     NSURL *option_rom_url = PGCopyOptionROMURL();
@@ -37,6 +53,7 @@ static void apple_gfx_init_option_rom_path(void)
     apple_gfx_pci_option_rom_path = g_strdup(option_rom_path);
     [option_rom_url release];
 }
+#endif
 
 static void apple_gfx_pci_init(Object *obj)
 {
@@ -82,6 +99,14 @@ static void apple_gfx_pci_interrupt(PCIDevice *dev, uint32_t vector)
                             apple_gfx_pci_raise_interrupt, job);
 }
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+static void apple_gfx_pci_raise_interrupt_cb(void *ctx, uint32_t vector)
+{
+    PCIDevice *dev = ctx;
+    apple_gfx_pci_interrupt(dev, vector);
+}
+#endif
+
 static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
 {
     AppleGFXPCIState *s = APPLE_GFX_PCI(dev);
@@ -98,6 +123,16 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
     }
 
     @autoreleasepool {
+#ifdef APPLE_GFX_BACKEND_REIMS
+        /* The block, as a triple: ctx is the PCIDevice it captured. */
+        RvgDeviceDescriptor *desc = rvg_device_descriptor_create();
+        rvg_device_descriptor_set_raise_interrupt(
+            desc, apple_gfx_pci_raise_interrupt_cb, dev, NULL);
+
+        apple_gfx_common_realize(&s->common, DEVICE(dev), desc, errp);
+        rvg_device_descriptor_release(desc);
+        desc = NULL;
+#else
         PGDeviceDescriptor *desc = [PGDeviceDescriptor new];
         desc.raiseInterrupt = ^(uint32_t vector) {
             apple_gfx_pci_interrupt(dev, vector);
@@ -106,13 +141,18 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
         apple_gfx_common_realize(&s->common, DEVICE(dev), desc, errp);
         [desc release];
         desc = nil;
+#endif
     }
 }
 
 static void apple_gfx_pci_reset(Object *obj, ResetType type)
 {
     AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
+#ifdef APPLE_GFX_BACKEND_REIMS
+    rvg_device_reset(s->common.pgdev);
+#else
     [s->common.pgdev reset];
+#endif
 }
 
 static const Property apple_gfx_pci_properties[] = {

@@ -871,26 +871,50 @@ elif host_os == 'darwin'
   # install name of each dylib it links and dyld loads that path, so linking
   # one that kept the system's (/System/Library/Frameworks/...) would load
   # the system's copy at run time.
+  # With apple_gfx_backend=reims, apple-gfx drives reims-vgpu's C API
+  # (reims_vgpu.h) instead, and pvg_framework holds a ReimsVGPU.framework
+  # (paravirt-decompile's `cargo xtask bundle`); the same checks apply to it.
+  apple_gfx_backend = get_option('apple_gfx_backend')
+  if apple_gfx_backend == 'reims'
+    pvg_name = 'ReimsVGPU'
+    pvg_header = 'reims_vgpu.h'
+    pvg_builder = '`cargo xtask bundle` in rust/'
+    pvg_builder_into = 'into rust/target/Frameworks with ' + pvg_builder
+  else
+    pvg_name = 'ParavirtualizedGraphics'
+    pvg_header = 'ParavirtualizedGraphics.h'
+    pvg_builder = '`make qemu-framework`'
+    pvg_builder_into = 'into build/qemu-framework with ' + pvg_builder
+  endif
   pvg_framework = get_option('pvg_framework')
+  # reims is never the default, so choosing it asks for apple-gfx: with pvg
+  # auto it counts as pvg enabled, and with pvg disabled it has no effect,
+  # which is said rather than passed over.
+  pvg_required = (get_option('pvg').enabled() or
+                  (apple_gfx_backend == 'reims' and get_option('pvg').allowed()))
+  if apple_gfx_backend == 'reims' and get_option('pvg').disabled()
+    warning('apple_gfx_backend=reims has no effect: pvg is disabled, so ' +
+            'QEMU builds no apple-gfx')
+  endif
   if get_option('pvg').allowed() and pvg_framework == ''
-    if get_option('pvg').enabled()
-      error('pvg needs pvg_framework (configure --pvg-framework=DIR), the ' +
-            'directory holding a ParavirtualizedGraphics.framework built ' +
-            'from source: paravirt-decompile builds one into ' +
-            'build/qemu-framework with `make qemu-framework`')
+    if pvg_required
+      error((get_option('pvg').enabled() ? 'pvg' : 'apple_gfx_backend=reims') +
+            ' needs pvg_framework (configure --pvg-framework=DIR), the ' +
+            'directory holding a ' + pvg_name + '.framework built ' +
+            'from source: paravirt-decompile builds one ' + pvg_builder_into)
     endif
   elif get_option('pvg').allowed()
     if not fs.is_absolute(pvg_framework)
       error('pvg_framework must be an absolute path, since it is also the ' +
             'rpath: ' + pvg_framework)
     endif
-    pvg_bundle = pvg_framework / 'ParavirtualizedGraphics.framework'
-    pvg_binary = pvg_bundle / 'ParavirtualizedGraphics'
+    pvg_bundle = pvg_framework / pvg_name + '.framework'
+    pvg_binary = pvg_bundle / pvg_name
     if not (fs.is_file(pvg_binary) and
-            fs.is_file(pvg_bundle / 'Headers' / 'ParavirtualizedGraphics.h'))
+            fs.is_file(pvg_bundle / 'Headers' / pvg_header))
       error('pvg_framework: ' + pvg_framework + ' holds no ' +
-            'ParavirtualizedGraphics.framework with a binary and Headers; ' +
-            'paravirt-decompile builds one with `make qemu-framework`')
+            pvg_name + '.framework with a binary and Headers/' + pvg_header +
+            '; paravirt-decompile builds one with ' + pvg_builder)
     endif
     # otool -D prints "<path>:" or "<path> (architecture <arch>):", then the
     # install name, per slice, or a complaint such as "<path>: is not an
@@ -913,16 +937,22 @@ elif host_os == 'darwin'
         error('pvg_framework: ' + pvg_binary + ' has the install name ' +
               id + ', which QEMU would record and dyld load in its place. ' +
               'Build the @rpath variant: paravirt-decompile\'s ' +
-              '`make qemu-framework`')
+              pvg_builder)
       endif
     endforeach
     metal = dependency('appleframeworks', modules: 'Metal',
-                       required: get_option('pvg'))
+                       required: pvg_required)
     if metal.found()
+      pvg_compile_args = ['-F' + pvg_framework]
+      pvg_link_args = ['-F' + pvg_framework, '-framework', pvg_name]
+      if apple_gfx_backend == 'reims'
+        # apple-gfx*.m then import Metal themselves: reims_vgpu.h, unlike
+        # ParavirtualizedGraphics.h, does not.
+        pvg_compile_args += ['-DAPPLE_GFX_BACKEND_REIMS']
+      endif
       pvg = declare_dependency(
-        compile_args: ['-F' + pvg_framework],
-        link_args: ['-F' + pvg_framework, '-framework', 'ParavirtualizedGraphics',
-                    '-Wl,-rpath,' + pvg_framework],
+        compile_args: pvg_compile_args,
+        link_args: pvg_link_args + ['-Wl,-rpath,' + pvg_framework],
         dependencies: metal)
     endif
   endif
@@ -5137,9 +5167,10 @@ if host_os == 'freebsd'
   summary_info += {'libinotify-kqueue': inotify}
 endif
 if host_os == 'darwin'
-  summary_info += {'ParavirtualizedGraphics support': pvg}
+  summary_info += {'apple-gfx backend': apple_gfx_backend}
+  summary_info += {pvg_name + ' support': pvg}
   if pvg.found()
-    summary_info += {'ParavirtualizedGraphics framework': pvg_framework}
+    summary_info += {pvg_name + ' framework': pvg_framework}
   endif
 endif
 summary_info += {'valgrind':          valgrind}

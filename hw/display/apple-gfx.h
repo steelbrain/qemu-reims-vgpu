@@ -17,9 +17,22 @@
 #define TYPE_APPLE_GFX_MMIO         "apple-gfx-mmio"
 #define TYPE_APPLE_GFX_PCI          "apple-gfx-pci"
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+/*
+ * apple_gfx_backend=reims: the device drives reims-vgpu's C API
+ * (ReimsVGPU.framework, reims_vgpu.h) in place of the Objective-C API of
+ * ParavirtualizedGraphics.framework. Each call maps one to one; the
+ * framework's handles become Rvg* handles with rvg_*_retain/release.
+ */
+#import <ReimsVGPU/reims_vgpu.h>
+
+/* PGDevice.h's opaque task type, which QEMU implements (apple-gfx.m). */
+typedef struct PGTask_s PGTask_t;
+#else
 @class PGDeviceDescriptor;
 @protocol PGDevice;
 @protocol PGDisplay;
+#endif
 @protocol MTLDevice;
 @protocol MTLTexture;
 @protocol MTLCommandQueue;
@@ -31,9 +44,11 @@ typedef struct PGGuestPhysicalRange_s
     void *hostAddress;
 } PGGuestPhysicalRange_t;
 
+#ifndef APPLE_GFX_BACKEND_REIMS
 @interface PGMemoryMapDescriptor : NSObject
 -(void)addRange:(PGGuestPhysicalRange_t) range;
 @end
+#endif
 
 typedef QTAILQ_HEAD(, PGTask_s) PGTaskList;
 
@@ -46,8 +61,13 @@ typedef struct AppleGFXDisplayMode {
 typedef struct AppleGFXState {
     /* Initialised on init/realize() */
     MemoryRegion iomem_gfx;
+#ifdef APPLE_GFX_BACKEND_REIMS
+    RvgDevice *pgdev;
+    RvgDisplay *pgdisp;
+#else
     id<PGDevice> pgdev;
     id<PGDisplay> pgdisp;
+#endif
     QemuConsole *con;
     id<MTLDevice> mtl;
     id<MTLCommandQueue> mtl_queue;
@@ -74,8 +94,13 @@ typedef struct AppleGFXState {
 } AppleGFXState;
 
 void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char* obj_name);
+#ifdef APPLE_GFX_BACKEND_REIMS
+bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
+                              RvgDeviceDescriptor *desc, Error **errp);
+#else
 bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                               PGDeviceDescriptor *desc, Error **errp);
+#endif
 void *apple_gfx_host_ptr_for_gpa_range(uint64_t guest_physical,
                                        uint64_t length, bool read_only,
                                        MemoryRegion **mapping_in_region);

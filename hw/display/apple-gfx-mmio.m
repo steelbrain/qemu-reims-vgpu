@@ -21,10 +21,13 @@
 #include "trace.h"
 #include "system/address-spaces.h"
 
+#ifndef APPLE_GFX_BACKEND_REIMS
 #import <ParavirtualizedGraphics/ParavirtualizedGraphics.h>
+#endif
 
 OBJECT_DECLARE_SIMPLE_TYPE(AppleGFXMMIOState, APPLE_GFX_MMIO)
 
+#ifndef APPLE_GFX_BACKEND_REIMS
 /*
  * ParavirtualizedGraphics.Framework only ships header files for the PCI
  * variant which does not include IOSFC descriptors and host devices. We add
@@ -58,6 +61,7 @@ typedef bool(^IOSFCMapMemory)(uint64_t phys, uint64_t len, bool ro, void **va,
 -(uint32_t)mmioReadAtOffset:(size_t)offset;
 -(void)mmioWriteAtOffset:(size_t)offset value:(uint32_t)value;
 @end
+#endif
 
 struct AppleGFXMapSurfaceMemoryJob;
 struct AppleGFXMMIOState {
@@ -68,7 +72,11 @@ struct AppleGFXMMIOState {
     qemu_irq irq_gfx;
     qemu_irq irq_iosfc;
     MemoryRegion iomem_iosfc;
+#ifdef APPLE_GFX_BACKEND_REIMS
+    RvgIOSurfaceHostDevice *pgiosfc;
+#else
     PGIOSurfaceHostDevice *pgiosfc;
+#endif
 };
 
 typedef struct AppleGFXMMIOJob {
@@ -81,7 +89,16 @@ typedef struct AppleGFXMMIOJob {
 static void iosfc_do_read(void *opaque)
 {
     AppleGFXMMIOJob *job = opaque;
+#ifdef APPLE_GFX_BACKEND_REIMS
+    /*
+     * QEMU declared -mmioReadAtOffset: as returning uint32_t, so the value
+     * is truncated to 32 bits, then zero-extended into job->value.
+     */
+    job->value = (uint32_t)rvg_iosurface_host_device_mmio_read(
+        job->state->pgiosfc, job->offset);
+#else
     job->value = [job->state->pgiosfc mmioReadAtOffset:job->offset];
+#endif
     qatomic_set(&job->completed, true);
     aio_wait_kick();
 }
@@ -106,7 +123,13 @@ static uint64_t iosfc_read(void *opaque, hwaddr offset, unsigned size)
 static void iosfc_do_write(void *opaque)
 {
     AppleGFXMMIOJob *job = opaque;
+#ifdef APPLE_GFX_BACKEND_REIMS
+    /* QEMU declared value:(uint32_t): the value is truncated to 32 bits. */
+    rvg_iosurface_host_device_mmio_write(job->state->pgiosfc, job->offset,
+                                         (uint32_t)job->value);
+#else
     [job->state->pgiosfc mmioWriteAtOffset:job->offset value:job->value];
+#endif
     qatomic_set(&job->completed, true);
     aio_wait_kick();
 }
@@ -184,6 +207,118 @@ static bool apple_gfx_mmio_unmap_surface_memory(void *ptr)
     return true;
 }
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+/*
+ * The Objective-C version's blocks, as {fn, ctx, destroy} triples: each body
+ * is the block's, ctx is what the block captured (nothing for the map and
+ * unmap blocks), and destroy is NULL because releasing the blocks released
+ * nothing.
+ */
+static bool apple_gfx_mmio_iosfc_map_memory_cb(void *ctx, uint64_t phys,
+                                               uint64_t len, bool ro,
+                                               void **va, void *e, void *f)
+{
+    *va = apple_gfx_mmio_map_surface_memory(phys, len, ro);
+
+    trace_apple_gfx_iosfc_map_memory(phys, len, ro, va, e, f, *va);
+
+    return *va != NULL;
+}
+
+static bool apple_gfx_mmio_iosfc_unmap_memory_cb(void *ctx, void *va, void *b,
+                                                 void *c, void *d, void *e,
+                                                 void *f)
+{
+    return apple_gfx_mmio_unmap_surface_memory(va);
+}
+
+/* The block returned true (IOSFCRaiseInterrupt); RvgRaiseInterruptFn is void. */
+static void apple_gfx_mmio_iosfc_raise_interrupt_cb(void *ctx, uint32_t vector)
+{
+    AppleGFXMMIOState *s = ctx;
+    trace_apple_gfx_iosfc_raise_irq(vector);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            raise_irq_bh, &s->irq_iosfc);
+}
+
+static RvgIOSurfaceHostDevice *apple_gfx_prepare_iosurface_host_device(
+    AppleGFXMMIOState *s)
+{
+    RvgIOSurfaceHostDeviceDescriptor *iosfc_desc =
+        rvg_iosurface_host_device_descriptor_create();
+    RvgIOSurfaceHostDevice *iosfc_host_dev;
+
+    /*
+     * The legacy memory management API is no longer present
+     * for the IOSurface mapper as of macOS 15.4.
+     */
+    if (@available(macOS 15.4, *)) {
+        RvgMemoryMapDescriptor *memory_map_descriptor =
+            rvg_memory_map_descriptor_create();
+        FlatView* fv = address_space_to_flatview(&address_space_memory);
+        flatview_for_each_range(fv, apple_gfx_register_memory_cb, memory_map_descriptor);
+        /* the device model defines this as a single-page MMIO region, hence 16KB */
+        rvg_iosurface_host_device_descriptor_set_mmio_length(iosfc_desc,
+                                                             0x10000);
+        /* QEMU's own reference to the map is never released, as before. */
+        rvg_iosurface_host_device_descriptor_set_memory_map(
+            iosfc_desc, memory_map_descriptor);
+    } else {
+        rvg_iosurface_host_device_descriptor_set_map_memory(
+            iosfc_desc, apple_gfx_mmio_iosfc_map_memory_cb, NULL, NULL);
+
+        rvg_iosurface_host_device_descriptor_set_unmap_memory(
+            iosfc_desc, apple_gfx_mmio_iosfc_unmap_memory_cb, NULL, NULL);
+    }
+
+    rvg_iosurface_host_device_descriptor_set_raise_interrupt(
+        iosfc_desc, apple_gfx_mmio_iosfc_raise_interrupt_cb, s, NULL);
+
+    iosfc_host_dev = rvg_iosurface_host_device_create(iosfc_desc);
+    rvg_iosurface_host_device_descriptor_release(iosfc_desc);
+    return iosfc_host_dev;
+}
+
+static void apple_gfx_mmio_raise_interrupt_cb(void *ctx, uint32_t vector)
+{
+    AppleGFXMMIOState *s = ctx;
+    trace_apple_gfx_raise_irq(vector);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            raise_irq_bh, &s->irq_gfx);
+}
+
+static void apple_gfx_mmio_realize(DeviceState *dev, Error **errp)
+{
+    @autoreleasepool {
+        AppleGFXMMIOState *s = APPLE_GFX_MMIO(dev);
+        RvgDeviceDescriptor *desc = rvg_device_descriptor_create();
+
+        rvg_device_descriptor_set_raise_interrupt(
+            desc, apple_gfx_mmio_raise_interrupt_cb, s, NULL);
+
+        rvg_device_descriptor_set_using_iosurface_mapper(desc, true);
+        rvg_device_descriptor_set_enable_argument_buffers(desc, true);
+        /*
+         * Process isolation needs PGMemoryMapDescriptor instead of
+         * the legacy memory management interface present in releases
+         * older than macOS 15.4.
+         */
+        if (@available(macOS 15.4, *)) {
+            rvg_device_descriptor_set_enable_process_isolation(desc, true);
+        }
+
+        if (!apple_gfx_common_realize(&s->common, dev, desc, errp)) {
+            rvg_iosurface_host_device_release(s->pgiosfc);
+            s->pgiosfc = NULL;
+        }
+
+        s->pgiosfc = apple_gfx_prepare_iosurface_host_device(s);
+
+        rvg_device_descriptor_release(desc);
+        desc = NULL;
+    }
+}
+#else
 static PGIOSurfaceHostDevice *apple_gfx_prepare_iosurface_host_device(
     AppleGFXMMIOState *s)
 {
@@ -265,6 +400,7 @@ static void apple_gfx_mmio_realize(DeviceState *dev, Error **errp)
         desc = nil;
     }
 }
+#endif
 
 static void apple_gfx_mmio_init(Object *obj)
 {
@@ -283,7 +419,11 @@ static void apple_gfx_mmio_init(Object *obj)
 static void apple_gfx_mmio_reset(Object *obj, ResetType type)
 {
     AppleGFXMMIOState *s = APPLE_GFX_MMIO(obj);
+#ifdef APPLE_GFX_BACKEND_REIMS
+    rvg_device_reset(s->common.pgdev);
+#else
     [s->common.pgdev reset];
+#endif
 }
 
 static const Property apple_gfx_mmio_properties[] = {

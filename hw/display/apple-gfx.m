@@ -31,7 +31,27 @@
 #include <mach/mach_vm.h>
 #include <dispatch/dispatch.h>
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+/* reims_vgpu.h comes through apple-gfx.h; Metal is QEMU's own. */
+#import <Metal/Metal.h>
+
+/*
+ * PGDevice.h's PGPhysicalMemoryRange_t, with QEMU's field names: the
+ * mapMemory callback's ranges are RvgPhysicalMemoryRange, the same layout.
+ */
+typedef struct PGPhysicalMemoryRange_s {
+    uint64_t physicalAddress;
+    uint64_t physicalLength;
+} PGPhysicalMemoryRange_t;
+QEMU_BUILD_BUG_ON(sizeof(PGPhysicalMemoryRange_t) !=
+                  sizeof(RvgPhysicalMemoryRange));
+QEMU_BUILD_BUG_ON(offsetof(PGPhysicalMemoryRange_t, physicalAddress) !=
+                  offsetof(RvgPhysicalMemoryRange, physical_address));
+QEMU_BUILD_BUG_ON(offsetof(PGPhysicalMemoryRange_t, physicalLength) !=
+                  offsetof(RvgPhysicalMemoryRange, physical_length));
+#else
 #import <ParavirtualizedGraphics/ParavirtualizedGraphics.h>
+#endif
 
 static const AppleGFXDisplayMode apple_gfx_default_modes[] = {
     { 1920, 1080, 60 },
@@ -252,9 +272,20 @@ static void apple_gfx_render_new_frame(AppleGFXState *s)
          * This is not safe to call from the BQL/BH due to PVG-internal locks
          * causing deadlocks.
          */
+#ifdef APPLE_GFX_BACKEND_REIMS
+        RvgMTLRegion rvg_region = {
+            .origin = { region.origin.x, region.origin.y, region.origin.z },
+            .size = { region.size.width, region.size.height, region.size.depth },
+        };
+        bool r = rvg_display_encode_current_frame(s->pgdisp,
+                                                  (__bridge void *)command_buffer,
+                                                  (__bridge void *)texture,
+                                                  rvg_region);
+#else
         bool r = [s->pgdisp encodeCurrentFrameToCommandBuffer:command_buffer
                                                  texture:texture
                                                   region:region];
+#endif
         if (!r) {
             [texture release];
             [command_buffer release];
@@ -376,7 +407,12 @@ static void set_mode(AppleGFXState *s, uint32_t width, uint32_t height)
                                              width:width
                                             height:height
                                          mipmapped:NO];
+#ifdef APPLE_GFX_BACKEND_REIMS
+        textureDescriptor.usage =
+            rvg_display_get_minimum_texture_usage(s->pgdisp);
+#else
         textureDescriptor.usage = s->pgdisp.minimumTextureUsage;
+#endif
         s->texture = [s->mtl newTextureWithDescriptor:textureDescriptor];
         s->using_managed_texture_storage =
             (s->texture.storageMode == MTLStorageModeManaged);
@@ -388,8 +424,14 @@ static void set_mode(AppleGFXState *s, uint32_t width, uint32_t height)
 static void update_cursor(AppleGFXState *s)
 {
     assert(bql_locked());
+#ifdef APPLE_GFX_BACKEND_REIMS
+    qemu_console_set_mouse(s->con, rvg_display_get_cursor_position(s->pgdisp).x,
+                           rvg_display_get_cursor_position(s->pgdisp).y,
+                           qatomic_read(&s->cursor_show));
+#else
     qemu_console_set_mouse(s->con, s->pgdisp.cursorPosition.x,
                            s->pgdisp.cursorPosition.y, qatomic_read(&s->cursor_show));
+#endif
 }
 
 static void update_cursor_bh(void *opaque)
@@ -400,20 +442,43 @@ static void update_cursor_bh(void *opaque)
 
 typedef struct AppleGFXSetCursorGlyphJob {
     AppleGFXState *s;
+#ifdef APPLE_GFX_BACKEND_REIMS
+    /*
+     * The RvgCursorGlyph is borrowed for the handler's call only: its
+     * pixels are copied where the block retained the NSBitmapImageRep.
+     */
+    uint8_t *glyph_rgba;
+    uint32_t glyph_width;
+    uint32_t glyph_height;
+    RvgDisplayCoord hotspot;
+#else
     NSBitmapImageRep *glyph;
     PGDisplayCoord_t hotspot;
+#endif
 } AppleGFXSetCursorGlyphJob;
 
 static void set_cursor_glyph(void *opaque)
 {
     AppleGFXSetCursorGlyphJob *job = opaque;
     AppleGFXState *s = job->s;
+#ifdef APPLE_GFX_BACKEND_REIMS
+    /*
+     * The image the framework made from an RvgCursorGlyph: 8 bits a sample,
+     * 4 samples (RGBA), 32 bits a pixel, width * 4 bytes a row.
+     */
+    uint32_t bpp = 32;
+    size_t width = job->glyph_width;
+    size_t height = job->glyph_height;
+    size_t padding_bytes_per_row = 0;
+    const uint8_t* px_data = job->glyph_rgba;
+#else
     NSBitmapImageRep *glyph = job->glyph;
     uint32_t bpp = glyph.bitsPerPixel;
     size_t width = glyph.pixelsWide;
     size_t height = glyph.pixelsHigh;
     size_t padding_bytes_per_row = glyph.bytesPerRow - width * 4;
     const uint8_t* px_data = glyph.bitmapData;
+#endif
 
     trace_apple_gfx_cursor_set(bpp, width, height);
 
@@ -448,7 +513,11 @@ static void set_cursor_glyph(void *opaque)
         qemu_console_set_cursor(s->con, s->cursor);
         update_cursor(s);
     }
+#ifdef APPLE_GFX_BACKEND_REIMS
+    g_free(job->glyph_rgba);
+#else
     [glyph release];
+#endif
 
     g_free(job);
 }
@@ -505,7 +574,11 @@ typedef struct AppleGFXIOJob {
 static void apple_gfx_do_read(void *opaque)
 {
     AppleGFXIOJob *job = opaque;
+#ifdef APPLE_GFX_BACKEND_REIMS
+    job->value = rvg_device_mmio_read(job->state->pgdev, job->offset);
+#else
     job->value = [job->state->pgdev mmioReadAtOffset:job->offset];
+#endif
     qatomic_set(&job->completed, true);
     aio_wait_kick();
 }
@@ -529,7 +602,11 @@ static uint64_t apple_gfx_read(void *opaque, hwaddr offset, unsigned size)
 static void apple_gfx_do_write(void *opaque)
 {
     AppleGFXIOJob *job = opaque;
+#ifdef APPLE_GFX_BACKEND_REIMS
+    rvg_device_mmio_write(job->state->pgdev, job->offset, job->value);
+#else
     [job->state->pgdev mmioWriteAtOffset:job->offset value:job->value];
+#endif
     qatomic_set(&job->completed, true);
     aio_wait_kick();
 }
@@ -578,9 +655,15 @@ static size_t apple_gfx_get_default_mmio_range_size(void)
 {
     size_t mmio_range_size;
     @autoreleasepool {
+#ifdef APPLE_GFX_BACKEND_REIMS
+        RvgDeviceDescriptor *desc = rvg_device_descriptor_create();
+        mmio_range_size = rvg_device_descriptor_get_mmio_length(desc);
+        rvg_device_descriptor_release(desc);
+#else
         PGDeviceDescriptor *desc = [PGDeviceDescriptor new];
         mmio_range_size = desc.mmioLength;
         [desc release];
+#endif
     }
     return mmio_range_size;
 }
@@ -598,24 +681,54 @@ void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char* obj_name)
     /* TODO: PVG framework supports serialising device state: integrate it! */
 }
 
+#ifndef APPLE_GFX_BACKEND_REIMS
 @interface PGDeviceDescriptor (IOSurfaceMapper)
 @property (readwrite, nonatomic, copy, nullable) PGMemoryMapDescriptor* memoryMapDescriptor;
 @end
+#endif
 
 bool apple_gfx_register_memory_cb(Int128 start, Int128 len,
                                   const MemoryRegion *mr,
                                   hwaddr offset_in_region, void *opaque) {
     PGGuestPhysicalRange_t range;
+#ifdef APPLE_GFX_BACKEND_REIMS
+    RvgMemoryMapDescriptor *memory_map_descriptor = opaque;
+#else
     PGMemoryMapDescriptor *memory_map_descriptor = opaque;
+#endif
     if (memory_access_is_direct(mr, true, MEMTXATTRS_UNSPECIFIED)) {
         range.physicalAddress = start;
         range.physicalLength = len;
         range.hostAddress = memory_region_get_ram_ptr(mr);
+#ifdef APPLE_GFX_BACKEND_REIMS
+        rvg_memory_map_descriptor_add_range(memory_map_descriptor,
+                                            range.physicalAddress,
+                                            range.physicalLength,
+                                            range.hostAddress);
+#else
         [memory_map_descriptor addRange:range];
+#endif
     }
     return false;
 }
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+static void apple_gfx_register_memory(AppleGFXState *s,
+                                      RvgDeviceDescriptor *desc)
+{
+    RvgMemoryMapDescriptor *memoryMapDescriptor =
+        rvg_memory_map_descriptor_create();
+
+    FlatView* fv = address_space_to_flatview(&address_space_memory);
+    flatview_for_each_range(fv, apple_gfx_register_memory_cb, memoryMapDescriptor);
+
+    /*
+     * The descriptor retains the map. QEMU's own reference (+new's) is never
+     * released, as in the Objective-C version.
+     */
+    rvg_device_descriptor_set_memory_map(desc, memoryMapDescriptor);
+}
+#else
 static void apple_gfx_register_memory(AppleGFXState *s,
                                                      PGDeviceDescriptor *desc)
 {
@@ -626,7 +739,74 @@ static void apple_gfx_register_memory(AppleGFXState *s,
 
     desc.memoryMapDescriptor = memoryMapDescriptor;
 }
+#endif
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+/*
+ * The Objective-C version's blocks, as {fn, ctx, destroy} triples: each body
+ * is the block's, ctx is the AppleGFXState the block captured, and destroy is
+ * NULL because releasing those blocks released nothing.
+ */
+static void *apple_gfx_create_task_cb(void *ctx, uint64_t vmSize,
+                                      void **baseAddress)
+{
+    AppleGFXState *s = ctx;
+    PGTask_t *task = apple_gfx_new_task(s, vmSize);
+    *baseAddress = (void *)task->address;
+    trace_apple_gfx_create_task(vmSize, *baseAddress);
+    return task;
+}
+
+static void apple_gfx_destroy_task_cb(void *ctx, void *task_ptr)
+{
+    AppleGFXState *s = ctx;
+    PGTask_t *task = task_ptr;
+
+    trace_apple_gfx_destroy_task(task, task->mapped_regions->len);
+
+    apple_gfx_destroy_task(s, task);
+}
+
+static bool apple_gfx_map_memory_cb(void *ctx, void *task, uint32_t range_count,
+                                    uint64_t virtual_offset, bool read_only,
+                                    const RvgPhysicalMemoryRange *ranges)
+{
+    AppleGFXState *s = ctx;
+    return apple_gfx_task_map_memory(s, task, virtual_offset,
+                                     (PGPhysicalMemoryRange_t *)ranges,
+                                     range_count, read_only);
+}
+
+static bool apple_gfx_unmap_memory_cb(void *ctx, void *task,
+                                      uint64_t virtual_offset, uint64_t length)
+{
+    AppleGFXState *s = ctx;
+    apple_gfx_task_unmap_memory(s, task, virtual_offset, length);
+    return true;
+}
+
+static bool apple_gfx_read_memory_cb(void *ctx, uint64_t physical_address,
+                                     uint64_t length, void *dst)
+{
+    AppleGFXState *s = ctx;
+    return apple_gfx_read_memory(s, physical_address, length, dst);
+}
+
+static void apple_gfx_register_task_mapping_handlers(AppleGFXState *s,
+                                                     RvgDeviceDescriptor *desc)
+{
+    rvg_device_descriptor_set_create_task(desc, apple_gfx_create_task_cb,
+                                          s, NULL);
+    rvg_device_descriptor_set_destroy_task(desc, apple_gfx_destroy_task_cb,
+                                           s, NULL);
+    rvg_device_descriptor_set_map_memory(desc, apple_gfx_map_memory_cb,
+                                         s, NULL);
+    rvg_device_descriptor_set_unmap_memory(desc, apple_gfx_unmap_memory_cb,
+                                           s, NULL);
+    rvg_device_descriptor_set_read_memory(desc, apple_gfx_read_memory_cb,
+                                          s, NULL);
+}
+#else
 static void apple_gfx_register_task_mapping_handlers(AppleGFXState *s,
                                                      PGDeviceDescriptor *desc)
 {
@@ -661,6 +841,7 @@ static void apple_gfx_register_task_mapping_handlers(AppleGFXState *s,
         return apple_gfx_read_memory(s, physical_address, length, dst);
     };
 }
+#endif
 
 static void new_frame_handler_bh(void *opaque)
 {
@@ -680,6 +861,109 @@ static void new_frame_handler_bh(void *opaque)
     }
 }
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+/* The display descriptor's blocks; ctx is the AppleGFXState (see above). */
+static void apple_gfx_new_frame_event_cb(void *ctx)
+{
+    AppleGFXState *s = ctx;
+    trace_apple_gfx_new_frame();
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), new_frame_handler_bh, s);
+}
+
+static void apple_gfx_mode_change_cb(void *ctx, RvgDisplayCoord sizeInPixels,
+                                     uint32_t pixelFormat)
+{
+    AppleGFXState *s = ctx;
+    trace_apple_gfx_mode_change(sizeInPixels.x, sizeInPixels.y);
+
+    BQL_LOCK_GUARD();
+    set_mode(s, sizeInPixels.x, sizeInPixels.y);
+}
+
+static void apple_gfx_cursor_glyph_cb(void *ctx, const RvgCursorGlyph *glyph,
+                                      RvgDisplayCoord hotspot)
+{
+    AppleGFXState *s = ctx;
+    AppleGFXSetCursorGlyphJob *job = g_malloc0(sizeof(*job));
+    /* The image's buffer: height rows of width * 4 bytes. */
+    size_t length = (size_t)glyph->width * 4 * glyph->height;
+
+    job->s = s;
+    job->glyph_width = glyph->width;
+    job->glyph_height = glyph->height;
+    job->hotspot = hotspot;
+    job->glyph_rgba = g_malloc0(length);
+    memcpy(job->glyph_rgba, glyph->rgba, MIN(glyph->rgba_length, length));
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            set_cursor_glyph, job);
+}
+
+/*
+ * The block took a BOOL, which is C bool on arm64, and the framework calls it
+ * with the guest's byte unnormalised. RvgCursorShowFn hands over that byte as
+ * uint8_t; the function keeps the block's bool parameter, and is registered
+ * through a cast, so that it reads the byte exactly as the block's invoke
+ * function did.
+ */
+static void apple_gfx_cursor_show_cb(void *ctx, bool show)
+{
+    AppleGFXState *s = ctx;
+    trace_apple_gfx_cursor_show(show);
+    qatomic_set(&s->cursor_show, show);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            update_cursor_bh, s);
+}
+
+static void apple_gfx_cursor_move_cb(void *ctx)
+{
+    AppleGFXState *s = ctx;
+    trace_apple_gfx_cursor_move();
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            update_cursor_bh, s);
+}
+
+static RvgDisplayDescriptor *apple_gfx_prepare_display_descriptor(AppleGFXState *s)
+{
+    static const char name[] = "QEMU display";
+    RvgDisplayDescriptor *disp_desc = rvg_display_descriptor_create();
+
+    rvg_display_descriptor_set_name(disp_desc, name, sizeof(name) - 1);
+    rvg_display_descriptor_set_size_in_millimeters(
+        disp_desc, (RvgSize){ 400., 300. }); /* A 20" display */
+    rvg_display_descriptor_set_queue(disp_desc,
+                                     (__bridge void *)dispatch_get_main_queue());
+    rvg_display_descriptor_set_new_frame_event_handler(
+        disp_desc, apple_gfx_new_frame_event_cb, s, NULL);
+    rvg_display_descriptor_set_mode_change_handler(
+        disp_desc, apple_gfx_mode_change_cb, s, NULL);
+    rvg_display_descriptor_set_cursor_glyph_handler(
+        disp_desc, apple_gfx_cursor_glyph_cb, s, NULL);
+    rvg_display_descriptor_set_cursor_show_handler(
+        disp_desc,
+        (RvgCursorShowFn)(void (*)(void))apple_gfx_cursor_show_cb, s, NULL);
+    rvg_display_descriptor_set_cursor_move_handler(
+        disp_desc, apple_gfx_cursor_move_cb, s, NULL);
+
+    return disp_desc;
+}
+
+static RvgDisplayMode **apple_gfx_create_display_mode_array(
+    const AppleGFXDisplayMode display_modes[], uint32_t display_mode_count)
+{
+    RvgDisplayMode **mode_array = g_new0(RvgDisplayMode *, display_mode_count);
+
+    for (unsigned i = 0; i < display_mode_count; i++) {
+        const AppleGFXDisplayMode *mode = &display_modes[i];
+        trace_apple_gfx_display_mode(i, mode->width_px, mode->height_px);
+        RvgDisplayCoord mode_size = { mode->width_px, mode->height_px };
+
+        mode_array[i] =
+            rvg_display_mode_create(mode_size, mode->refresh_rate_hz);
+    }
+
+    return mode_array;
+}
+#else
 static PGDisplayDescriptor *apple_gfx_prepare_display_descriptor(AppleGFXState *s)
 {
     PGDisplayDescriptor *disp_desc = [PGDisplayDescriptor new];
@@ -744,6 +1028,7 @@ static NSArray<PGDisplayMode *> *apple_gfx_create_display_mode_array(
 
     return mode_array;
 }
+#endif
 
 static id<MTLDevice> copy_suitable_metal_device(void)
 {
@@ -771,6 +1056,15 @@ static id<MTLDevice> copy_suitable_metal_device(void)
     return dev;
 }
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
+                              RvgDeviceDescriptor *desc, Error **errp)
+{
+    RvgDisplayDescriptor *disp_desc;
+    const AppleGFXDisplayMode *display_modes = apple_gfx_default_modes;
+    uint32_t num_display_modes = ARRAY_SIZE(apple_gfx_default_modes);
+    RvgDisplayMode **mode_array;
+#else
 bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                               PGDeviceDescriptor *desc, Error **errp)
 {
@@ -778,6 +1072,7 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     const AppleGFXDisplayMode *display_modes = apple_gfx_default_modes;
     uint32_t num_display_modes = ARRAY_SIZE(apple_gfx_default_modes);
     NSArray<PGDisplayMode *> *mode_array;
+#endif
 
     if (apple_gfx_mig_blocker == NULL) {
         error_setg(&apple_gfx_mig_blocker,
@@ -792,7 +1087,11 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     s->mtl = copy_suitable_metal_device();
     s->mtl_queue = [s->mtl newCommandQueue];
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+    rvg_device_descriptor_set_metal_device(desc, (__bridge void *)s->mtl);
+#else
     desc.device = s->mtl;
+#endif
 
     /* 
      * The legacy memory management interface doesn't allow for
@@ -807,7 +1106,11 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
 
     s->cursor_show = true;
 
+#ifdef APPLE_GFX_BACKEND_REIMS
+    s->pgdev = rvg_new_device(desc);
+#else
     s->pgdev = PGNewDeviceWithDescriptor(desc);
+#endif
 
     disp_desc = apple_gfx_prepare_display_descriptor(s);
     /*
@@ -818,19 +1121,38 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
      * guest will ignore these displays if they share the same serial number,
      * so ensure each instance gets a unique one.
      */
+#ifdef APPLE_GFX_BACKEND_REIMS
+    s->pgdisp = rvg_device_new_display(s->pgdev, disp_desc, 0,
+                                       next_pgdisplay_serial_num++);
+    rvg_display_descriptor_release(disp_desc);
+#else
     s->pgdisp = [s->pgdev newDisplayWithDescriptor:disp_desc
                                               port:0
                                          serialNum:next_pgdisplay_serial_num++];
     [disp_desc release];
+#endif
 
     if (s->display_modes != NULL && s->num_display_modes > 0) {
         trace_apple_gfx_common_realize_modes_property(s->num_display_modes);
         display_modes = s->display_modes;
         num_display_modes = s->num_display_modes;
     }
+#ifdef APPLE_GFX_BACKEND_REIMS
+    mode_array =
+        apple_gfx_create_display_mode_array(display_modes, num_display_modes);
+    rvg_display_set_mode_list(s->pgdisp,
+                              (const RvgDisplayMode *const *)mode_array,
+                              num_display_modes);
+    /* The array's release: the display keeps its own copies. */
+    for (uint32_t i = 0; i < num_display_modes; i++) {
+        rvg_display_mode_release(mode_array[i]);
+    }
+    g_free(mode_array);
+#else
     s->pgdisp.modeList = mode_array =
         apple_gfx_create_display_mode_array(display_modes, num_display_modes);
     [mode_array release];
+#endif
 
     s->con = qemu_graphic_console_create(dev, 0, &apple_gfx_fb_ops, s);
     return true;
