@@ -864,44 +864,49 @@ elif host_os == 'darwin'
   coref = dependency('appleframeworks', modules: 'CoreFoundation')
   iokit = dependency('appleframeworks', modules: 'IOKit', required: false)
   host_dsosuf = '.dylib'
-  # apple-gfx links a ParavirtualizedGraphics.framework built from source,
-  # never the system's; pvg_framework is the directory holding it. -F there
-  # finds its Headers and its binary, and the directory is the rpath. The
-  # framework's install name has to be @rpath-relative: a binary records the
-  # install name of each dylib it links and dyld loads that path, so linking
-  # one that kept the system's (/System/Library/Frameworks/...) would load
-  # the system's copy at run time.
-  # With apple_gfx_backend=reims, apple-gfx drives reims-vgpu's C API
-  # (reims_vgpu.h) instead, and pvg_framework holds a ReimsVGPU.framework
-  # (paravirt-decompile's `cargo xtask bundle`); the same checks apply to it.
+  # apple-gfx drives one of two libraries, which apple_gfx_backend picks:
+  # - reims, the default: reims-vgpu's C API (reims_vgpu.h), in a
+  #   ReimsVGPU.framework built from source (paravirt-decompile's `cargo
+  #   xtask bundle`). pvg_framework is the directory holding it, and pvg=auto
+  #   without one builds no apple-gfx.
+  # - pg: ParavirtualizedGraphics, whose Objective-C API upstream drives.
+  #   With no pvg_framework it is the system's framework, linked as upstream
+  #   links it: QEMU records its /System/Library/Frameworks install name and
+  #   dyld loads the system's copy. With pvg_framework it is a
+  #   ParavirtualizedGraphics.framework built from source (paravirt-decompile's
+  #   skin) in that directory.
+  # A framework built from source is found with -F at pvg_framework, which
+  # is also the rpath. Its install name has to be @rpath-relative: a binary
+  # records the install name of each dylib it links and dyld loads that path,
+  # so linking one that kept the system's (/System/Library/Frameworks/...)
+  # would load the system's copy at run time.
   apple_gfx_backend = get_option('apple_gfx_backend')
   if apple_gfx_backend == 'reims'
     pvg_name = 'ReimsVGPU'
     pvg_header = 'reims_vgpu.h'
-    pvg_builder = '`cargo xtask bundle` in rust/'
-    pvg_builder_into = 'into rust/target/Frameworks with ' + pvg_builder
+    pvg_builder = '`cargo xtask bundle` (into its target/Frameworks)'
   else
     pvg_name = 'ParavirtualizedGraphics'
     pvg_header = 'ParavirtualizedGraphics.h'
-    pvg_builder = '`make qemu-framework`'
-    pvg_builder_into = 'into build/qemu-framework with ' + pvg_builder
+    pvg_builder = ('`cargo xtask bundle --all` (the skin, into its ' +
+                   'target/skin/Frameworks)')
   endif
   pvg_framework = get_option('pvg_framework')
-  # reims is never the default, so choosing it asks for apple-gfx: with pvg
-  # auto it counts as pvg enabled, and with pvg disabled it has no effect,
-  # which is said rather than passed over.
-  pvg_required = (get_option('pvg').enabled() or
-                  (apple_gfx_backend == 'reims' and get_option('pvg').allowed()))
-  if apple_gfx_backend == 'reims' and get_option('pvg').disabled()
-    warning('apple_gfx_backend=reims has no effect: pvg is disabled, so ' +
-            'QEMU builds no apple-gfx')
-  endif
   if get_option('pvg').allowed() and pvg_framework == ''
-    if pvg_required
-      error((get_option('pvg').enabled() ? 'pvg' : 'apple_gfx_backend=reims') +
-            ' needs pvg_framework (configure --pvg-framework=DIR), the ' +
-            'directory holding a ' + pvg_name + '.framework built ' +
-            'from source: paravirt-decompile builds one ' + pvg_builder_into)
+    if apple_gfx_backend == 'pg'
+      pvg = dependency('appleframeworks',
+                       modules: ['ParavirtualizedGraphics', 'Metal'],
+                       required: get_option('pvg'))
+    elif get_option('pvg').enabled()
+      error('pvg with apple_gfx_backend=reims needs pvg_framework ' +
+            '(configure --pvg-framework=DIR), the directory holding a ' +
+            'ReimsVGPU.framework built from source: paravirt-decompile ' +
+            'builds one with ' + pvg_builder)
+    else
+      message('apple-gfx is left out: apple_gfx_backend=reims needs ' +
+              'pvg_framework (configure --pvg-framework=DIR), and ' +
+              'apple_gfx_backend=pg without it links the system\'s ' +
+              'ParavirtualizedGraphics.framework')
     endif
   elif get_option('pvg').allowed()
     if not fs.is_absolute(pvg_framework)
@@ -940,21 +945,19 @@ elif host_os == 'darwin'
               pvg_builder)
       endif
     endforeach
-    metal = dependency('appleframeworks', modules: 'Metal',
-                       required: pvg_required)
-    if metal.found()
-      pvg_compile_args = ['-F' + pvg_framework]
-      pvg_link_args = ['-F' + pvg_framework, '-framework', pvg_name]
-      if apple_gfx_backend == 'reims'
-        # apple-gfx*.m then import Metal themselves: reims_vgpu.h, unlike
-        # ParavirtualizedGraphics.h, does not.
-        pvg_compile_args += ['-DAPPLE_GFX_BACKEND_REIMS']
-      endif
-      pvg = declare_dependency(
-        compile_args: pvg_compile_args,
-        link_args: pvg_link_args + ['-Wl,-rpath,' + pvg_framework],
-        dependencies: metal)
+    # Naming a framework asks for apple-gfx, so Metal is required with it.
+    metal = dependency('appleframeworks', modules: 'Metal')
+    pvg_compile_args = ['-F' + pvg_framework]
+    pvg_link_args = ['-F' + pvg_framework, '-framework', pvg_name]
+    if apple_gfx_backend == 'reims'
+      # apple-gfx*.m then import Metal themselves: reims_vgpu.h, unlike
+      # ParavirtualizedGraphics.h, does not.
+      pvg_compile_args += ['-DAPPLE_GFX_BACKEND_REIMS']
     endif
+    pvg = declare_dependency(
+      compile_args: pvg_compile_args,
+      link_args: pvg_link_args + ['-Wl,-rpath,' + pvg_framework],
+      dependencies: metal)
   endif
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
@@ -5170,7 +5173,9 @@ if host_os == 'darwin'
   summary_info += {'apple-gfx backend': apple_gfx_backend}
   summary_info += {pvg_name + ' support': pvg}
   if pvg.found()
-    summary_info += {pvg_name + ' framework': pvg_framework}
+    summary_info += {pvg_name + ' framework':
+                     pvg_framework != '' ? pvg_framework
+                                         : '/System/Library/Frameworks'}
   endif
 endif
 summary_info += {'valgrind':          valgrind}
