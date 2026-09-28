@@ -849,6 +849,11 @@ static const GraphicHwOps reims_vgpu_pci_fb_ops = {
 
 /* ---------- MMIO (forward only) ---------- */
 
+/*
+ * Runs without the BQL: the region is lockless (see realize), and a read only
+ * asks Rust, whose gfx read path is lock-free for the ISR/spin registers and
+ * try-locks the device otherwise. Nothing here touches QEMU device state.
+ */
 static uint64_t reims_vgpu_pci_gfx_read(void *opaque, hwaddr offset, unsigned size)
 {
     ReimsVGPUPCIState *s = opaque;
@@ -871,6 +876,14 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
                               unsigned size)
 {
     ReimsVGPUPCIState *s = opaque;
+
+    /*
+     * Writes keep the BQL: the dirty harvest syncs the accelerator's dirty
+     * log and action delivery raises interrupts, both main-loop state. The
+     * region is lockless for the reads' sake, so take it here when the
+     * dispatcher did not.
+     */
+    BQL_LOCK_GUARD();
 
     if (s->rust_handle == 0) {
         return;
@@ -992,6 +1005,13 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
     memory_region_init_io(&s->iomem_gfx, OBJECT(s), &reims_vgpu_pci_gfx_ops, s,
                           TYPE_REIMS_VGPU_PCI ".gfx",
                           REIMS_VGPU_GFX_MMIO_SIZE);
+    /*
+     * The guest's interrupt handler polls this BAR (0x102c, 0x100c, 0x1014/
+     * 0x1018) tens of thousands of times a second. Let those reads skip the
+     * BQL, so an accelerator can serve them from the vCPU thread directly;
+     * the write handler takes the BQL itself.
+     */
+    memory_region_enable_lockless_io(&s->iomem_gfx);
     /* 32-bit non-prefetch BAR (16 KiB control window). Live 2026-07-13: 64-bit
      * BAR behind pcie-root-port caused Apple efiboot STOP 0x15; keep 32-bit. */
     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->iomem_gfx);
