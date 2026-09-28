@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -28,6 +29,14 @@ for source, dest in json.loads(out).items():
     try:
         os.symlink(source, bundle_dest)
     except BaseException as e:
+        # Windows without Developer Mode or elevation cannot create symlinks
+        # (ERROR_PRIVILEGE_NOT_HELD). Copy what already exists instead; build
+        # outputs that do not exist yet at configure time are skipped.
+        if (os.name == 'nt' and isinstance(e, OSError)
+                and getattr(e, 'winerror', None) == 1314):
+            if os.path.isfile(source):
+                shutil.copy2(source, bundle_dest)
+            continue
         if not isinstance(e, OSError) or e.errno != errno.EEXIST:
             if os.name == 'nt':
                 print('Please enable Developer Mode to support soft link '

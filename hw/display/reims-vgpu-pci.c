@@ -358,7 +358,9 @@ static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
         if (view->ptr != ptr || view->len != len) {
             continue;
         }
+#ifndef _WIN32
         munmap(view->ptr, view->len);
+#endif
         s->page_view_live_bytes -= view->len;
         s->page_view_live_pages -= view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
         s->page_views_destroyed++;
@@ -1175,16 +1177,16 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
     }
     reims_vgpu_pci_stop_backend(s);
     if (s->page_views) {
+#ifndef _WIN32
         size_t i;
 
         for (i = 0; i < s->page_views->len; i++) {
             ReimsVGPUPCIPageView *view =
                 &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
-#ifndef _WIN32
             munmap(view->ptr, view->len);
             s->page_views_destroyed++;
-#endif
         }
+#endif
         g_array_free(s->page_views, true);
         s->page_views = NULL;
     }
