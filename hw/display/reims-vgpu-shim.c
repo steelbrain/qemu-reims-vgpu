@@ -11,6 +11,8 @@
 #include "system/address-spaces.h"
 #include "system/hw_accel.h"
 #include "system/memory.h"
+#include "system/physmem.h"
+#include "system/ram_addr.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "reims_vgpu_qemu_abi.h"
@@ -47,18 +49,58 @@ int reims_vgpu_shim_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len)
     return r == MEMTX_OK ? 0 : -1;
 }
 
+/*
+ * The device's own stores must not reach the DIRTY_MEMORY_VGA bitmap.
+ * reims-vgpu-dirty.c reads that bitmap as "the guest CPU wrote these pages",
+ * and the gather witness refuses (and re-reads) every sampled window whose
+ * pages it finds set there. address_space_write() marks every enabled dirty
+ * client, so each writeback the device made read back as a guest store.
+ *
+ * Hosts with the packed page alias send the device's bulk stores through host
+ * pointers and never reached this function with them; without the alias
+ * (Windows) every store came here, and the witness refused almost every bind.
+ * Guest RAM is therefore written directly and dirtied for every client except
+ * VGA. Anything that is not plain RAM, and any range TCG must invalidate code
+ * for, keeps the checked address_space path.
+ */
 int reims_vgpu_shim_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
                               size_t len)
 {
-    MemTxResult r;
-
     (void)ctx;
     if (!buf || len == 0) {
         return 0;
     }
-    r = address_space_write(&address_space_memory, gpa,
-                            reims_vgpu_shim_ram_attrs, buf, len);
-    return r == MEMTX_OK ? 0 : -1;
+
+    RCU_READ_LOCK_GUARD();
+    while (len > 0) {
+        hwaddr xlat, plen = len;
+        MemoryRegion *mr;
+        uint8_t mask;
+
+        mr = address_space_translate(&address_space_memory, gpa, &xlat, &plen,
+                                     true, reims_vgpu_shim_ram_attrs);
+        if (!mr || plen == 0) {
+            return -1;
+        }
+        mask = memory_region_get_dirty_log_mask(mr);
+        if (memory_region_is_ram(mr) && !mr->readonly &&
+            !memory_region_is_romd(mr) &&
+            memory_region_get_ram_addr(mr) != RAM_ADDR_INVALID &&
+            !(mask & (1 << DIRTY_MEMORY_CODE))) {
+            memcpy((uint8_t *)memory_region_get_ram_ptr(mr) + xlat, buf, plen);
+            physical_memory_set_dirty_range(
+                memory_region_get_ram_addr(mr) + xlat, plen,
+                mask & ~(1 << DIRTY_MEMORY_VGA));
+        } else if (address_space_write(&address_space_memory, gpa,
+                                       reims_vgpu_shim_ram_attrs, buf,
+                                       plen) != MEMTX_OK) {
+            return -1;
+        }
+        gpa += plen;
+        buf += plen;
+        len -= plen;
+    }
+    return 0;
 }
 
 int reims_vgpu_shim_is_ram_gpa(void *ctx, uint64_t gpa)
