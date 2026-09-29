@@ -12,8 +12,8 @@
  * that device, from within QEMU as a PCI device aimed primarily at x86-64
  * macOS VMs.
  *
- * The device has no default option ROM: pass one with romfile= where the
- * guest's firmware needs its EFI driver.
+ * Its default option ROM is Apple's EFI driver for the device, which the
+ * reims-vgpu package names and QEMU's build installs with its data files.
  */
 
 #include "qemu/osdep.h"
@@ -122,6 +122,7 @@ static void apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
     pci->vendor_id = RVG_PCI_VENDOR_ID;
     pci->device_id = RVG_PCI_DEVICE_ID;
     pci->class_id = PCI_CLASS_DISPLAY_OTHER;
+    pci->romfile = "AppleParavirtEFI.rom";
     pci->realize = apple_gfx_pci_realize;
 
     device_class_set_props(dc, apple_gfx_pci_properties);

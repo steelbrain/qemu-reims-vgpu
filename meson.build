@@ -870,6 +870,20 @@ elif host_os == 'darwin'
   # statically, so the binary records no path to it.
   pvg = dependency('reims-vgpu', method: 'pkg-config', static: true,
                    required: get_option('pvg'))
+  # apple-gfx-pci's default romfile: the EFI option ROM the package's
+  # optionrom variable names, installed with QEMU's data files under
+  # apple-gfx-pci's name for it. Configure links it into the build tree's
+  # qemu-bundle too, where a QEMU run from the build tree finds it.
+  if pvg.found()
+    pvg_rom = pvg.get_variable(pkgconfig: 'optionrom', default_value: '')
+    if pvg_rom != '' and fs.is_file(pvg_rom)
+      install_data(pvg_rom, rename: 'AppleParavirtEFI.rom',
+                   install_dir: qemu_datadir, install_mode: 'rw-r--r--')
+    else
+      warning('reims-vgpu names no option ROM that exists (its optionrom ' +
+              'variable): apple-gfx-pci needs romfile= to realize')
+    endif
+  endif
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
             cc.find_library('nsl'),
