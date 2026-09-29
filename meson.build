@@ -864,67 +864,12 @@ elif host_os == 'darwin'
   coref = dependency('appleframeworks', modules: 'CoreFoundation')
   iokit = dependency('appleframeworks', modules: 'IOKit', required: false)
   host_dsosuf = '.dylib'
-  # apple-gfx drives reims-vgpu's C API (reims_vgpu.h), in a
-  # ReimsVGPU.framework built from source (paravirt-decompile's `cargo xtask
-  # bundle`). pvg_framework is the directory holding it, and pvg=auto without
-  # one builds no apple-gfx. The framework is found with -F at pvg_framework,
-  # which is also the rpath. Its install name has to be @rpath-relative: a
-  # binary records the install name of each dylib it links and dyld loads
-  # that path.
-  pvg_framework = get_option('pvg_framework')
-  pvg_builder = ('paravirt-decompile builds one with `cargo xtask bundle` ' +
-                 '(into its target/Frameworks)')
-  if get_option('pvg').allowed() and pvg_framework == ''
-    if get_option('pvg').enabled()
-      error('pvg needs pvg_framework (configure --pvg-framework=DIR), the ' +
-            'directory holding a ReimsVGPU.framework built from source: ' +
-            pvg_builder)
-    else
-      message('apple-gfx is left out: it needs pvg_framework (configure ' +
-              '--pvg-framework=DIR), the directory holding a ' +
-              'ReimsVGPU.framework built from source')
-    endif
-  elif get_option('pvg').allowed()
-    if not fs.is_absolute(pvg_framework)
-      error('pvg_framework must be an absolute path, since it is also the ' +
-            'rpath: ' + pvg_framework)
-    endif
-    pvg_bundle = pvg_framework / 'ReimsVGPU.framework'
-    pvg_binary = pvg_bundle / 'ReimsVGPU'
-    if not (fs.is_file(pvg_binary) and
-            fs.is_file(pvg_bundle / 'Headers' / 'reims_vgpu.h'))
-      error('pvg_framework: ' + pvg_framework + ' holds no ' +
-            'ReimsVGPU.framework with a binary and Headers/reims_vgpu.h; ' +
-            pvg_builder)
-    endif
-    # otool -D prints "<path>:" or "<path> (architecture <arch>):", then the
-    # install name, per slice, or a complaint such as "<path>: is not an
-    # object file"
-    pvg_ids = []
-    foreach line : run_command(find_program('otool'), '-D', pvg_binary,
-                               check: true).stdout().strip().split('\n')
-      if line.startswith(pvg_binary + ': ')
-        error('pvg_framework: ' + line)
-      elif not (line.startswith(pvg_binary) and line.endswith(':'))
-        pvg_ids += line
-      endif
-    endforeach
-    if pvg_ids.length() == 0
-      error('pvg_framework: ' + pvg_binary + ' has no install name: it is ' +
-            'not a dylib')
-    endif
-    foreach id : pvg_ids
-      if not id.startswith('@rpath/')
-        error('pvg_framework: ' + pvg_binary + ' has the install name ' +
-              id + ', which QEMU would record and dyld load in its place: ' +
-              pvg_builder)
-      endif
-    endforeach
-    pvg = declare_dependency(
-      compile_args: ['-F' + pvg_framework],
-      link_args: ['-F' + pvg_framework, '-framework', 'ReimsVGPU',
-                  '-Wl,-rpath,' + pvg_framework])
-  endif
+  # apple-gfx drives reims-vgpu's C API (reims_vgpu.h), a library found
+  # through pkg-config: reims-vgpu.pc, which paravirt-decompile's `cargo
+  # xtask dist` writes into its target/dist/lib/pkgconfig. It is linked
+  # statically, so the binary records no path to it.
+  pvg = dependency('reims-vgpu', method: 'pkg-config', static: true,
+                   required: get_option('pvg'))
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
             cc.find_library('nsl'),
@@ -5136,10 +5081,7 @@ if host_os == 'freebsd'
   summary_info += {'libinotify-kqueue': inotify}
 endif
 if host_os == 'darwin'
-  summary_info += {'ReimsVGPU support': pvg}
-  if pvg.found()
-    summary_info += {'ReimsVGPU framework': pvg_framework}
-  endif
+  summary_info += {'reims-vgpu support': pvg}
 endif
 summary_info += {'valgrind':          valgrind}
 summary(summary_info, bool_yn: true, section: 'Dependencies')

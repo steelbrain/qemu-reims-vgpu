@@ -12,7 +12,7 @@
 #include "hw/core/qdev-properties.h"
 #include "ui/surface.h"
 #include "block/thread-pool.h"
-#include <ReimsVGPU/reims_vgpu.h>
+#include <reims_vgpu.h>
 
 #define TYPE_APPLE_GFX_MMIO         "apple-gfx-mmio"
 #define TYPE_APPLE_GFX_PCI          "apple-gfx-pci"

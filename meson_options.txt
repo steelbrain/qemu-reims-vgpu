@@ -210,8 +210,6 @@ option('lzo', type : 'feature', value : 'auto',
        description: 'lzo compression support')
 option('pvg', type: 'feature', value: 'auto',
        description: 'macOS paravirtualized graphics support')
-option('pvg_framework', type: 'string', value: '',
-       description: 'directory of the ReimsVGPU.framework apple-gfx links, built from source with an @rpath install name')
 option('rbd', type : 'feature', value : 'auto',
        description: 'Ceph block device driver')
 option('opengl', type : 'feature', value : 'auto',

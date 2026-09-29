@@ -19,12 +19,12 @@ To run the vmapple machine model, you need to
    the guest side. I will assume that you installed it using the
    `macosvm <https://github.com/s-u/macosvm>`__ CLI.
  * Build QEMU with apple-gfx, which the machine's display needs. apple-gfx
-   drives reims-vgpu's C API, in a ``ReimsVGPU.framework`` built from source:
-   pass ``--enable-pvg --pvg-framework=DIR``, where ``DIR`` is the absolute
-   path of the directory holding that framework, whose install name starts
-   with ``@rpath/``. paravirt-decompile's ``cargo xtask bundle`` builds one
-   into its ``target/Frameworks``; its ``make qemu`` builds that and QEMU
-   together. Without pvg the vmapple machine is left out of the build.
+   drives reims-vgpu's C API, a library that pkg-config finds as
+   ``reims-vgpu``: pass ``--enable-pvg`` with ``PKG_CONFIG_PATH`` naming the
+   directory of its ``reims-vgpu.pc``. paravirt-decompile's ``cargo xtask
+   dist`` writes one into its ``target/dist/lib/pkgconfig``; its ``make
+   qemu`` builds that and QEMU together. Without pvg the vmapple machine is
+   left out of the build.
 
 First, we need to extract the UUID from the virtual machine that you installed. You can do this
 by running the shell script in contrib/vmapple/uuid.sh on the macosvm.json file.
