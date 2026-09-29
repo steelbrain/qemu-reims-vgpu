@@ -877,7 +877,7 @@ elif host_os == 'darwin'
   if pvg.found()
     pvg_rom = pvg.get_variable(pkgconfig: 'optionrom', default_value: '')
     if pvg_rom != '' and fs.is_file(pvg_rom)
-      install_data(pvg_rom, rename: 'AppleParavirtEFI.rom',
+      install_data(pvg_rom, rename: 'ReimsVgpu.rom',
                    install_dir: qemu_datadir, install_mode: 'rw-r--r--')
     else
       warning('reims-vgpu names no option ROM that exists (its optionrom ' +
