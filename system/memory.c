@@ -2260,6 +2260,60 @@ static void memory_region_sync_dirty_bitmap(MemoryRegion *mr, bool last_stage)
     }
 }
 
+void memory_region_sync_dirty_ranges(MemoryRegion *mr,
+                                     const MemoryRegionRange *ranges,
+                                     size_t n)
+{
+    MemoryRegionSection mrs, sub;
+    MemoryListener *listener;
+    FlatView *view;
+    FlatRange *fr;
+    hwaddr sec_start, sec_end;
+    size_t i;
+
+    if (n == 0) {
+        return;
+    }
+    QTAILQ_FOREACH(listener, &memory_listeners, link) {
+        if (listener->log_sync_global) {
+            /* Cannot sync in a finer granularity than everything. */
+            listener->log_sync_global(listener, false);
+            continue;
+        }
+        if (!listener->log_sync) {
+            continue;
+        }
+        view = address_space_get_flatview(listener->address_space);
+        FOR_EACH_FLAT_RANGE(fr, view) {
+            if (!fr->dirty_log_mask || fr->mr != mr) {
+                continue;
+            }
+            mrs = section_from_flat_range(fr, view);
+            if (!listener->log_sync_ranged) {
+                listener->log_sync(listener, &mrs);
+                continue;
+            }
+            for (i = 0; i < n; i++) {
+                sec_start = MAX(mrs.offset_within_region, ranges[i].start);
+                sec_end = MIN(mrs.offset_within_region +
+                              int128_get64(mrs.size),
+                              ranges[i].start + ranges[i].len);
+                if (sec_start >= sec_end) {
+                    continue;
+                }
+                sub = mrs;
+                sub.offset_within_address_space +=
+                    sec_start - mrs.offset_within_region;
+                sub.offset_within_region = sec_start;
+                sub.size = int128_make64(sec_end - sec_start);
+                listener->log_sync(listener, &sub);
+            }
+        }
+        flatview_unref(view);
+        trace_memory_region_sync_dirty(mr->name, listener->name, 0);
+    }
+}
+
 void memory_region_clear_dirty_bitmap(MemoryRegion *mr, hwaddr start,
                                       hwaddr len)
 {

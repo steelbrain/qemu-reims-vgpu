@@ -13,6 +13,8 @@
 #include "qemu/accel.h"
 #include "accel/accel-ops.h"
 #include "system/memory.h"
+#include "system/physmem.h"
+#include "system/ram_addr.h"
 #include "system/whpx.h"
 #include "system/cpus.h"
 #include "system/runstate.h"
@@ -284,6 +286,30 @@ void whpx_vcpu_kick(CPUState *cpu)
  * Memory support.
  */
 
+/*
+ * Guest-write tracking. Writable guest RAM is mapped with
+ * WHvMapGpaRangeFlagTrackDirtyPages and log_sync reads the hypervisor's
+ * per-page bitmap, the way KVM's log_sync reads KVM_GET_DIRTY_LOG. Without
+ * it log_sync can only report every page of every logged region as written,
+ * which makes any consumer of the dirty bitmap (display devices, migration)
+ * redo all of its work on every sync.
+ *
+ * Tracking starts enabled when the host exports the query and switches off
+ * for the rest of the run the first time the hypervisor refuses a tracked
+ * mapping or a query; log_sync then falls back to the conservative answer.
+ */
+static bool whpx_dirty_tracking;
+static bool whpx_dirty_tracking_decided;
+
+static void whpx_dirty_tracking_disable(const char *why, HRESULT hr)
+{
+    if (whpx_dirty_tracking) {
+        warn_report("WHPX: guest dirty-page tracking disabled (%s, hr=0x%lx); "
+                    "logged RAM will be reported as fully dirty", why, hr);
+    }
+    whpx_dirty_tracking = false;
+}
+
 static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -324,6 +350,20 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
      | (writable ? WHvMapGpaRangeFlagWrite : 0);
     mem = memory_region_get_ram_ptr(area) + section->offset_within_region;
 
+    if (!whpx_dirty_tracking_decided) {
+        whpx_dirty_tracking = whp_dispatch.WHvQueryGpaRangeDirtyBitmap != NULL;
+        whpx_dirty_tracking_decided = true;
+    }
+    if (whpx_dirty_tracking && writable && memory_region_is_ram(area)) {
+        hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gva, size,
+                                         flags |
+                                         WHvMapGpaRangeFlagTrackDirtyPages);
+        if (SUCCEEDED(hr)) {
+            return;
+        }
+        whpx_dirty_tracking_disable("tracked mapping refused", hr);
+    }
+
     hr = whp_dispatch.WHvMapGpaRange(whpx->partition,
          mem, gva, size, flags);
     if (FAILED(hr)) {
@@ -352,16 +392,81 @@ static void whpx_transaction_commit(MemoryListener *listener)
 {
 }
 
+/*
+ * Queries longer than this many pages run without the BQL. 64 MiB of 4 KiB
+ * pages is about 0.7 ms of hypervisor walk.
+ */
+#define WHPX_DIRTY_QUERY_UNLOCKED_PAGES 16384
+
 static void whpx_log_sync(MemoryListener *listener,
                          MemoryRegionSection *section)
 {
+    struct whpx_state *whpx = &whpx_global;
     MemoryRegion *mr = section->mr;
+    uint64_t gpa = section->offset_within_address_space;
+    uint64_t size = int128_get64(section->size);
+    uint64_t page = qemu_real_host_page_size();
+    uint64_t pages, words;
+    g_autofree uint64_t *bitmap = NULL;
+    ram_addr_t ram_addr;
+    bool relock;
+    HRESULT hr;
 
     if (!memory_region_is_ram(mr)) {
         return;
     }
 
-    memory_region_set_dirty(mr, 0, int128_get64(section->size));
+    /*
+     * Only writable, page-aligned RAM was mapped tracked. The hypervisor
+     * bitmap has one bit per 4 KiB page, which is also the page the QEMU
+     * bitmaps are kept in on this host.
+     */
+    if (whpx_dirty_tracking && !mr->readonly && !mr->rom_device &&
+        page == 4096 && QEMU_IS_ALIGNED(gpa, page) &&
+        QEMU_IS_ALIGNED(size, page) && size / page <= UINT32_MAX * 8ULL) {
+        pages = size / page;
+        words = DIV_ROUND_UP(pages, 64);
+        bitmap = g_new0(uint64_t, words);
+        ram_addr = memory_region_get_ram_addr(mr) +
+                   section->offset_within_region;
+        /*
+         * The query walks every page of the range in the hypervisor: tens of
+         * milliseconds for gigabytes of guest RAM. It touches only the
+         * partition and this local bitmap, so run it without the BQL; holding
+         * it here stalled the main loop (interrupt delivery) and every vCPU's
+         * MMIO dispatch for the whole walk. Everything read from the section
+         * is captured above; guest RAM is never unplugged while running.
+         *
+         * Only for a long walk, though: a range of a few thousand pages
+         * returns in tens of microseconds, less than giving the BQL up and
+         * taking it back costs, and a caller that syncs many small ranges
+         * would pay that for each of them.
+         */
+        relock = bql_locked() && pages > WHPX_DIRTY_QUERY_UNLOCKED_PAGES;
+        if (relock) {
+            bql_unlock();
+        }
+        hr = whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa,
+                                                      size, bitmap,
+                                                      words * sizeof(uint64_t));
+        if (relock) {
+            bql_lock();
+        }
+        if (SUCCEEDED(hr)) {
+            /*
+             * The bitmap is little-endian 64-bit words; on this (x86,
+             * little-endian) host that is bit-for-bit the little-endian
+             * unsigned-long bitmap QEMU consumes, whatever the long's width.
+             */
+            physical_memory_set_dirty_lebitmap((unsigned long *)bitmap,
+                                               ram_addr, pages);
+            return;
+        }
+        whpx_dirty_tracking_disable("bitmap query failed", hr);
+    }
+
+    /* The section may start anywhere in the region (e.g. RAM above 4G). */
+    memory_region_set_dirty(mr, section->offset_within_region, size);
 }
 
 static MemoryListener whpx_memory_listener = {
@@ -371,6 +476,7 @@ static MemoryListener whpx_memory_listener = {
     .region_add = whpx_region_add,
     .region_del = whpx_region_del,
     .log_sync = whpx_log_sync,
+    .log_sync_ranged = true,
     .priority = MEMORY_LISTENER_PRIORITY_ACCEL,
 };
 

@@ -7,6 +7,7 @@
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
 #include "qemu/rcu.h"
+#include "qemu/bitmap.h"
 #include "exec/target_page.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
@@ -87,6 +88,14 @@ struct ReimsVgpuDirty {
      * writes into one sync.
      */
     uint64_t reads_since_harvest;
+    /*
+     * Scratch for reims_vgpu_dirty_sync_tracked, owned across harvests so the
+     * steady state does not allocate: one bit per target page of guest-physical
+     * space up to the highest RAM range, and the ranges handed to the sync.
+     */
+    unsigned long *sync_pages;
+    uint64_t sync_pages_bits;
+    GArray *sync_ranges;    /* MemoryRegionRange */
 };
 
 static void reims_vgpu_dirty_set_free(gpointer p)
@@ -128,6 +137,10 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
     g_hash_table_destroy(d->logged);
     g_hash_table_destroy(d->sets);
     g_free(d->slices);
+    g_free(d->sync_pages);
+    if (d->sync_ranges) {
+        g_array_free(d->sync_ranges, TRUE);
+    }
     qemu_mutex_destroy(&d->lock);
     g_free(d);
 }
@@ -434,6 +447,128 @@ static bool reims_vgpu_dirty_page_written(const ReimsVgpuDirtySlice *sl,
     return false;
 }
 
+/*
+ * Pages of unwritten gap a sync range may absorb rather than end. Measured on
+ * WHPX, a query costs ~4 us a call plus ~26 ns a page walked, so a gap is
+ * worth absorbing below ~150 pages and a little past it costs little. At 256
+ * the tracked set of a busy desktop (~60k pages) is ~800 ranges over ~360k
+ * pages, ~12 ms a harvest, against ~3M pages and ~35 ms for all of RAM; 1024
+ * measured no better.
+ */
+#define REIMS_VGPU_DIRTY_SYNC_GAP_PAGES 256
+
+/*
+ * Bring the dirty bitmap up to date for the tracked pages, not all of RAM.
+ *
+ * The harvest reads the bit of every tracked page and nothing else, so that
+ * is all the sync has to cover. A whole-RAM sync walks every page the guest
+ * has, tens of milliseconds on a 12 GiB guest, and a vCPU waits through it on
+ * every doorbell write that harvests. Only logged slices are synced: pages in
+ * the others read as written without consulting a bit.
+ *
+ * Nothing is lost for any other bitmap consumer. A range sync moves the
+ * hypervisor's bits for that range into QEMU's bitmaps for every client; the
+ * bits outside it stay with the hypervisor until someone syncs them.
+ *
+ * A set tracked after the page scan below is synced at the next harvest, the
+ * same as one tracked after the whole-RAM sync used to be.
+ */
+static void reims_vgpu_dirty_sync_tracked(ReimsVgpuDirty *d,
+                                          const ReimsVgpuDirtySlice *slices,
+                                          int n)
+{
+    const int shift = qemu_target_page_bits();
+    GHashTableIter it;
+    gpointer key, val;
+    uint64_t bits = 0;
+    int i, j;
+
+    for (i = 0; i < n; i++) {
+        if (slices[i].logged) {
+            bits = MAX(bits, (slices[i].gpa + slices[i].len) >> shift);
+        }
+    }
+    if (bits == 0) {
+        return;
+    }
+    if (d->sync_pages_bits < bits) {
+        g_free(d->sync_pages);
+        d->sync_pages = bitmap_new(bits);
+        d->sync_pages_bits = bits;
+    }
+    if (!d->sync_ranges) {
+        d->sync_ranges = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
+    }
+
+    qemu_mutex_lock(&d->lock);
+    g_hash_table_iter_init(&it, d->sets);
+    while (g_hash_table_iter_next(&it, &key, &val)) {
+        const ReimsVgpuDirtySet *s = val;
+        size_t p;
+        uint64_t off;
+
+        for (p = 0; p < s->count; p++) {
+            for (off = 0; off < s->page_size; off += 1ULL << shift) {
+                uint64_t pfn = (s->pages[p] + off) >> shift;
+
+                if (pfn < bits) {
+                    set_bit(pfn, d->sync_pages);
+                }
+            }
+        }
+    }
+    qemu_mutex_unlock(&d->lock);
+
+    /*
+     * One batch per MemoryRegion: on q35 guest RAM is one region aliased below
+     * and above the PCI hole, and a listener that cannot sync sub-ranges syncs
+     * the whole region once per batch.
+     */
+    for (i = 0; i < n; i++) {
+        bool seen = false;
+
+        for (j = 0; j < i; j++) {
+            seen |= slices[j].logged && slices[j].mr == slices[i].mr;
+        }
+        if (!slices[i].logged || seen) {
+            continue;
+        }
+        g_array_set_size(d->sync_ranges, 0);
+        for (j = i; j < n; j++) {
+            const ReimsVgpuDirtySlice *sl = &slices[j];
+            uint64_t end = (sl->gpa + sl->len) >> shift;
+            uint64_t pfn, first, last, next;
+
+            if (!sl->logged || sl->mr != slices[i].mr) {
+                continue;
+            }
+            pfn = find_next_bit(d->sync_pages, end, sl->gpa >> shift);
+            while (pfn < end) {
+                MemoryRegionRange r;
+
+                first = last = pfn;
+                for (;;) {
+                    next = find_next_bit(d->sync_pages, end, last + 1);
+                    if (next >= end ||
+                        next - last - 1 > REIMS_VGPU_DIRTY_SYNC_GAP_PAGES) {
+                        break;
+                    }
+                    last = next;
+                }
+                r.start = sl->offset + ((first << shift) - sl->gpa);
+                r.len = (last - first + 1) << shift;
+                g_array_append_val(d->sync_ranges, r);
+                pfn = next;
+            }
+        }
+        memory_region_sync_dirty_ranges(slices[i].mr,
+                                        &g_array_index(d->sync_ranges,
+                                                       MemoryRegionRange, 0),
+                                        d->sync_ranges->len);
+    }
+    bitmap_zero(d->sync_pages, bits);
+}
+
 void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
 {
     ReimsVgpuDirtySlice *slices;
@@ -473,8 +608,8 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
         slices[i].logged = g_hash_table_contains(d->logged, slices[i].mr);
     }
 
-    /* One sync for every logged region, then only reads. */
-    memory_global_dirty_log_sync(false);
+    /* One sync covering every tracked page, then only reads. */
+    reims_vgpu_dirty_sync_tracked(d, slices, n);
 
     written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
     /*

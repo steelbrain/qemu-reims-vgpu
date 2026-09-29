@@ -1217,7 +1217,15 @@ uint64_t physical_memory_set_dirty_lebitmap(unsigned long *bitmap,
     hwaddr addr;
     ram_addr_t ram_addr;
     uint64_t num_dirty = 0;
-    unsigned long len = (pages + HOST_LONG_BITS - 1) / HOST_LONG_BITS;
+    /*
+     * The bitmap is an array of unsigned long, so its word width is
+     * BITS_PER_LONG. HOST_LONG_BITS is the pointer width, which differs on an
+     * LLP64 host (Windows: 32-bit long, 64-bit pointer): there the slow path
+     * below walked only the first half of the words and put bit j of word i on
+     * page i * 64 + j, so every page past the first 32 of an unaligned range
+     * was dropped or landed on the wrong page (WHPX ranged dirty sync).
+     */
+    unsigned long len = (pages + BITS_PER_LONG - 1) / BITS_PER_LONG;
     unsigned long hpratio = qemu_real_host_page_size() / TARGET_PAGE_SIZE;
     unsigned long page = BIT_WORD(start >> TARGET_PAGE_BITS);
 
@@ -1299,7 +1307,7 @@ uint64_t physical_memory_set_dirty_lebitmap(unsigned long *bitmap,
                 do {
                     j = ctzl(c);
                     c &= ~(1ul << j);
-                    page_number = (i * HOST_LONG_BITS + j) * hpratio;
+                    page_number = (i * BITS_PER_LONG + j) * hpratio;
                     addr = page_number * TARGET_PAGE_SIZE;
                     ram_addr = start + addr;
                     physical_memory_set_dirty_range(ram_addr,
