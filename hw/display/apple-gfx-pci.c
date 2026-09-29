@@ -1,15 +1,19 @@
 /*
- * QEMU Apple ParavirtualizedGraphics.framework device, PCI variant
+ * QEMU Apple paravirtualized graphics device, PCI variant
  *
  * Copyright © 2023-2024 Phil Dennis-Jordan
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * ParavirtualizedGraphics.framework is a set of libraries that macOS provides
- * which implements 3d graphics passthrough to the host as well as a
- * proprietary guest communication channel to drive it. This device model
- * implements support to drive that library from within QEMU as a PCI device
- * aimed primarily at x86-64 macOS VMs.
+ * macOS guests drive a paravirtualized GPU, the device of Apple's
+ * ParavirtualizedGraphics.framework, which implements 3d graphics passthrough
+ * to the host as well as a proprietary guest communication channel. This
+ * device model drives reims-vgpu, a library that implements the host side of
+ * that device, from within QEMU as a PCI device aimed primarily at x86-64
+ * macOS VMs.
+ *
+ * The device has no default option ROM: pass one with romfile= where the
+ * guest's firmware needs its EFI driver.
  */
 
 #include "qemu/osdep.h"
@@ -17,12 +21,6 @@
 #include "hw/pci/msi.h"
 #include "apple-gfx.h"
 #include "trace.h"
-
-/* PGDeviceSpec.h's PCI facts, which reims_vgpu.h does not carry. */
-#define PG_PCI_BAR_MMIO 0
-#define PG_PCI_MAX_MSI_VECTORS 1
-#define PG_PCI_VENDOR_ID 0x106b
-#define PG_PCI_DEVICE_ID 0xeeee
 
 OBJECT_DECLARE_SIMPLE_TYPE(AppleGFXPCIState, APPLE_GFX_PCI)
 
@@ -32,28 +30,9 @@ struct AppleGFXPCIState {
     AppleGFXState common;
 };
 
-static const char *apple_gfx_pci_option_rom_path = NULL;
-
-static void apple_gfx_init_option_rom_path(void)
-{
-    /* The library keeps the string: nothing to release (NULL: no ROM). */
-    const char *option_rom_path = rvg_option_rom_path();
-    apple_gfx_pci_option_rom_path = g_strdup(option_rom_path);
-}
-
 static void apple_gfx_pci_init(Object *obj)
 {
     AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
-
-    if (!apple_gfx_pci_option_rom_path) {
-        /*
-         * The following is done on device not class init to avoid running
-         * ObjC code before fork() in -daemonize mode.
-         */
-        PCIDeviceClass *pci = PCI_DEVICE_CLASS(object_get_class(obj));
-        apple_gfx_init_option_rom_path();
-        pci->romfile = apple_gfx_pci_option_rom_path;
-    }
 
     apple_gfx_common_init(obj, &s->common, TYPE_APPLE_GFX_PCI);
 }
@@ -73,8 +52,13 @@ static void apple_gfx_pci_raise_interrupt(void *opaque)
     g_free(job);
 }
 
-static void apple_gfx_pci_interrupt(PCIDevice *dev, uint32_t vector)
+/*
+ * On a library thread (a FIFO's or the device's reporting thread), or inside
+ * a call that may call back, such as apple_gfx_pci_reset's.
+ */
+static void apple_gfx_pci_raise_interrupt_cb(void *ctx, uint32_t vector)
 {
+    PCIDevice *dev = ctx;
     AppleGFXPCIInterruptJob *job;
 
     trace_apple_gfx_raise_irq(vector);
@@ -85,37 +69,31 @@ static void apple_gfx_pci_interrupt(PCIDevice *dev, uint32_t vector)
                             apple_gfx_pci_raise_interrupt, job);
 }
 
-static void apple_gfx_pci_raise_interrupt_cb(void *ctx, uint32_t vector)
-{
-    PCIDevice *dev = ctx;
-    apple_gfx_pci_interrupt(dev, vector);
-}
-
 static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
 {
     AppleGFXPCIState *s = APPLE_GFX_PCI(dev);
+    RvgHostCallbacks callbacks = {
+        .struct_size = sizeof(callbacks),
+        .ctx = dev,
+        .raise_interrupt = apple_gfx_pci_raise_interrupt_cb,
+    };
+    RvgDeviceConfig config = {
+        .struct_size = sizeof(config),
+        .callbacks = &callbacks,
+    };
     int ret;
 
-    pci_register_bar(dev, PG_PCI_BAR_MMIO,
+    pci_register_bar(dev, RVG_PCI_BAR_MMIO,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->common.iomem_gfx);
 
     ret = msi_init(dev, 0x0 /* config offset; 0 = find space */,
-                   PG_PCI_MAX_MSI_VECTORS, true /* msi64bit */,
+                   RVG_PCI_MSI_VECTORS, true /* msi64bit */,
                    false /* msi_per_vector_mask */, errp);
     if (ret != 0) {
         return;
     }
 
-    @autoreleasepool {
-        /* The block, as a triple: ctx is the PCIDevice it captured. */
-        RvgDeviceDescriptor *desc = rvg_device_descriptor_create();
-        rvg_device_descriptor_set_raise_interrupt(
-            desc, apple_gfx_pci_raise_interrupt_cb, dev, NULL);
-
-        apple_gfx_common_realize(&s->common, DEVICE(dev), desc, errp);
-        rvg_device_descriptor_release(desc);
-        desc = NULL;
-    }
+    apple_gfx_common_realize(&s->common, DEVICE(dev), &config, errp);
 }
 
 static void apple_gfx_pci_reset(Object *obj, ResetType type)
@@ -141,8 +119,8 @@ static void apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 
-    pci->vendor_id = PG_PCI_VENDOR_ID;
-    pci->device_id = PG_PCI_DEVICE_ID;
+    pci->vendor_id = RVG_PCI_VENDOR_ID;
+    pci->device_id = RVG_PCI_DEVICE_ID;
     pci->class_id = PCI_CLASS_DISPLAY_OTHER;
     pci->realize = apple_gfx_pci_realize;
 
@@ -163,4 +141,3 @@ static const TypeInfo apple_gfx_pci_types[] = {
     }
 };
 DEFINE_TYPES(apple_gfx_pci_types)
-

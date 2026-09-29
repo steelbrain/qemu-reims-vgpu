@@ -920,13 +920,10 @@ elif host_os == 'darwin'
               pvg_builder)
       endif
     endforeach
-    # apple-gfx*.m import Metal themselves: reims_vgpu.h does not.
-    metal = dependency('appleframeworks', modules: 'Metal')
     pvg = declare_dependency(
       compile_args: ['-F' + pvg_framework],
       link_args: ['-F' + pvg_framework, '-framework', 'ReimsVGPU',
-                  '-Wl,-rpath,' + pvg_framework],
-      dependencies: metal)
+                  '-Wl,-rpath,' + pvg_framework])
   endif
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
