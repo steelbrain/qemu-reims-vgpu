@@ -70,3 +70,15 @@ to get better interactive access into the target system:
        -netdev user,id=net0,ipv6=off,hostfwd=tcp::2222-:22,hostfwd=tcp::5901-:5900 \
        -device virtio-net-pci,netdev=net0
 
+Display
+-------
+
+apple-gfx gives the guest one display by default; ``-global
+apple-gfx-mmio.displays=N`` gives it N, up to 8, each with a console of its
+own. Under ``-display none``, reims-vgpu opens a window for each display on
+the host's screen, draws the guest's frames into it, and sends its pointer,
+wheel and keys to the guest's USB tablet and keyboard; closing a window
+powers the VM off. Each display is then offered modes that fit the host's
+screen, unless the device's ``display-modes`` property names some. Set
+``REIMS_VGPU_WINDOW=0`` in QEMU's environment to keep ``-display none``
+headless. Either way, ``screendump`` draws the display's current frame.

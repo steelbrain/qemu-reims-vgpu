@@ -14,16 +14,21 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "qemu/lockable.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qapi/visitor.h"
 #include "qapi/error.h"
+#include "qapi/qapi-commands-ui.h"
 #include "qemu/aio-wait.h"
 #include "system/address-spaces.h"
 #include "migration/blocker.h"
 #include "system/memory.h"
+#include "system/runstate.h"
+#include "system/runstate-action.h"
 #include "ui/console.h"
+#include "ui/input.h"
 #include "apple-gfx.h"
 #include "trace.h"
 
@@ -99,6 +104,7 @@ static void apple_gfx_render_frame_completed_bh(void *opaque)
     AppleGFXRenderJob *job = opaque;
     AppleGFXDisplay *d = job->d;
     DisplaySurface *surface = d->surface;
+    bool window = d->state->window;
 
     --d->pending_frames;
     assert(d->pending_frames >= 0);
@@ -112,7 +118,9 @@ static void apple_gfx_render_frame_completed_bh(void *opaque)
                                      surface_stride(surface),
                                      (size_t)surface_stride(surface) *
                                      surface_height(surface));
-        if (d->gfx_update_requested) {
+        if (window) {
+            qemu_console_update_full(d->con);
+        } else if (d->gfx_update_requested) {
             d->gfx_update_requested = false;
             qemu_console_update_full(d->con);
             qemu_console_hw_update_done(d->con);
@@ -124,7 +132,13 @@ static void apple_gfx_render_frame_completed_bh(void *opaque)
     rvg_frame_target_release(job->target);
     g_free(job);
 
-    if (d->pending_frames > 0) {
+    if (window) {
+        /*
+         * The render gfx_update asked for, drawn or not: an update that
+         * waits for it, a screendump's, never waits for another.
+         */
+        qemu_console_hw_update_done(d->con);
+    } else if (d->pending_frames > 0) {
         apple_gfx_render_new_frame(d);
     }
 }
@@ -145,12 +159,38 @@ static void new_frame_handler_bh(void *opaque)
     apple_gfx_render_new_frame(d);
 }
 
+/*
+ * In window mode, the library draws the guest's frames into the display's
+ * window, and the surface is drawn here only when QEMU's display system asks
+ * for it (a screendump, or a display change listener): one render, whose
+ * completion signals the update done.
+ */
+static bool apple_gfx_window_update_display(AppleGFXDisplay *d)
+{
+    if (d->pending_frames > 0) {
+        /* The render under way signals the update done. */
+        return false;
+    }
+    if (d->surface == NULL || d->target == NULL) {
+        /* No mode yet, or its target was refused: the surface stays. */
+        return true;
+    }
+
+    ++d->pending_frames;
+    apple_gfx_render_new_frame(d);
+    return false;
+}
+
 static bool apple_gfx_fb_update_display(void *opaque)
 {
     AppleGFXDisplay *d = opaque;
     bool done = true;
 
     assert(bql_locked());
+    if (d->state->window) {
+        return apple_gfx_window_update_display(d);
+    }
+
     if (d->new_frame_ready) {
         qemu_console_update_full(d->con);
         d->new_frame_ready = false;
@@ -258,12 +298,87 @@ static void set_cursor_glyph(AppleGFXDisplay *d,
     update_cursor(d);
 }
 
+/* ------ Input from the displays' windows ------ */
+
+/* The most wheel notches one wheel callback sends the guest. */
+#define APPLE_GFX_WHEEL_MAX_NOTCHES 256
+
+static void apple_gfx_input_pointer(AppleGFXDisplay *d, uint16_t x,
+                                    uint16_t y, uint16_t width,
+                                    uint16_t height, uint32_t buttons)
+{
+    static uint32_t button_map[INPUT_BUTTON__MAX] = {
+        [INPUT_BUTTON_LEFT] = RVG_WINDOW_BUTTON_LEFT,
+        [INPUT_BUTTON_RIGHT] = RVG_WINDOW_BUTTON_RIGHT,
+        [INPUT_BUTTON_MIDDLE] = RVG_WINDOW_BUTTON_MIDDLE,
+        [INPUT_BUTTON_SIDE] = RVG_WINDOW_BUTTON_SIDE,
+        [INPUT_BUTTON_EXTRA] = RVG_WINDOW_BUTTON_EXTRA,
+    };
+    AppleGFXState *s = d->state;
+
+    /* QEMU's input layer does not clamp absolute axes. */
+    width = MAX(width, 1);
+    height = MAX(height, 1);
+    qemu_input_queue_abs(d->con, INPUT_AXIS_X, MIN(x, width - 1), 0, width);
+    qemu_input_queue_abs(d->con, INPUT_AXIS_Y, MIN(y, height - 1), 0, height);
+    qemu_input_update_buttons(d->con, button_map, s->input_buttons, buttons);
+    s->input_buttons = buttons;
+    qemu_input_event_sync();
+}
+
+/*
+ * @notches wheel notches on one axis: a press and release of @up for each
+ * notch above 0, of @down for each below.
+ */
+static void apple_gfx_input_wheel_axis(AppleGFXDisplay *d, int32_t notches,
+                                       InputButton up, InputButton down)
+{
+    InputButton button = notches > 0 ? up : down;
+    int64_t count = MIN(ABS((int64_t)notches), APPLE_GFX_WHEEL_MAX_NOTCHES);
+
+    for (int64_t i = 0; i < count; i++) {
+        qemu_input_queue_btn(d->con, button, true);
+        qemu_input_queue_btn(d->con, button, false);
+        qemu_input_event_sync();
+    }
+}
+
+static void apple_gfx_input_key(AppleGFXDisplay *d, uint16_t usage,
+                                bool down)
+{
+    unsigned int lnx = 0;
+
+    if (usage < qemu_input_map_usb_to_linux_len) {
+        lnx = qemu_input_map_usb_to_linux[usage];
+    }
+    if (lnx == 0) {
+        return;
+    }
+    /*
+     * At once, as QEMU's cocoa, GTK and SDL displays send keys: no delay
+     * between them, which a person's keys, far apart, do not need to fit the
+     * USB keyboard's queue of 16 scancodes.
+     */
+    qemu_input_event_send_key_linux(d->con, lnx, down);
+}
+
+static void apple_gfx_input_close(void)
+{
+    /* As QEMU's own windows do: closing one powers the VM off. */
+    shutdown_action = SHUTDOWN_ACTION_POWEROFF;
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+}
+
 /* ------ Callbacks' work under the BQL ------ */
 
 typedef enum AppleGFXEventKind {
     APPLE_GFX_EVENT_CURSOR_GLYPH,
     APPLE_GFX_EVENT_CURSOR_SHOW,
     APPLE_GFX_EVENT_CURSOR_MOVE,
+    APPLE_GFX_EVENT_POINTER,
+    APPLE_GFX_EVENT_WHEEL,
+    APPLE_GFX_EVENT_KEY,
+    APPLE_GFX_EVENT_CLOSE,
 } AppleGFXEventKind;
 
 struct AppleGFXEvent {
@@ -273,6 +388,21 @@ struct AppleGFXEvent {
     union {
         AppleGFXCursorGlyph glyph;
         bool show;
+        struct {
+            uint16_t x;
+            uint16_t y;
+            uint16_t width;
+            uint16_t height;
+            uint32_t buttons;
+        } pointer;
+        struct {
+            int32_t dy;
+            int32_t dx;
+        } wheel;
+        struct {
+            uint16_t usage;
+            bool down;
+        } key;
     };
 };
 
@@ -316,6 +446,24 @@ static void apple_gfx_event_run(AppleGFXEvent *event)
         break;
     case APPLE_GFX_EVENT_CURSOR_MOVE:
         update_cursor(d);
+        break;
+    case APPLE_GFX_EVENT_POINTER:
+        apple_gfx_input_pointer(d, event->pointer.x, event->pointer.y,
+                                event->pointer.width, event->pointer.height,
+                                event->pointer.buttons);
+        break;
+    case APPLE_GFX_EVENT_WHEEL:
+        apple_gfx_input_wheel_axis(d, event->wheel.dy, INPUT_BUTTON_WHEEL_UP,
+                                   INPUT_BUTTON_WHEEL_DOWN);
+        apple_gfx_input_wheel_axis(d, event->wheel.dx,
+                                   INPUT_BUTTON_WHEEL_LEFT,
+                                   INPUT_BUTTON_WHEEL_RIGHT);
+        break;
+    case APPLE_GFX_EVENT_KEY:
+        apple_gfx_input_key(d, event->key.usage, event->key.down);
+        break;
+    case APPLE_GFX_EVENT_CLOSE:
+        apple_gfx_input_close();
         break;
     default:
         g_assert_not_reached();
@@ -474,6 +622,10 @@ static void apple_gfx_new_frame_cb(void *ctx)
 {
     AppleGFXDisplay *d = ctx;
     trace_apple_gfx_new_frame();
+    if (d->state->window) {
+        /* The window draws it; gfx_update renders the surface on demand. */
+        return;
+    }
     aio_bh_schedule_oneshot(qemu_get_aio_context(), new_frame_handler_bh, d);
 }
 
@@ -525,6 +677,50 @@ static void apple_gfx_cursor_move_cb(void *ctx)
     apple_gfx_event_push(apple_gfx_event_new(d, APPLE_GFX_EVENT_CURSOR_MOVE));
 }
 
+/*
+ * The window's callbacks. The library calls them on the process's main
+ * thread, which QEMU leaves in its run loop under -display none, without the
+ * BQL: they queue the input for the BQL, and never block.
+ */
+static void apple_gfx_window_pointer_cb(void *ctx, uint16_t x, uint16_t y,
+                                        uint16_t width, uint16_t height,
+                                        uint32_t buttons)
+{
+    AppleGFXEvent *event = apple_gfx_event_new(ctx, APPLE_GFX_EVENT_POINTER);
+
+    event->pointer.x = x;
+    event->pointer.y = y;
+    event->pointer.width = width;
+    event->pointer.height = height;
+    event->pointer.buttons = buttons;
+    apple_gfx_event_push(event);
+}
+
+/* dy above 0 is up, dx above 0 is left. */
+static void apple_gfx_window_wheel_cb(void *ctx, int32_t dy, int32_t dx)
+{
+    AppleGFXEvent *event = apple_gfx_event_new(ctx, APPLE_GFX_EVENT_WHEEL);
+
+    event->wheel.dy = dy;
+    event->wheel.dx = dx;
+    apple_gfx_event_push(event);
+}
+
+/* usage is a USB HID keyboard usage (page 0x07). */
+static void apple_gfx_window_key_cb(void *ctx, uint16_t usage, bool down)
+{
+    AppleGFXEvent *event = apple_gfx_event_new(ctx, APPLE_GFX_EVENT_KEY);
+
+    event->key.usage = usage;
+    event->key.down = down;
+    apple_gfx_event_push(event);
+}
+
+static void apple_gfx_window_close_cb(void *ctx)
+{
+    apple_gfx_event_push(apple_gfx_event_new(ctx, APPLE_GFX_EVENT_CLOSE));
+}
+
 static RvgDisplayMode *apple_gfx_new_display_modes(
     const AppleGFXDisplayMode display_modes[], uint32_t display_mode_count)
 {
@@ -542,6 +738,26 @@ static RvgDisplayMode *apple_gfx_new_display_modes(
     }
 
     return modes;
+}
+
+/*
+ * Window mode: under -display none, QEMU shows no display of its own, and the
+ * library opens a window for each, unless REIMS_VGPU_WINDOW is "0".
+ */
+static bool apple_gfx_window_wanted(void)
+{
+    static bool reported;
+    DisplayOptions *options = qmp_query_display_options(&error_abort);
+    bool window = options->type == DISPLAY_TYPE_NONE &&
+                  g_strcmp0(g_getenv("REIMS_VGPU_WINDOW"), "0") != 0;
+
+    qapi_free_DisplayOptions(options);
+    if (window && !reported) {
+        reported = true;
+        info_report("apple-gfx: -display none: each display opens a window "
+                    "of its own; REIMS_VGPU_WINDOW=0 keeps QEMU headless");
+    }
+    return window;
 }
 
 static void apple_gfx_events_free(AppleGFXState *s)
@@ -575,6 +791,19 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         .cursor_glyph = apple_gfx_cursor_glyph_cb,
         .cursor_show = apple_gfx_cursor_show_cb,
         .cursor_move = apple_gfx_cursor_move_cb,
+    };
+    RvgWindowCallbacks window_callbacks = {
+        .struct_size = sizeof(window_callbacks),
+        .pointer = apple_gfx_window_pointer_cb,
+        .wheel = apple_gfx_window_wheel_cb,
+        .key = apple_gfx_window_key_cb,
+        .close = apple_gfx_window_close_cb,
+    };
+    RvgWindowConfig window_config = {
+        .struct_size = sizeof(window_config),
+        /* The modes the host screen fits, unless display-modes names some. */
+        .flags = modes_property ? 0 : RVG_WINDOW_MATCH_HOST_SCREEN,
+        .callbacks = &window_callbacks,
     };
     RvgDisplayConfig display_config = {
         .struct_size = sizeof(display_config),
@@ -615,6 +844,7 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     qemu_mutex_init(&s->event_lock);
     QSIMPLEQ_INIT(&s->events);
     s->event_bh = qemu_bh_new(apple_gfx_event_bh, s);
+    s->window = apple_gfx_window_wanted();
     for (i = 0; i < s->num_displays; i++) {
         s->displays[i].state = s;
         s->displays[i].cursor_show = true;
@@ -632,13 +862,17 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         display_modes = s->display_modes;
         num_display_modes = s->num_display_modes;
     }
-    modes = apple_gfx_new_display_modes(display_modes, num_display_modes);
+    if (!s->window || modes_property) {
+        modes = apple_gfx_new_display_modes(display_modes, num_display_modes);
+    }
 
     for (i = 0; i < s->num_displays; i++) {
         AppleGFXDisplay *d = &s->displays[i];
 
         display_callbacks.ctx = d;
+        window_callbacks.ctx = d;
         display_config.port = i;
+        display_config.window = s->window ? &window_config : NULL;
         /*
          * The macOS guest ignores displays that share a serial number, those
          * of other instances of the device among them, so each display gets
@@ -652,7 +886,10 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
             goto fail;
         }
 
-        rvg_display_set_modes(d->pgdisp, modes, num_display_modes);
+        /* A window matching the host screen offers the guest its modes. */
+        if (modes) {
+            rvg_display_set_modes(d->pgdisp, modes, num_display_modes);
+        }
     }
 
     for (i = 0; i < s->num_displays; i++) {

@@ -38,7 +38,8 @@ typedef struct AppleGFXDisplay {
     QEMUCursor *cursor;
     DisplaySurface *surface;
     RvgFrameTarget *target; /* The surface's size, BGRA8; NULL if refused */
-    int8_t pending_frames; /* # guest frames in the rendering pipeline */
+    /* # guest frames in the rendering pipeline; in window mode, gfx_update's */
+    int8_t pending_frames;
     bool gfx_update_requested; /* QEMU display system wants a new frame */
     bool new_frame_ready; /* Guest has rendered a frame, ready to be used */
     uint32_t rendering_frame_width;
@@ -62,15 +63,23 @@ struct AppleGFXState {
     AppleGFXDisplayMode *display_modes;
     uint32_t num_display_modes;
     uint32_t num_displays; /* 1 to RVG_MAX_DISPLAY_PORTS, on ports 0 up */
+    /*
+     * Each display has a window of the library's, which draws its frames
+     * and sends its input (-display none, unless REIMS_VGPU_WINDOW=0).
+     */
+    bool window;
     AppleGFXDisplay displays[RVG_MAX_DISPLAY_PORTS];
 
     /*
-     * The display callbacks' cursor work, queued on the library's display
-     * thread and run under the BQL by event_bh.
+     * The display callbacks' cursor work and the windows' input, queued on
+     * the threads they come on and run under the BQL by event_bh.
      */
     QemuMutex event_lock;
     AppleGFXEventQueue events; /* event_lock protected */
     QEMUBH *event_bh;
+
+    /* Mutable state (BQL protected) */
+    uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
 };
 
 void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char* obj_name);
