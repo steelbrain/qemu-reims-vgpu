@@ -80,13 +80,15 @@ the host's screen, draws the guest's frames into it, and sends its pointer,
 wheel and keys to the guest's USB tablet and keyboard; closing a window
 powers the VM off. Each display then runs 1920x1080 at 1x, which the window
 scales to its size on the GPU, at the host screen's refresh rate;
-``-global apple-gfx-mmio.resolution=WxH`` picks another mode;
-``resolution=WxH@PPI`` also tells the guest the mode's density, so that at
-more than about 148 ppi it runs a HiDPI desktop at the mode's pixels, which
-the window shows one guest pixel per screen pixel (``2560x1600@200`` looks
-like 1280x800); and ``resolution=host`` offers the modes that fill the host's
-screen at its density (HiDPI on a Retina screen). The device's ``display-modes`` property,
-where given, sets the modes instead. Set
+``-global apple-gfx-mmio.resolution=WxH`` picks another mode, and
+``resolution=host`` offers the modes that fill the host's screen at its
+density (HiDPI on a Retina screen). ``resolution=WxH@PPI`` also tells the
+guest the mode's density, so that at more than about 148 ppi it runs a
+HiDPI desktop at the mode's pixels (``2560x1600@200`` looks like 1280x800).
+A window is sized by the scale the guest runs: on a Retina screen, a HiDPI
+guest's pixel is a screen pixel where half the mode fits on the screen, and
+a borderless window fits the image to its screen. The device's
+``display-modes`` property, where given, sets the modes instead. Set
 ``REIMS_VGPU_WINDOW=0`` in QEMU's environment to keep ``-display none``
 headless. Either way, ``screendump`` draws the display's current frame.
 
