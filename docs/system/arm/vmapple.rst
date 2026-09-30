@@ -89,3 +89,26 @@ screen at its density (HiDPI on a Retina screen). The device's ``display-modes``
 where given, sets the modes instead. Set
 ``REIMS_VGPU_WINDOW=0`` in QEMU's environment to keep ``-display none``
 headless. Either way, ``screendump`` draws the display's current frame.
+
+Input
+-----
+
+The machine gives the guest a USB keyboard and a USB pointing device,
+``usb-vmapple-tablet`` unless the machine's ``tablet`` property names another
+USB device: ``-M vmapple,tablet=usb-tablet`` gives it QEMU's usual USB
+tablet instead.
+
+``usb-vmapple-tablet`` is the pointing device Virtualization.framework gives
+its macOS guests: an absolute pointer with three buttons, a wheel and a
+horizontal wheel, whose reports also carry smooth scrolling, that is, the
+distance scrolled with the phases of the gesture it belongs to and of the
+momentum scrolling after it. macOS drives it with a driver of its own
+(AppleVirtualPlatformHIDEventDriver in macOS 13.6), and scrolls as it does
+with a trackpad: smooth scroll events, such as the ``scroll`` events of
+``input-send-event``, scroll the guest point by point, both ways, with the
+momentum the host gave the gesture. A wheel's notch scrolls a fixed 20
+pixels there. Other guests see a HID mouse with an absolute pointer and two
+wheels.
+
+With ``usb-tablet``, macOS scrolls by whole wheel notches, which it
+accelerates, vertically only.

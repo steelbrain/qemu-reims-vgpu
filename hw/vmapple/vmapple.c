@@ -68,6 +68,7 @@ struct VMAppleMachineState {
     MemoryRegion fw_mr;
     MemoryRegion ecam_alias;
     uint64_t uuid;
+    char *tablet;
 };
 
 #define TYPE_VMAPPLE_MACHINE   MACHINE_TYPE_NAME("vmapple")
@@ -450,7 +451,7 @@ static void create_pcie(VMAppleMachineState *vms)
         usb_bus = USB_BUS(object_resolve_type_unambiguous(TYPE_USB_BUS,
                                                           &error_fatal));
         usb_create_simple(usb_bus, "usb-kbd");
-        usb_create_simple(usb_bus, "usb-tablet");
+        usb_create_simple(usb_bus, vms->tablet);
     }
 }
 
@@ -616,6 +617,27 @@ static GlobalProperty vmapple_compat_defaults[] = {
     { TYPE_XHCI_PCI, "conditional-intr-mapping", "on" },
 };
 
+static char *vmapple_get_tablet(Object *obj, Error **errp)
+{
+    VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
+
+    return g_strdup(vms->tablet);
+}
+
+static void vmapple_set_tablet(Object *obj, const char *value, Error **errp)
+{
+    VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
+    ObjectClass *oc = object_class_by_name(value);
+
+    if (!oc || object_class_is_abstract(oc) ||
+        !object_class_dynamic_cast(oc, TYPE_USB_DEVICE)) {
+        error_setg(errp, "tablet: '%s' is not a USB device", value);
+        return;
+    }
+    g_free(vms->tablet);
+    vms->tablet = g_strdup(value);
+}
+
 static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -636,6 +658,14 @@ static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
 
     compat_props_add(mc->compat_props, vmapple_compat_defaults,
                      G_N_ELEMENTS(vmapple_compat_defaults));
+
+    object_class_property_add_str(oc, "tablet", vmapple_get_tablet,
+                                  vmapple_set_tablet);
+    object_class_property_set_description(oc, "tablet",
+                                          "The USB pointing device: "
+                                          "usb-vmapple-tablet (default), "
+                                          "or another USB device such as "
+                                          "usb-tablet");
 }
 
 static void vmapple_instance_init(Object *obj)
@@ -643,10 +673,22 @@ static void vmapple_instance_init(Object *obj)
     VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
 
     vms->irqmap = irqmap;
+    /*
+     * macOS drives Virtualization.framework's USB tablet with its own
+     * driver, which takes smooth scrolling.
+     */
+    vms->tablet = g_strdup("usb-vmapple-tablet");
 
     object_property_add_uint64_ptr(obj, "uuid", &vms->uuid,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "uuid", "Machine UUID (SDOM)");
+}
+
+static void vmapple_instance_finalize(Object *obj)
+{
+    VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
+
+    g_free(vms->tablet);
 }
 
 static const TypeInfo vmapple_machine_info = {
@@ -655,6 +697,7 @@ static const TypeInfo vmapple_machine_info = {
     .instance_size = sizeof(VMAppleMachineState),
     .class_init    = vmapple_machine_class_init,
     .instance_init = vmapple_instance_init,
+    .instance_finalize = vmapple_instance_finalize,
 };
 
 static void machvmapple_machine_init(void)
