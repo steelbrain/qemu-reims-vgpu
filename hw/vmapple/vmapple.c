@@ -32,7 +32,6 @@
 #include "hw/core/sysbus.h"
 #include "hw/usb/usb.h"
 #include "hw/arm/boot.h"
-#include "hw/arm/machines-qom.h"
 #include "hw/char/pl011.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gicv3_common.h"
@@ -644,7 +643,6 @@ static const TypeInfo vmapple_machine_info = {
     .instance_size = sizeof(VMAppleMachineState),
     .class_init    = vmapple_machine_class_init,
     .instance_init = vmapple_instance_init,
-    .interfaces    = aarch64_machine_interfaces
 };
 
 static void machvmapple_machine_init(void)
