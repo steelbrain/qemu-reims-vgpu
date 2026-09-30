@@ -773,6 +773,39 @@ static void apple_gfx_events_free(AppleGFXState *s)
     }
 }
 
+/*
+ * The mode a window display offers the guest first, from the resolution
+ * property: NULL is 1920x1080, "host" is none (0x0: the host screen's own
+ * modes, at its density), else "<width>x<height>", each 1 to 65535 pixels.
+ */
+static bool apple_gfx_parse_resolution(const char *str, uint16_t *width,
+                                       uint16_t *height, Error **errp)
+{
+    const char *endptr;
+    int w, h;
+
+    if (str == NULL) {
+        *width = 1920;
+        *height = 1080;
+        return true;
+    }
+    if (strcmp(str, "host") == 0) {
+        *width = 0;
+        *height = 0;
+        return true;
+    }
+    if (qemu_strtoi(str, &endptr, 10, &w) || w <= 0 || w > UINT16_MAX ||
+        *endptr != 'x' ||
+        qemu_strtoi(endptr + 1, NULL, 10, &h) || h <= 0 || h > UINT16_MAX) {
+        error_setg(errp, "apple-gfx: resolution must be <width>x<height>, "
+                   "each 1 to 65535 pixels, or host, not '%s'", str);
+        return false;
+    }
+    *width = w;
+    *height = h;
+    return true;
+}
+
 bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                               RvgDeviceConfig *config, Error **errp)
 {
@@ -799,9 +832,13 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         .key = apple_gfx_window_key_cb,
         .close = apple_gfx_window_close_cb,
     };
+    /*
+     * Unless display-modes names some, the library offers the resolution
+     * property's mode at 1x, or the host screen's own modes, at the host
+     * screen's refresh rate.
+     */
     RvgWindowConfig window_config = {
         .struct_size = sizeof(window_config),
-        /* The modes the host screen fits, unless display-modes names some. */
         .flags = modes_property ? 0 : RVG_WINDOW_MATCH_HOST_SCREEN,
         .callbacks = &window_callbacks,
     };
@@ -819,6 +856,10 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     if (s->num_displays < 1 || s->num_displays > RVG_MAX_DISPLAY_PORTS) {
         error_setg(errp, "apple-gfx: displays must be 1 to %u, not %" PRIu32,
                    RVG_MAX_DISPLAY_PORTS, s->num_displays);
+        return false;
+    }
+    if (!apple_gfx_parse_resolution(s->resolution, &window_config.mode_width,
+                                    &window_config.mode_height, errp)) {
         return false;
     }
 

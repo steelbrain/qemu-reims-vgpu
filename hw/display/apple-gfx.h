@@ -64,6 +64,11 @@ struct AppleGFXState {
     uint32_t num_display_modes;
     uint32_t num_displays; /* 1 to RVG_MAX_DISPLAY_PORTS, on ports 0 up */
     /*
+     * The mode a window display offers the guest first: "<width>x<height>",
+     * or "host" for the host screen's own modes; NULL is 1920x1080.
+     */
+    char *resolution;
+    /*
      * Each display has a window of the library's, which draws its frames
      * and sends its input (-display none, unless REIMS_VGPU_WINDOW=0).
      */

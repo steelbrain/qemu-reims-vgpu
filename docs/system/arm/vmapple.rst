@@ -78,7 +78,11 @@ apple-gfx-mmio.displays=N`` gives it N, up to 8, each with a console of its
 own. Under ``-display none``, reims-vgpu opens a window for each display on
 the host's screen, draws the guest's frames into it, and sends its pointer,
 wheel and keys to the guest's USB tablet and keyboard; closing a window
-powers the VM off. Each display is then offered modes that fit the host's
-screen, unless the device's ``display-modes`` property names some. Set
+powers the VM off. Each display then runs 1920x1080 at 1x, which the window
+scales to its size on the GPU, at the host screen's refresh rate;
+``-global apple-gfx-mmio.resolution=WxH`` picks another mode, and
+``resolution=host`` offers the modes that fill the host's screen at its
+density (HiDPI on a Retina screen). The device's ``display-modes`` property,
+where given, sets the modes instead. Set
 ``REIMS_VGPU_WINDOW=0`` in QEMU's environment to keep ``-display none``
 headless. Either way, ``screendump`` draws the display's current frame.
