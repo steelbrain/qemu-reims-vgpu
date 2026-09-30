@@ -840,11 +840,50 @@ static void apple_gfx_events_free(AppleGFXState *s)
 }
 
 /*
+ * The whole centimetres a macOS guest reads a mode @width pixels wide as,
+ * told @ppi pixels per inch: the library tells it width / (ppi / 25.46)
+ * millimetres, which the display's settings page holds as a float and in
+ * whole millimetres, rounded to nearest, and the guest rounds those up to
+ * whole centimetres.
+ */
+static uint64_t apple_gfx_guest_centimeters(int width, int ppi)
+{
+    float millimeters = width / (ppi / 25.46);
+    uint64_t whole = (uint64_t)((double)millimeters + 0.5);
+
+    return (whole + 9) / 10;
+}
+
+/*
+ * Whether the scale a macOS guest runs a mode @width pixels wide at, told
+ * @ppi pixels per inch, was never measured. Measured on macOS 13.6, the
+ * guest runs HiDPI from 2021 pixels across 35 whole centimetres (146.667
+ * ppi), for modes from 1920 pixels wide and 29 cm, and 1x at up to 3811
+ * pixels across 66 (146.666 ppi), for modes up to 3811 pixels wide. A mode
+ * 5832 pixels wide ran HiDPI at 128.8 ppi, and 1280x800 ran 1x at 216.7
+ * ppi across 15 cm.
+ */
+static bool apple_gfx_guest_scale_unknown(int width, int ppi)
+{
+    uint64_t cm = apple_gfx_guest_centimeters(width, ppi);
+    uint64_t w = width;
+
+    if (cm == 0) {
+        return true;
+    }
+    if (w * 35 >= 2021 * cm) {
+        return width < 1920 || cm < 29;
+    }
+    return width > 3811 || w * 66 > 3811 * cm;
+}
+
+/*
  * The mode a window display offers the guest first, from the resolution
  * property: NULL is 1920x1080, "host" is none (0x0: the host screen's own
  * modes, at its density), else "<width>x<height>", each 1 to 65535 pixels,
  * optionally followed by "@<ppi>", the density the guest is told for the
- * mode, 1 to 65535 pixels per inch. Without it *ppi is 0, which the library
+ * mode, 1 to 65535 pixels per inch, refused where the scale the guest runs
+ * the mode at was never measured. Without it *ppi is 0, which the library
  * takes as its 1x density.
  */
 static bool apple_gfx_parse_resolution(const char *str, uint16_t *width,
@@ -876,6 +915,13 @@ static bool apple_gfx_parse_resolution(const char *str, uint16_t *width,
         error_setg(errp, "apple-gfx: resolution must be <width>x<height>, "
                    "each 1 to 65535 pixels, optionally followed by @<ppi>, "
                    "1 to 65535, or host, not '%s'", str);
+        return false;
+    }
+    if (p != 0 && apple_gfx_guest_scale_unknown(w, p)) {
+        error_setg(errp, "apple-gfx: resolution '%s' tells a macOS guest "
+                   "%d pixels across %" PRIu64 " cm, where the scale it runs "
+                   "was never measured; choose another density", str, w,
+                   apple_gfx_guest_centimeters(w, p));
         return false;
     }
     *width = w;

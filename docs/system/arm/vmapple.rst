@@ -83,9 +83,15 @@ scales to its size on the GPU, at the host screen's refresh rate;
 ``-global apple-gfx-mmio.resolution=WxH`` picks another mode, and
 ``resolution=host`` offers the modes that fill the host's screen at its
 density (HiDPI on a Retina screen). ``resolution=WxH@PPI`` also tells the
-guest the mode's density, so that at more than about 148 ppi it runs a
-HiDPI desktop at the mode's pixels (``2560x1600@200`` looks like 1280x800).
-A window is sized by the scale the guest runs: on a Retina screen, a HiDPI
+guest the mode's density. A macOS 13.6 guest reads the width in whole
+centimetres, rounded up, and runs a HiDPI desktop at the mode's pixels where
+that comes to 146.67 ppi or more: ``2560x1600@148`` reads as 44 cm, 147.8
+ppi, and looks like 1280x800, where ``2560x1600@146`` reads as 45 cm, 144.5
+ppi, and runs at 1x. A density at which the guest's scale was never
+measured is refused: just below 146.67 ppi, below it for a mode wider than
+3811 pixels, which may run HiDPI anyway, and above it for a mode narrower
+than 1920 pixels or 29 cm, which may stay at 1x (``1280x800@220`` did). A
+window is sized by the scale the guest runs: on a Retina screen, a HiDPI
 guest's pixel is a screen pixel where half the mode fits on the screen, and
 a borderless window fits the image to its screen. The device's
 ``display-modes`` property, where given, sets the modes instead. Set
