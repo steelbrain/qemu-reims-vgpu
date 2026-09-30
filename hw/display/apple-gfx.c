@@ -343,6 +343,56 @@ static void apple_gfx_input_wheel_axis(AppleGFXDisplay *d, int32_t notches,
     }
 }
 
+/*
+ * A scroll event: smooth scrolling where the device that takes the wheel
+ * takes it, the event's notches elsewhere.
+ */
+static void apple_gfx_input_scroll(AppleGFXDisplay *d,
+                                   const RvgWindowScroll *scroll)
+{
+    static const InputScrollPhase phases[] = {
+        [RVG_WINDOW_SCROLL_PHASE_NONE] = INPUT_SCROLL_PHASE_NONE,
+        [RVG_WINDOW_SCROLL_PHASE_MAY_BEGIN] = INPUT_SCROLL_PHASE_MAY_BEGIN,
+        [RVG_WINDOW_SCROLL_PHASE_BEGAN] = INPUT_SCROLL_PHASE_BEGAN,
+        [RVG_WINDOW_SCROLL_PHASE_CHANGED] = INPUT_SCROLL_PHASE_CHANGED,
+        [RVG_WINDOW_SCROLL_PHASE_ENDED] = INPUT_SCROLL_PHASE_ENDED,
+        [RVG_WINDOW_SCROLL_PHASE_CANCELLED] = INPUT_SCROLL_PHASE_CANCELLED,
+    };
+    static const InputScrollMomentum momenta[] = {
+        [RVG_WINDOW_SCROLL_MOMENTUM_NONE] = INPUT_SCROLL_MOMENTUM_NONE,
+        [RVG_WINDOW_SCROLL_MOMENTUM_BEGAN] = INPUT_SCROLL_MOMENTUM_BEGAN,
+        [RVG_WINDOW_SCROLL_MOMENTUM_CHANGED] = INPUT_SCROLL_MOMENTUM_CHANGED,
+        [RVG_WINDOW_SCROLL_MOMENTUM_ENDED] = INPUT_SCROLL_MOMENTUM_ENDED,
+    };
+    InputScrollPhase phase = INPUT_SCROLL_PHASE_NONE;
+    InputScrollMomentum momentum = INPUT_SCROLL_MOMENTUM_NONE;
+
+    if (!qemu_input_scrolls_smoothly(d->con)) {
+        apple_gfx_input_wheel_axis(d, scroll->notches_dy,
+                                   INPUT_BUTTON_WHEEL_UP,
+                                   INPUT_BUTTON_WHEEL_DOWN);
+        apple_gfx_input_wheel_axis(d, scroll->notches_dx,
+                                   INPUT_BUTTON_WHEEL_LEFT,
+                                   INPUT_BUTTON_WHEEL_RIGHT);
+        return;
+    }
+    if (scroll->phase < ARRAY_SIZE(phases)) {
+        phase = phases[scroll->phase];
+    }
+    if (scroll->momentum < ARRAY_SIZE(momenta)) {
+        momentum = momenta[scroll->momentum];
+    }
+    /*
+     * 1/256 of the host's point, as 1/256 pixel, which a macOS guest scrolls
+     * as its point.
+     */
+    qemu_input_queue_scroll(d->con, INPUT_AXIS_Y, scroll->dy, phase,
+                            momentum);
+    qemu_input_queue_scroll(d->con, INPUT_AXIS_X, scroll->dx, phase,
+                            momentum);
+    qemu_input_event_sync();
+}
+
 static void apple_gfx_input_key(AppleGFXDisplay *d, uint16_t usage,
                                 bool down)
 {
@@ -377,6 +427,7 @@ typedef enum AppleGFXEventKind {
     APPLE_GFX_EVENT_CURSOR_MOVE,
     APPLE_GFX_EVENT_POINTER,
     APPLE_GFX_EVENT_WHEEL,
+    APPLE_GFX_EVENT_SCROLL,
     APPLE_GFX_EVENT_KEY,
     APPLE_GFX_EVENT_CLOSE,
 } AppleGFXEventKind;
@@ -399,6 +450,7 @@ struct AppleGFXEvent {
             int32_t dy;
             int32_t dx;
         } wheel;
+        RvgWindowScroll scroll;
         struct {
             uint16_t usage;
             bool down;
@@ -458,6 +510,9 @@ static void apple_gfx_event_run(AppleGFXEvent *event)
         apple_gfx_input_wheel_axis(d, event->wheel.dx,
                                    INPUT_BUTTON_WHEEL_LEFT,
                                    INPUT_BUTTON_WHEEL_RIGHT);
+        break;
+    case APPLE_GFX_EVENT_SCROLL:
+        apple_gfx_input_scroll(d, &event->scroll);
         break;
     case APPLE_GFX_EVENT_KEY:
         apple_gfx_input_key(d, event->key.usage, event->key.down);
@@ -706,6 +761,17 @@ static void apple_gfx_window_wheel_cb(void *ctx, int32_t dy, int32_t dx)
     apple_gfx_event_push(event);
 }
 
+static void apple_gfx_window_scroll_cb(void *ctx,
+                                       const RvgWindowScroll *scroll)
+{
+    AppleGFXEvent *event = apple_gfx_event_new(ctx, APPLE_GFX_EVENT_SCROLL);
+
+    /* The fields the library's version has; the rest stay 0. */
+    memcpy(&event->scroll, scroll,
+           MIN(scroll->struct_size, sizeof(event->scroll)));
+    apple_gfx_event_push(event);
+}
+
 /* usage is a USB HID keyboard usage (page 0x07). */
 static void apple_gfx_window_key_cb(void *ctx, uint16_t usage, bool down)
 {
@@ -843,6 +909,7 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         .wheel = apple_gfx_window_wheel_cb,
         .key = apple_gfx_window_key_cb,
         .close = apple_gfx_window_close_cb,
+        .scroll = apple_gfx_window_scroll_cb,
     };
     /*
      * Unless display-modes names some, the library offers the resolution
