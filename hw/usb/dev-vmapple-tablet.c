@@ -37,6 +37,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "hw/usb/usb.h"
@@ -692,6 +693,7 @@ static void usb_vmapple_tablet_unrealize(USBDevice *dev)
 
 static void usb_vmapple_tablet_realize(USBDevice *dev, Error **errp)
 {
+    ERRP_GUARD();
     USBVMAppleTabletState *s = USB_VMAPPLE_TABLET(dev);
 
     dev->usb_desc = &desc_vmapple_tablet;
@@ -701,6 +703,10 @@ static void usb_vmapple_tablet_realize(USBDevice *dev, Error **errp)
     s->hs = qemu_input_handler_register(DEVICE(dev), &vmapple_tablet_handler);
     if (s->display) {
         qemu_input_handler_bind(s->hs, s->display, s->head, errp);
+        if (*errp) {
+            /* A device that fails to realize is freed, not unrealized. */
+            g_clear_pointer(&s->hs, qemu_input_handler_unregister);
+        }
     }
 }
 
