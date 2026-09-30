@@ -106,6 +106,8 @@ static const Property apple_gfx_pci_properties[] = {
     DEFINE_PROP_ARRAY("display-modes", AppleGFXPCIState,
                       common.num_display_modes, common.display_modes,
                       qdev_prop_apple_gfx_display_mode, AppleGFXDisplayMode),
+    /* The guest's display ports, 1 to RVG_MAX_DISPLAY_PORTS. */
+    DEFINE_PROP_UINT32("displays", AppleGFXPCIState, common.num_displays, 1),
 };
 
 static void apple_gfx_pci_class_init(ObjectClass *klass, const void *data)

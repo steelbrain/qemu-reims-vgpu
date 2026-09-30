@@ -14,6 +14,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qemu/lockable.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qapi/visitor.h"
@@ -42,7 +43,7 @@ static uint32_t next_pgdisplay_serial_num = 1;
  * surface had when the render started, then copied into the surface.
  */
 typedef struct AppleGFXRenderJob {
-    AppleGFXState *s;
+    AppleGFXDisplay *d;
     RvgFrameTarget *target;
     bool encoded;
 } AppleGFXRenderJob;
@@ -60,7 +61,7 @@ static int apple_gfx_do_render(void *opaque)
      * display's lock, which a guest present holds while it may wait for the
      * main loop.
      */
-    status = rvg_display_encode_frame(job->s->pgdisp, job->target, NULL,
+    status = rvg_display_encode_frame(job->d->pgdisp, job->target, NULL,
                                       &frame);
     job->encoded = status == RVG_OK;
     if (job->encoded) {
@@ -77,83 +78,84 @@ static int apple_gfx_do_render(void *opaque)
     return 0;
 }
 
-static void apple_gfx_render_new_frame(AppleGFXState *s)
+static void apple_gfx_render_new_frame(AppleGFXDisplay *d)
 {
     AppleGFXRenderJob *job = g_new0(AppleGFXRenderJob, 1);
 
     assert(bql_locked());
-    job->s = s;
+    job->d = d;
     /* NULL where set_mode's target was refused: the encode then refuses. */
-    job->target = s->target ? rvg_frame_target_retain(s->target) : NULL;
+    job->target = d->target ? rvg_frame_target_retain(d->target) : NULL;
 
-    s->rendering_frame_width = surface_width(s->surface);
-    s->rendering_frame_height = surface_height(s->surface);
+    d->rendering_frame_width = surface_width(d->surface);
+    d->rendering_frame_height = surface_height(d->surface);
 
-    thread_pool_submit_immediate(s->pool, apple_gfx_do_render, job, NULL);
+    thread_pool_submit_immediate(d->state->pool, apple_gfx_do_render, job,
+                                 NULL);
 }
 
 static void apple_gfx_render_frame_completed_bh(void *opaque)
 {
     AppleGFXRenderJob *job = opaque;
-    AppleGFXState *s = job->s;
-    DisplaySurface *surface = s->surface;
+    AppleGFXDisplay *d = job->d;
+    DisplaySurface *surface = d->surface;
 
-    --s->pending_frames;
-    assert(s->pending_frames >= 0);
+    --d->pending_frames;
+    assert(d->pending_frames >= 0);
 
     /* Only update display if mode hasn't changed since we started rendering. */
     if (job->encoded &&
-        s->rendering_frame_width == surface_width(surface) &&
-        s->rendering_frame_height == surface_height(surface)) {
+        d->rendering_frame_width == surface_width(surface) &&
+        d->rendering_frame_height == surface_height(surface)) {
         /* The target has the surface's size and pixman's x8r8g8b8 layout. */
         rvg_frame_target_read_pixels(job->target, surface_data(surface),
                                      surface_stride(surface),
                                      (size_t)surface_stride(surface) *
                                      surface_height(surface));
-        if (s->gfx_update_requested) {
-            s->gfx_update_requested = false;
-            qemu_console_update_full(s->con);
-            qemu_console_hw_update_done(s->con);
-            s->new_frame_ready = false;
+        if (d->gfx_update_requested) {
+            d->gfx_update_requested = false;
+            qemu_console_update_full(d->con);
+            qemu_console_hw_update_done(d->con);
+            d->new_frame_ready = false;
         } else {
-            s->new_frame_ready = true;
+            d->new_frame_ready = true;
         }
     }
     rvg_frame_target_release(job->target);
     g_free(job);
 
-    if (s->pending_frames > 0) {
-        apple_gfx_render_new_frame(s);
+    if (d->pending_frames > 0) {
+        apple_gfx_render_new_frame(d);
     }
 }
 
 static void new_frame_handler_bh(void *opaque)
 {
-    AppleGFXState *s = opaque;
+    AppleGFXDisplay *d = opaque;
 
     /* Drop frames if guest gets too far ahead. */
-    if (s->pending_frames >= 2) {
+    if (d->pending_frames >= 2) {
         return;
     }
-    ++s->pending_frames;
-    if (s->pending_frames > 1) {
+    ++d->pending_frames;
+    if (d->pending_frames > 1) {
         return;
     }
 
-    apple_gfx_render_new_frame(s);
+    apple_gfx_render_new_frame(d);
 }
 
 static bool apple_gfx_fb_update_display(void *opaque)
 {
-    AppleGFXState *s = opaque;
+    AppleGFXDisplay *d = opaque;
     bool done = true;
 
     assert(bql_locked());
-    if (s->new_frame_ready) {
-        qemu_console_update_full(s->con);
-        s->new_frame_ready = false;
-    } else if (s->pending_frames > 0) {
-        s->gfx_update_requested = true;
+    if (d->new_frame_ready) {
+        qemu_console_update_full(d->con);
+        d->new_frame_ready = false;
+    } else if (d->pending_frames > 0) {
+        d->gfx_update_requested = true;
         done = false;
     }
 
@@ -166,7 +168,7 @@ static const GraphicHwOps apple_gfx_fb_ops = {
 
 /* ------ Mouse cursor and display mode setting ------ */
 
-static void set_mode(AppleGFXState *s, uint32_t width, uint32_t height)
+static void set_mode(AppleGFXDisplay *d, uint32_t width, uint32_t height)
 {
     RvgFrameTargetConfig target_config = {
         .struct_size = sizeof(target_config),
@@ -177,19 +179,20 @@ static void set_mode(AppleGFXState *s, uint32_t width, uint32_t height)
     };
     RvgStatus status;
 
-    if (s->surface &&
-        width == surface_width(s->surface) &&
-        height == surface_height(s->surface)) {
+    if (d->surface &&
+        width == surface_width(d->surface) &&
+        height == surface_height(d->surface)) {
         return;
     }
 
     /* A render under way keeps its own reference. */
-    rvg_frame_target_release(s->target);
-    s->target = NULL;
+    rvg_frame_target_release(d->target);
+    d->target = NULL;
 
-    s->surface = qemu_create_displaysurface(width, height);
+    d->surface = qemu_create_displaysurface(width, height);
 
-    status = rvg_frame_target_create(s->pgdev, &target_config, &s->target);
+    status = rvg_frame_target_create(d->state->pgdev, &target_config,
+                                     &d->target);
     if (status != RVG_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: rvg_frame_target_create(%" PRIu32 "x%" PRIu32
@@ -197,56 +200,47 @@ static void set_mode(AppleGFXState *s, uint32_t width, uint32_t height)
                       rvg_status_message(status));
     }
 
-    qemu_console_set_surface(s->con, s->surface);
+    qemu_console_set_surface(d->con, d->surface);
 }
 
-static void update_cursor(AppleGFXState *s)
+static void update_cursor(AppleGFXDisplay *d)
 {
     RvgDisplayCoord position;
 
     assert(bql_locked());
-    position = rvg_display_cursor_position(s->pgdisp);
-    qemu_console_set_mouse(s->con, position.x, position.y,
-                           qatomic_read(&s->cursor_show));
+    position = rvg_display_cursor_position(d->pgdisp);
+    qemu_console_set_mouse(d->con, position.x, position.y, d->cursor_show);
 }
 
-static void update_cursor_bh(void *opaque)
-{
-    AppleGFXState *s = opaque;
-    update_cursor(s);
-}
-
-typedef struct AppleGFXSetCursorGlyphJob {
-    AppleGFXState *s;
-    /* A copy of the RvgCursorGlyph, which is borrowed for its callback. */
+/* A copy of the RvgCursorGlyph, which is borrowed for its callback. */
+typedef struct AppleGFXCursorGlyph {
     uint8_t *rgba;
     uint32_t width;
     uint32_t height;
     RvgDisplayCoord hot_spot;
-} AppleGFXSetCursorGlyphJob;
+} AppleGFXCursorGlyph;
 
-static void set_cursor_glyph(void *opaque)
+static void set_cursor_glyph(AppleGFXDisplay *d,
+                             const AppleGFXCursorGlyph *glyph)
 {
-    AppleGFXSetCursorGlyphJob *job = opaque;
-    AppleGFXState *s = job->s;
-    const uint8_t *px_data = job->rgba;
+    const uint8_t *px_data = glyph->rgba;
     uint32_t *dest_px;
 
     /* An RvgCursorGlyph has 32 bits a pixel, and width * 4 bytes a row. */
-    trace_apple_gfx_cursor_set(32, job->width, job->height);
+    trace_apple_gfx_cursor_set(32, glyph->width, glyph->height);
 
-    if (s->cursor) {
-        cursor_unref(s->cursor);
-        s->cursor = NULL;
+    if (d->cursor) {
+        cursor_unref(d->cursor);
+        d->cursor = NULL;
     }
 
-    s->cursor = cursor_alloc(job->width, job->height);
-    s->cursor->hot_x = job->hot_spot.x;
-    s->cursor->hot_y = job->hot_spot.y;
+    d->cursor = cursor_alloc(glyph->width, glyph->height);
+    d->cursor->hot_x = glyph->hot_spot.x;
+    d->cursor->hot_y = glyph->hot_spot.y;
 
-    dest_px = s->cursor->data;
-    for (uint32_t y = 0; y < job->height; ++y) {
-        for (uint32_t x = 0; x < job->width; ++x) {
+    dest_px = d->cursor->data;
+    for (uint32_t y = 0; y < glyph->height; ++y) {
+        for (uint32_t x = 0; x < glyph->width; ++x) {
             /*
              * RvgCursorGlyph's red & blue channels are swapped compared to
              * QEMUCursor's.
@@ -260,11 +254,94 @@ static void set_cursor_glyph(void *opaque)
             px_data += 4;
         }
     }
-    qemu_console_set_cursor(s->con, s->cursor);
-    update_cursor(s);
+    qemu_console_set_cursor(d->con, d->cursor);
+    update_cursor(d);
+}
 
-    g_free(job->rgba);
-    g_free(job);
+/* ------ Callbacks' work under the BQL ------ */
+
+typedef enum AppleGFXEventKind {
+    APPLE_GFX_EVENT_CURSOR_GLYPH,
+    APPLE_GFX_EVENT_CURSOR_SHOW,
+    APPLE_GFX_EVENT_CURSOR_MOVE,
+} AppleGFXEventKind;
+
+struct AppleGFXEvent {
+    QSIMPLEQ_ENTRY(AppleGFXEvent) next;
+    AppleGFXDisplay *d;
+    AppleGFXEventKind kind;
+    union {
+        AppleGFXCursorGlyph glyph;
+        bool show;
+    };
+};
+
+static AppleGFXEvent *apple_gfx_event_new(AppleGFXDisplay *d,
+                                          AppleGFXEventKind kind)
+{
+    AppleGFXEvent *event = g_new0(AppleGFXEvent, 1);
+
+    event->d = d;
+    event->kind = kind;
+    return event;
+}
+
+/*
+ * Queues @event behind every earlier one, on any thread. One-shot BHs
+ * scheduled together run in the reverse order, so each device has one BH,
+ * which runs its events in the order they were queued.
+ */
+static void apple_gfx_event_push(AppleGFXEvent *event)
+{
+    AppleGFXState *s = event->d->state;
+
+    WITH_QEMU_LOCK_GUARD(&s->event_lock) {
+        QSIMPLEQ_INSERT_TAIL(&s->events, event, next);
+    }
+    qemu_bh_schedule(s->event_bh);
+}
+
+static void apple_gfx_event_run(AppleGFXEvent *event)
+{
+    AppleGFXDisplay *d = event->d;
+
+    switch (event->kind) {
+    case APPLE_GFX_EVENT_CURSOR_GLYPH:
+        set_cursor_glyph(d, &event->glyph);
+        g_free(event->glyph.rgba);
+        break;
+    case APPLE_GFX_EVENT_CURSOR_SHOW:
+        d->cursor_show = event->show;
+        update_cursor(d);
+        break;
+    case APPLE_GFX_EVENT_CURSOR_MOVE:
+        update_cursor(d);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static void apple_gfx_event_bh(void *opaque)
+{
+    AppleGFXState *s = opaque;
+    AppleGFXEvent *event;
+
+    assert(bql_locked());
+    /* One at a time, so a nested run still takes them in order. */
+    for (;;) {
+        WITH_QEMU_LOCK_GUARD(&s->event_lock) {
+            event = QSIMPLEQ_FIRST(&s->events);
+            if (event) {
+                QSIMPLEQ_REMOVE_HEAD(&s->events, next);
+            }
+        }
+        if (event == NULL) {
+            break;
+        }
+        apple_gfx_event_run(event);
+        g_free(event);
+    }
 }
 
 /* ------ Memory-mapped device I/O operations ------ */
@@ -395,15 +472,15 @@ GArray *apple_gfx_new_memory_ranges(void)
  */
 static void apple_gfx_new_frame_cb(void *ctx)
 {
-    AppleGFXState *s = ctx;
+    AppleGFXDisplay *d = ctx;
     trace_apple_gfx_new_frame();
-    aio_bh_schedule_oneshot(qemu_get_aio_context(), new_frame_handler_bh, s);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), new_frame_handler_bh, d);
 }
 
 static void apple_gfx_mode_change_cb(void *ctx, uint16_t width,
                                      uint16_t height, uint32_t pixel_format)
 {
-    AppleGFXState *s = ctx;
+    AppleGFXDisplay *d = ctx;
     trace_apple_gfx_mode_change(width, height);
 
     /*
@@ -411,39 +488,41 @@ static void apple_gfx_mode_change_cb(void *ctx, uint16_t width,
      * after it runs.
      */
     BQL_LOCK_GUARD();
-    set_mode(s, width, height);
+    set_mode(d, width, height);
 }
 
 static void apple_gfx_cursor_glyph_cb(void *ctx, const RvgCursorGlyph *glyph)
 {
-    AppleGFXState *s = ctx;
-    AppleGFXSetCursorGlyphJob *job = g_new0(AppleGFXSetCursorGlyphJob, 1);
+    AppleGFXDisplay *d = ctx;
+    AppleGFXEvent *event = apple_gfx_event_new(d,
+                                               APPLE_GFX_EVENT_CURSOR_GLYPH);
     /* height rows of width * 4 bytes */
     size_t length = (size_t)glyph->width * 4 * glyph->height;
 
-    job->s = s;
-    job->width = glyph->width;
-    job->height = glyph->height;
-    job->hot_spot = glyph->hot_spot;
-    job->rgba = g_malloc0(length);
-    memcpy(job->rgba, glyph->rgba, MIN(glyph->rgba_length, length));
-    aio_bh_schedule_oneshot(qemu_get_aio_context(), set_cursor_glyph, job);
+    event->glyph.width = glyph->width;
+    event->glyph.height = glyph->height;
+    event->glyph.hot_spot = glyph->hot_spot;
+    event->glyph.rgba = g_malloc0(length);
+    memcpy(event->glyph.rgba, glyph->rgba, MIN(glyph->rgba_length, length));
+    apple_gfx_event_push(event);
 }
 
 /* show is the guest's byte: any value but 0 shows the cursor. */
 static void apple_gfx_cursor_show_cb(void *ctx, uint8_t show)
 {
-    AppleGFXState *s = ctx;
+    AppleGFXDisplay *d = ctx;
+    AppleGFXEvent *event = apple_gfx_event_new(d, APPLE_GFX_EVENT_CURSOR_SHOW);
+
     trace_apple_gfx_cursor_show(show);
-    qatomic_set(&s->cursor_show, show != 0);
-    aio_bh_schedule_oneshot(qemu_get_aio_context(), update_cursor_bh, s);
+    event->show = show != 0;
+    apple_gfx_event_push(event);
 }
 
 static void apple_gfx_cursor_move_cb(void *ctx)
 {
-    AppleGFXState *s = ctx;
+    AppleGFXDisplay *d = ctx;
     trace_apple_gfx_cursor_move();
-    aio_bh_schedule_oneshot(qemu_get_aio_context(), update_cursor_bh, s);
+    apple_gfx_event_push(apple_gfx_event_new(d, APPLE_GFX_EVENT_CURSOR_MOVE));
 }
 
 static RvgDisplayMode *apple_gfx_new_display_modes(
@@ -465,6 +544,19 @@ static RvgDisplayMode *apple_gfx_new_display_modes(
     return modes;
 }
 
+static void apple_gfx_events_free(AppleGFXState *s)
+{
+    AppleGFXEvent *event;
+
+    while ((event = QSIMPLEQ_FIRST(&s->events)) != NULL) {
+        QSIMPLEQ_REMOVE_HEAD(&s->events, next);
+        if (event->kind == APPLE_GFX_EVENT_CURSOR_GLYPH) {
+            g_free(event->glyph.rgba);
+        }
+        g_free(event);
+    }
+}
+
 bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                               RvgDeviceConfig *config, Error **errp)
 {
@@ -473,10 +565,11 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     g_autofree RvgDisplayMode *modes = NULL;
     const AppleGFXDisplayMode *display_modes = apple_gfx_default_modes;
     uint32_t num_display_modes = ARRAY_SIZE(apple_gfx_default_modes);
+    bool modes_property = s->display_modes != NULL &&
+                          s->num_display_modes > 0;
     RvgMemoryMap memory_map;
     RvgDisplayCallbacks display_callbacks = {
         .struct_size = sizeof(display_callbacks),
-        .ctx = s,
         .mode_change = apple_gfx_mode_change_cb,
         .new_frame = apple_gfx_new_frame_cb,
         .cursor_glyph = apple_gfx_cursor_glyph_cb,
@@ -485,7 +578,6 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     };
     RvgDisplayConfig display_config = {
         .struct_size = sizeof(display_config),
-        .port = 0,
         .name = display_name,
         .name_length = sizeof(display_name) - 1,
         .width_millimeters = 400., /* A 20" display */
@@ -493,6 +585,13 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         .callbacks = &display_callbacks,
     };
     RvgStatus status;
+    uint32_t i;
+
+    if (s->num_displays < 1 || s->num_displays > RVG_MAX_DISPLAY_PORTS) {
+        error_setg(errp, "apple-gfx: displays must be 1 to %u, not %" PRIu32,
+                   RVG_MAX_DISPLAY_PORTS, s->num_displays);
+        return false;
+    }
 
     if (apple_gfx_mig_blocker == NULL) {
         error_setg(&apple_gfx_mig_blocker,
@@ -508,12 +607,18 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         .ranges = (const RvgMemoryRange *)memory_ranges->data,
         .range_count = memory_ranges->len,
     };
-    config->display_port_count = 1;
+    config->display_port_count = s->num_displays;
     config->metal_registry_id = 0; /* the system's default Metal device */
     config->memory_map = &memory_map;
 
     s->pool = thread_pool_new();
-    s->cursor_show = true;
+    qemu_mutex_init(&s->event_lock);
+    QSIMPLEQ_INIT(&s->events);
+    s->event_bh = qemu_bh_new(apple_gfx_event_bh, s);
+    for (i = 0; i < s->num_displays; i++) {
+        s->displays[i].state = s;
+        s->displays[i].cursor_show = true;
+    }
 
     status = rvg_device_create(config, &s->pgdev);
     if (status != RVG_OK) {
@@ -522,38 +627,54 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         goto fail;
     }
 
-    /*
-     * Although the library does, this integration currently does not support
-     * multiple virtual displays connected to a single PV graphics device.
-     * It is however possible to create
-     * more than one instance of the device, each with one display. The macOS
-     * guest will ignore these displays if they share the same serial number,
-     * so ensure each instance gets a unique one.
-     */
-    display_config.serial_number = next_pgdisplay_serial_num++;
-    status = rvg_display_create(s->pgdev, &display_config, &s->pgdisp);
-    if (status != RVG_OK) {
-        error_setg(errp, "apple-gfx: rvg_display_create: %s",
-                   rvg_status_message(status));
-        goto fail;
-    }
-
-    if (s->display_modes != NULL && s->num_display_modes > 0) {
+    if (modes_property) {
         trace_apple_gfx_common_realize_modes_property(s->num_display_modes);
         display_modes = s->display_modes;
         num_display_modes = s->num_display_modes;
     }
     modes = apple_gfx_new_display_modes(display_modes, num_display_modes);
-    rvg_display_set_modes(s->pgdisp, modes, num_display_modes);
 
-    s->con = qemu_graphic_console_create(dev, 0, &apple_gfx_fb_ops, s);
+    for (i = 0; i < s->num_displays; i++) {
+        AppleGFXDisplay *d = &s->displays[i];
+
+        display_callbacks.ctx = d;
+        display_config.port = i;
+        /*
+         * The macOS guest ignores displays that share a serial number, those
+         * of other instances of the device among them, so each display gets
+         * a unique one.
+         */
+        display_config.serial_number = next_pgdisplay_serial_num++;
+        status = rvg_display_create(s->pgdev, &display_config, &d->pgdisp);
+        if (status != RVG_OK) {
+            error_setg(errp, "apple-gfx: rvg_display_create: %s",
+                       rvg_status_message(status));
+            goto fail;
+        }
+
+        rvg_display_set_modes(d->pgdisp, modes, num_display_modes);
+    }
+
+    for (i = 0; i < s->num_displays; i++) {
+        s->displays[i].con = qemu_graphic_console_create(dev, i,
+                                                         &apple_gfx_fb_ops,
+                                                         &s->displays[i]);
+    }
     return true;
 
 fail:
+    for (i = s->num_displays; i-- > 0;) {
+        rvg_display_release(s->displays[i].pgdisp);
+        s->displays[i].pgdisp = NULL;
+    }
     rvg_device_release(s->pgdev);
     s->pgdev = NULL;
     thread_pool_free(s->pool);
     s->pool = NULL;
+    qemu_bh_delete(s->event_bh);
+    s->event_bh = NULL;
+    apple_gfx_events_free(s);
+    qemu_mutex_destroy(&s->event_lock);
     return false;
 }
 
