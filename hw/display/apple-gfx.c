@@ -776,14 +776,19 @@ static void apple_gfx_events_free(AppleGFXState *s)
 /*
  * The mode a window display offers the guest first, from the resolution
  * property: NULL is 1920x1080, "host" is none (0x0: the host screen's own
- * modes, at its density), else "<width>x<height>", each 1 to 65535 pixels.
+ * modes, at its density), else "<width>x<height>", each 1 to 65535 pixels,
+ * optionally followed by "@<ppi>", the density the guest is told for the
+ * mode, 1 to 65535 pixels per inch. Without it *ppi is 0, which the library
+ * takes as its 1x density.
  */
 static bool apple_gfx_parse_resolution(const char *str, uint16_t *width,
-                                       uint16_t *height, Error **errp)
+                                       uint16_t *height, double *ppi,
+                                       Error **errp)
 {
     const char *endptr;
-    int w, h;
+    int w, h, p = 0;
 
+    *ppi = 0;
     if (str == NULL) {
         *width = 1920;
         *height = 1080;
@@ -796,13 +801,20 @@ static bool apple_gfx_parse_resolution(const char *str, uint16_t *width,
     }
     if (qemu_strtoi(str, &endptr, 10, &w) || w <= 0 || w > UINT16_MAX ||
         *endptr != 'x' ||
-        qemu_strtoi(endptr + 1, NULL, 10, &h) || h <= 0 || h > UINT16_MAX) {
+        qemu_strtoi(endptr + 1, &endptr, 10, &h) || h <= 0 ||
+        h > UINT16_MAX ||
+        (*endptr == '@' &&
+         (qemu_strtoi(endptr + 1, NULL, 10, &p) || p <= 0 ||
+          p > UINT16_MAX)) ||
+        (*endptr != '@' && *endptr != '\0')) {
         error_setg(errp, "apple-gfx: resolution must be <width>x<height>, "
-                   "each 1 to 65535 pixels, or host, not '%s'", str);
+                   "each 1 to 65535 pixels, optionally followed by @<ppi>, "
+                   "1 to 65535, or host, not '%s'", str);
         return false;
     }
     *width = w;
     *height = h;
+    *ppi = p;
     return true;
 }
 
@@ -834,8 +846,8 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     };
     /*
      * Unless display-modes names some, the library offers the resolution
-     * property's mode at 1x, or the host screen's own modes, at the host
-     * screen's refresh rate.
+     * property's mode at 1x or at the density it names, or the host screen's
+     * own modes, at the host screen's refresh rate.
      */
     RvgWindowConfig window_config = {
         .struct_size = sizeof(window_config),
@@ -859,7 +871,9 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         return false;
     }
     if (!apple_gfx_parse_resolution(s->resolution, &window_config.mode_width,
-                                    &window_config.mode_height, errp)) {
+                                    &window_config.mode_height,
+                                    &window_config.mode_pixels_per_inch,
+                                    errp)) {
         return false;
     }
 
