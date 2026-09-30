@@ -504,6 +504,18 @@ static void mach_vmapple_init(MachineState *machine)
         object_property_set_int(cpu, "psci-conduit", QEMU_PSCI_CONDUIT_HVC,
                                 &error_fatal);
 
+        /*
+         * macOS asks the hypervisor to program its pointer authentication
+         * keys, through the paravirtualized calls SMCCC 0xC1000000 to
+         * 0xC1000006. Hypervisor.framework answers them itself, without an
+         * exit to QEMU, and programs no key: the guest runs on the keys
+         * each CPU holds. The boot firmware sets them on the boot CPU
+         * only, so start each CPU the guest powers on with the keys of
+         * the CPU that powers it on, and all CPUs share them.
+         */
+        object_property_set_bool(cpu, "cpu-on-copies-pauth-keys", true,
+                                 &error_fatal);
+
         /* Secondary CPUs start in PSCI powered-down state */
         if (n > 0) {
             object_property_set_bool(cpu, "start-powered-off", true,
