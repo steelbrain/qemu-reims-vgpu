@@ -1121,6 +1121,73 @@
               'value'      : 'int' } }
 
 ##
+# @InputScrollPhase:
+#
+# Phase of a scroll gesture, such as two fingers moving on a touchpad.
+#
+# @none: The scroll is not part of a gesture.
+#
+# @may-begin: Fingers rest on the device, and a gesture may begin.
+#
+# @began: A gesture began.
+#
+# @changed: A gesture moved.
+#
+# @ended: A gesture ended.
+#
+# @cancelled: A gesture was cancelled.
+#
+# Since: 11.2
+##
+{ 'enum'  : 'InputScrollPhase',
+  'data'  : [ 'none', 'may-begin', 'began', 'changed', 'ended',
+              'cancelled' ] }
+
+##
+# @InputScrollMomentum:
+#
+# Phase of the momentum scrolling that follows a scroll gesture, which
+# the source of the events computes.
+#
+# @none: The scroll is not momentum scrolling.
+#
+# @began: Momentum scrolling began.
+#
+# @changed: Momentum scrolling continued.
+#
+# @ended: Momentum scrolling ended.
+#
+# Since: 11.2
+##
+{ 'enum'  : 'InputScrollMomentum',
+  'data'  : [ 'none', 'began', 'changed', 'ended' ] }
+
+##
+# @InputScrollEvent:
+#
+# Smooth scroll input event: a distance to scroll rather than wheel
+# notches, with the phases of the gesture it belongs to.  The events
+# up to the next synchronization make one report, and carry the same
+# @phase and @momentum.
+#
+# @axis: Which axis is referenced by @value.
+#
+# @value: Distance in 1/256 pixel.  Positive values scroll up (y) or
+#     left (x), as @wheel-up and @wheel-left of @InputButton do.
+#
+# @phase: Phase of the gesture.
+#
+# @momentum: Phase of the momentum scrolling.
+#
+# Since: 11.2
+##
+{ 'struct'  : 'InputScrollEvent',
+  'data'  : { 'axis'       : 'InputAxis',
+              'value'      : 'int',
+              'phase'      : 'InputScrollPhase',
+              'momentum'   : 'InputScrollMomentum' } }
+
+##
 # @InputEventKind:
 #
 # @key: a keyboard input event
@@ -1133,10 +1200,12 @@
 #
 # @mtt: a multi-touch input event
 #
+# @scroll: a smooth scroll input event (since 11.2)
+#
 # Since: 2.0
 ##
 { 'enum': 'InputEventKind',
-  'data': [ 'key', 'btn', 'rel', 'abs', 'mtt' ] }
+  'data': [ 'key', 'btn', 'rel', 'abs', 'mtt', 'scroll' ] }
 
 ##
 # @InputKeyEventWrapper:
@@ -1179,6 +1248,16 @@
   'data': { 'data': 'InputMultiTouchEvent' } }
 
 ##
+# @InputScrollEventWrapper:
+#
+# @data: Smooth scroll input event
+#
+# Since: 11.2
+##
+{ 'struct': 'InputScrollEventWrapper',
+  'data': { 'data': 'InputScrollEvent' } }
+
+##
 # @InputEvent:
 #     Input event union.
 #
@@ -1193,7 +1272,8 @@
               'btn'     : 'InputBtnEventWrapper',
               'rel'     : 'InputMoveEventWrapper',
               'abs'     : 'InputMoveEventWrapper',
-              'mtt'     : 'InputMultiTouchEventWrapper' } }
+              'mtt'     : 'InputMultiTouchEventWrapper',
+              'scroll'  : 'InputScrollEventWrapper' } }
 
 ##
 # @input-send-event:
@@ -1259,6 +1339,16 @@
 #       "arguments": { "events": [
 #                    { "type": "abs", "data" : { "axis": "x", "value" : 20000 } },
 #                    { "type": "abs", "data" : { "axis": "y", "value" : 400 } } ] } }
+#     <- { "return": {} }
+#
+# .. qmp-example::
+#    :title: Begin a scroll gesture, moving 10 pixels up
+#
+#     -> { "execute": "input-send-event" ,
+#       "arguments": { "events": [
+#                    { "type": "scroll", "data" : { "axis": "y",
+#                      "value" : 2560, "phase": "began",
+#                      "momentum": "none" } } ] } }
 #     <- { "return": {} }
 ##
 { 'command': 'input-send-event',

@@ -45,6 +45,12 @@ void replay_save_input_event(QemuInputEvent *evt)
         replay_put_dword(evt->mtt.axis);
         replay_put_qword(evt->mtt.value);
         break;
+    case INPUT_EVENT_KIND_SCROLL:
+        replay_put_dword(evt->scroll.axis);
+        replay_put_qword(evt->scroll.value);
+        replay_put_dword(evt->scroll.phase);
+        replay_put_dword(evt->scroll.momentum);
+        break;
     case INPUT_EVENT_KIND__MAX:
         /* keep gcc happy */
         break;
@@ -79,6 +85,12 @@ QemuInputEvent *replay_read_input_event(void)
         evt->mtt.tracking_id = replay_get_qword();
         evt->mtt.axis = (InputAxis)replay_get_dword();
         evt->mtt.value = replay_get_qword();
+        break;
+    case INPUT_EVENT_KIND_SCROLL:
+        evt->scroll.axis = (InputAxis)replay_get_dword();
+        evt->scroll.value = replay_get_qword();
+        evt->scroll.phase = (InputScrollPhase)replay_get_dword();
+        evt->scroll.momentum = (InputScrollMomentum)replay_get_dword();
         break;
     case INPUT_EVENT_KIND__MAX:
         /* keep gcc happy */

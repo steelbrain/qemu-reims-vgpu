@@ -217,6 +217,10 @@ void qmp_input_send_event(const char *device,
             evt.mtt = *qapi->u.mtt.data;
             break;
 
+        case INPUT_EVENT_KIND_SCROLL:
+            evt.scroll = *qapi->u.scroll.data;
+            break;
+
         default:
             g_assert_not_reached();
         }
@@ -235,6 +239,7 @@ static void qemu_input_event_trace(QemuConsole *src, QemuInputEvent *evt)
     InputBtnEvent *btn;
     InputMoveEvent *move;
     InputMultiTouchEvent *mtt;
+    InputScrollEvent *scroll;
 
     if (src) {
         idx = qemu_console_get_index(src);
@@ -264,6 +269,14 @@ static void qemu_input_event_trace(QemuConsole *src, QemuInputEvent *evt)
         mtt = &evt->mtt;
         name = mtt->axis < INPUT_AXIS__MAX ? InputAxis_str(mtt->axis) : "invalid";
         trace_input_event_mtt(idx, name, mtt->value);
+        break;
+    case INPUT_EVENT_KIND_SCROLL:
+        scroll = &evt->scroll;
+        name = scroll->axis < INPUT_AXIS__MAX ?
+            InputAxis_str(scroll->axis) : "invalid";
+        trace_input_event_scroll(idx, name, scroll->value,
+                                 InputScrollPhase_str(scroll->phase),
+                                 InputScrollMomentum_str(scroll->momentum));
         break;
     case INPUT_EVENT_KIND__MAX:
         /* keep gcc happy */
@@ -476,6 +489,19 @@ bool qemu_input_is_absolute(const QemuConsole *con)
     return (s != NULL) && (s->handler->mask & INPUT_EVENT_MASK_ABS);
 }
 
+/*
+ * Whether the device that takes wheel and scroll input from @con takes
+ * scroll events; if not, a user interface sends it wheel buttons.
+ */
+bool qemu_input_scrolls_smoothly(const QemuConsole *con)
+{
+    QemuInputHandlerState *s;
+
+    s = qemu_input_find_handler(INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_SCROLL,
+                                con);
+    return (s != NULL) && (s->handler->mask & INPUT_EVENT_MASK_SCROLL);
+}
+
 uint32_t qemu_input_get_leds_mask(const QemuConsole *con)
 {
     QemuInputHandlerState *s;
@@ -563,6 +589,23 @@ void qemu_input_queue_mtt_abs(QemuConsole *src, InputAxis axis, int value,
                                            INPUT_EVENT_ABS_MIN,
                                            INPUT_EVENT_ABS_MAX),
         }
+    };
+
+    qemu_input_event_send(src, &evt);
+}
+
+void qemu_input_queue_scroll(QemuConsole *src, InputAxis axis, int value,
+                             InputScrollPhase phase,
+                             InputScrollMomentum momentum)
+{
+    QemuInputEvent evt = {
+        .type = INPUT_EVENT_KIND_SCROLL,
+        .scroll = {
+            .axis = axis,
+            .value = value,
+            .phase = phase,
+            .momentum = momentum,
+        },
     };
 
     qemu_input_event_send(src, &evt);
