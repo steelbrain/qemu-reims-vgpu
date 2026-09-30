@@ -451,7 +451,9 @@ static void create_pcie(VMAppleMachineState *vms)
         usb_bus = USB_BUS(object_resolve_type_unambiguous(TYPE_USB_BUS,
                                                           &error_fatal));
         usb_create_simple(usb_bus, "usb-kbd");
-        usb_create_simple(usb_bus, vms->tablet);
+        /* The user names the tablet, which may not realize on its own. */
+        usb_realize_and_unref(USB_DEVICE(qdev_new(vms->tablet)), usb_bus,
+                              &error_fatal);
     }
 }
 
