@@ -1051,6 +1051,13 @@ struct ArchCPU {
      */
     uint32_t psci_conduit;
 
+    /*
+     * If true, when another CPU powers this one on (PSCI CPU_ON), this
+     * CPU starts with that CPU's pointer authentication keys instead of
+     * the reset value: for platforms that give every CPU the same keys.
+     */
+    bool cpu_on_copies_pauth_keys;
+
     /* For v8M, initial value of the Secure VTOR */
     uint32_t init_svtor;
     /* For v8M, initial value of the Non-secure VTOR */

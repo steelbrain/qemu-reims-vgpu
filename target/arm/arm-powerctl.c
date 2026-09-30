@@ -15,6 +15,7 @@
 #include "arm-powerctl.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
+#include "system/hw_accel.h"
 #include "system/tcg.h"
 #include "target/arm/multiprocessing.h"
 #include "trace.h"
@@ -43,6 +44,8 @@ struct CpuOnInfo {
     uint64_t context_id;
     uint32_t target_el;
     bool target_aa64;
+    bool copy_pauth_keys;
+    typeof_field(CPUARMState, keys) pauth_keys;
 };
 
 void arm_set_cpu_power_state(ARMCPU *cpu, ARMPSCIState state)
@@ -63,6 +66,10 @@ static void arm_set_cpu_on_async_work(CPUState *target_cpu_state,
     cpu_reset(target_cpu_state);
     arm_emulate_firmware_reset(target_cpu_state, info->target_el);
     target_cpu_state->halted = 0;
+
+    if (info->copy_pauth_keys) {
+        target_cpu->env.keys = info->pauth_keys;
+    }
 
     /* We check if the started CPU is now at the correct level */
     assert(info->target_el == arm_current_el(&target_cpu->env));
@@ -174,6 +181,14 @@ int arm_set_cpu_on(uint64_t cpuid, uint64_t entry, uint64_t context_id,
     info->context_id = context_id;
     info->target_el = target_el;
     info->target_aa64 = target_aa64;
+
+    /* Take the keys of the CPU making the call, as they are now. */
+    info->copy_pauth_keys = target_cpu->cpu_on_copies_pauth_keys &&
+                            current_cpu;
+    if (info->copy_pauth_keys) {
+        cpu_synchronize_state(current_cpu);
+        info->pauth_keys = ARM_CPU(current_cpu)->env.keys;
+    }
 
     async_run_on_cpu(target_cpu_state, arm_set_cpu_on_async_work,
                      RUN_ON_CPU_HOST_PTR(info));
