@@ -72,6 +72,11 @@ config USB_TABLET_WACOM
     default y
     depends on USB
 
+config USB_TABLET_VMAPPLE
+    bool
+    default y
+    depends on USB
+
 config USB_STORAGE_CORE
     bool
     depends on USB

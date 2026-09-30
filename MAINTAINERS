@@ -3218,6 +3218,7 @@ M: Phil Dennis-Jordan <phil@philjordan.eu>
 S: Maintained
 F: hw/vmapple/*
 F: include/hw/vmapple/*
+F: hw/usb/dev-vmapple-tablet.c
 F: docs/system/arm/vmapple.rst
 
 Nitro Enclaves (native)
