@@ -944,7 +944,7 @@ static bool apple_gfx_parse_resolution(const char *str, uint16_t *width,
 bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                               RvgDeviceConfig *config, Error **errp)
 {
-    static const char display_name[] = "QEMU display";
+    static const char display_name[] = "Reims vGPU";
     g_autoptr(GArray) memory_ranges = NULL;
     g_autofree RvgDisplayMode *modes = NULL;
     const AppleGFXDisplayMode *display_modes = apple_gfx_default_modes;
