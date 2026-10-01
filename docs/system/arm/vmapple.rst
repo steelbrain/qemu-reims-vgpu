@@ -119,9 +119,9 @@ momentum scrolling after it. macOS drives it with a driver of its own
 (AppleVirtualPlatformHIDEventDriver in macOS 13.6), and scrolls as it does
 with a trackpad: smooth scroll events, such as a window's under ``-display
 none`` or the ``scroll`` events of ``input-send-event``, scroll the guest
-point by point, both ways, with the momentum the host gave the gesture. A wheel's notch scrolls a fixed 20
-pixels there. Other guests see a HID mouse with an absolute pointer and two
-wheels.
+point by point, both ways, with the momentum the host gave the gesture. A
+wheel's notch scrolls a fixed 20 pixels there. Other guests see a HID mouse
+with an absolute pointer and two wheels.
 
 With ``usb-tablet``, macOS scrolls by whole wheel notches, which it
 accelerates, vertically only.
