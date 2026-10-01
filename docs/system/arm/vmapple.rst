@@ -87,16 +87,19 @@ guest the mode's density. A macOS 13.6 guest reads the width in whole
 centimetres, rounded up, and runs a HiDPI desktop at the mode's pixels where
 that comes to 146.67 ppi or more: ``2560x1600@148`` reads as 44 cm, 147.8
 ppi, and looks like 1280x800, where ``2560x1600@146`` reads as 45 cm, 144.5
-ppi, and runs at 1x. A density at which the guest's scale was never
-measured is refused: just below 146.67 ppi, below it for a mode wider than
-3811 pixels, which may run HiDPI anyway, and above it for a mode narrower
-than 1920 pixels or 29 cm, which may stay at 1x (``1280x800@220`` did). A
-window is sized by the scale the guest runs: on a Retina screen, a HiDPI
-guest's pixel is a screen pixel where half the mode fits on the screen, and
-a borderless window fits the image to its screen. The device's
-``display-modes`` property, where given, sets the modes instead. Set
-``REIMS_VGPU_WINDOW=0`` in QEMU's environment to keep ``-display none``
-headless. Either way, ``screendump`` draws the display's current frame.
+ppi, and runs at 1x. A density that does not tell the guest's scale is
+refused: just below 146.67 ppi, below it for a mode wider than 3811 pixels,
+which may run HiDPI anyway (5832 pixels wide did at 128.8 ppi), and above
+it for a mode narrower than 1920 pixels or 29 cm, which may stay at 1x
+(``1280x800@220`` did). Only the chosen mode is checked: the smaller modes
+offered with it are told the same size, so a guest switched to one may run
+a scale the window does not expect. A window is sized by the scale the
+guest runs: on a Retina screen, a HiDPI guest's pixel is a screen pixel
+where half the mode fits on the screen, and a borderless window fits the
+image to its screen. The device's ``display-modes`` property, where given,
+sets the modes instead. Set ``REIMS_VGPU_WINDOW=0`` in QEMU's environment
+to keep ``-display none`` headless. Either way, ``screendump`` draws the
+display's current frame.
 
 Input
 -----

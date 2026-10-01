@@ -856,12 +856,12 @@ static uint64_t apple_gfx_guest_centimeters(int width, int ppi)
 
 /*
  * Whether the scale a macOS guest runs a mode @width pixels wide at, told
- * @ppi pixels per inch, was never measured. Measured on macOS 13.6, the
- * guest runs HiDPI from 2021 pixels across 35 whole centimetres (146.667
- * ppi), for modes from 1920 pixels wide and 29 cm, and 1x at up to 3811
- * pixels across 66 (146.666 ppi), for modes up to 3811 pixels wide. A mode
- * 5832 pixels wide ran HiDPI at 128.8 ppi, and 1280x800 ran 1x at 216.7
- * ppi across 15 cm.
+ * @ppi pixels per inch, is not known from the density. Measured on macOS
+ * 13.6, the guest runs HiDPI from 2021 pixels across 35 whole centimetres
+ * (146.667 ppi), for modes from 1920 pixels wide and 29 cm, and 1x at up to
+ * 3811 pixels across 66 (146.666 ppi), for modes up to 3811 pixels wide.
+ * Modes of other widths need not follow it: a mode 5832 pixels wide ran
+ * HiDPI at 128.8 ppi, and 1280x800 ran 1x at 216.7 ppi across 15 cm.
  */
 static bool apple_gfx_guest_scale_unknown(int width, int ppi)
 {
@@ -883,8 +883,9 @@ static bool apple_gfx_guest_scale_unknown(int width, int ppi)
  * modes, at its density), else "<width>x<height>", each 1 to 65535 pixels,
  * optionally followed by "@<ppi>", the density the guest is told for the
  * mode, 1 to 65535 pixels per inch, refused where the scale the guest runs
- * the mode at was never measured. Without it *ppi is 0, which the library
- * takes as its 1x density.
+ * the mode at is not known from it. Without it *ppi is 0, which the library
+ * takes as its 1x density. Only this mode is checked: the smaller modes
+ * offered with it are told the same size.
  */
 static bool apple_gfx_parse_resolution(const char *str, uint16_t *width,
                                        uint16_t *height, double *ppi,
@@ -920,8 +921,8 @@ static bool apple_gfx_parse_resolution(const char *str, uint16_t *width,
     if (p != 0 && apple_gfx_guest_scale_unknown(w, p)) {
         error_setg(errp, "apple-gfx: resolution '%s' tells a macOS guest "
                    "%d pixels across %" PRIu64 " cm, where the scale it runs "
-                   "was never measured; choose another density", str, w,
-                   apple_gfx_guest_centimeters(w, p));
+                   "is not known from the density; choose another density",
+                   str, w, apple_gfx_guest_centimeters(w, p));
         return false;
     }
     *width = w;
