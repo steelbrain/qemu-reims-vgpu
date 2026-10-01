@@ -14,9 +14,9 @@ To run the vmapple machine model, you need to
 
  * Run on Apple Silicon
  * Run on macOS 12.0 or above
- * Have an already installed copy of a Virtualization.Framework macOS 12 virtual
-   machine. Note that newer versions than 12.x are currently NOT supported on
-   the guest side. I will assume that you installed it using the
+ * Have an already installed copy of a Virtualization.Framework macOS 12 or 13
+   virtual machine. Newer versions are NOT supported on the guest side (see
+   `Guest versions`_). I will assume that you installed it using the
    `macosvm <https://github.com/s-u/macosvm>`__ CLI.
  * Build QEMU with apple-gfx, which the machine's display needs. apple-gfx
    drives reims-vgpu's C API, a library that pkg-config finds as
@@ -69,6 +69,25 @@ to get better interactive access into the target system:
        -device vmapple-virtio-blk-pci,variant=root,drive=root \
        -netdev user,id=net0,ipv6=off,hostfwd=tcp::2222-:22,hostfwd=tcp::5901-:5900 \
        -device virtio-net-pci,netdev=net0
+
+Guest versions
+--------------
+
+macOS 12 and 13 guests boot. A vmapple guest kernel asks the hypervisor to
+manage its pointer authentication keys through paravirtualized hypercalls:
+``hvc #0`` with SMCCC function IDs 0xC1000000 to 0xC10000FF.
+Hypervisor.framework answers these calls itself, without an exit to QEMU,
+and for a VM created through its public API it answers each of them as not
+supported. The macOS 12 and 13 kernels carry on with the keys the firmware
+set up, which all processes then share.
+
+From macOS 14 on, the kernel checks the result of every one of these calls
+and loops forever when one fails. Such a guest stops right after iBoot hands
+over to the kernel. The serial console ends with iBoot's ``End of
+iBootStage2 serial output.`` line, and the boot CPU keeps a host core busy
+without exiting to QEMU. Hypervisor.framework implements the calls only for
+VMs created with a private ISA setting, which needs an entitlement that only
+Apple-signed binaries can hold. QEMU does not use it.
 
 Display
 -------
