@@ -84,9 +84,10 @@ scales to its size on the GPU, at the host screen's refresh rate;
 ``resolution=host`` offers the modes that fill the host's screen at its
 density (HiDPI on a Retina screen). ``resolution=WxH@PPI`` also tells the
 guest the mode's density. A macOS 13.6 guest reads the width in whole
-centimetres, rounded up, and runs a HiDPI desktop at the mode's pixels where
-that comes to 146.67 ppi or more: ``2560x1600@148`` reads as 44 cm, 147.8
-ppi, and looks like 1280x800, where ``2560x1600@146`` reads as 45 cm, 144.5
+millimetres, rounded to nearest, then in whole centimetres, rounded up, and
+runs a HiDPI desktop at the mode's pixels where that comes to 146.67 ppi or
+more: ``2560x1600@148`` is told 440.39 mm, which reads as 44 cm, 147.8 ppi,
+and looks like 1280x800, where ``2560x1600@146`` reads as 45 cm, 144.5
 ppi, and runs at 1x. A density that does not tell the guest's scale is
 refused: one just below 146.67 ppi; one below it for a mode wider than 3811
 pixels, which may run HiDPI anyway (5832 pixels wide did at 128.8 ppi); one
