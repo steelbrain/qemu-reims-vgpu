@@ -416,6 +416,16 @@ static int32_t vmapple_tablet_lines(int64_t distance)
     return MIN(MAX(lines, INT32_MIN), INT32_MAX);
 }
 
+/*
+ * @distance plus @value, in 1/256 pixel, held to 32 bits: input-send-event
+ * takes any 64-bit value, which the sums after this would overflow.
+ */
+static int64_t vmapple_tablet_add(int64_t distance, int64_t value)
+{
+    value = MIN(MAX(value, INT32_MIN), INT32_MAX);
+    return MIN(MAX(distance + value, INT32_MIN), INT32_MAX);
+}
+
 static void vmapple_tablet_input_event(DeviceState *dev, QemuConsole *src,
                                        QemuInputEvent *evt)
 {
@@ -463,9 +473,9 @@ static void vmapple_tablet_input_event(DeviceState *dev, QemuConsole *src,
 
     case INPUT_EVENT_KIND_SCROLL:
         if (evt->scroll.axis == INPUT_AXIS_X) {
-            s->scroll_x += evt->scroll.value;
+            s->scroll_x = vmapple_tablet_add(s->scroll_x, evt->scroll.value);
         } else if (evt->scroll.axis == INPUT_AXIS_Y) {
-            s->scroll_y += evt->scroll.value;
+            s->scroll_y = vmapple_tablet_add(s->scroll_y, evt->scroll.value);
         }
         s->phases = vmapple_tablet_phases(evt->scroll.phase,
                                           evt->scroll.momentum);
