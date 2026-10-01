@@ -14,10 +14,9 @@ To run the vmapple machine model, you need to
 
  * Run on Apple Silicon
  * Run on macOS 12.0 or above
- * Have an already installed copy of a Virtualization.Framework macOS 12 or 13
-   virtual machine. Newer versions are NOT supported on the guest side (see
-   `Guest versions`_). I will assume that you installed it using the
-   `macosvm <https://github.com/s-u/macosvm>`__ CLI.
+ * Have an already installed copy of a Virtualization.Framework macOS 12 or
+   later virtual machine (see `Guest versions`_). I will assume that you
+   installed it using the `macosvm <https://github.com/s-u/macosvm>`__ CLI.
  * Build QEMU with apple-gfx, which the machine's display needs. apple-gfx
    drives reims-vgpu's C API, a library that pkg-config finds as
    ``reims-vgpu``: pass ``--enable-pvg`` with ``PKG_CONFIG_PATH`` naming the
@@ -73,21 +72,43 @@ to get better interactive access into the target system:
 Guest versions
 --------------
 
-macOS 12 and 13 guests boot. A vmapple guest kernel asks the hypervisor to
-manage its pointer authentication keys through paravirtualized hypercalls:
-``hvc #0`` with SMCCC function IDs 0xC1000000 to 0xC10000FF.
+macOS 12 and 13 guests boot without changes. macOS 14 and later need the
+two below, which the machine makes when iBoot enters the kernel.
+
+A vmapple guest kernel asks the hypervisor to manage its pointer
+authentication keys through paravirtualized hypercalls: ``hvc #0`` with
+SMCCC function IDs 0xC1000000 to 0xC10000FF.
 Hypervisor.framework answers these calls itself, without an exit to QEMU,
 and for a VM created through its public API it answers each of them as not
 supported. The macOS 12 and 13 kernels carry on with the keys the firmware
 set up, which all processes then share.
 
 From macOS 14 on, the kernel checks the result of every one of these calls
-and loops forever when one fails. Such a guest stops right after iBoot hands
-over to the kernel. The serial console ends with iBoot's ``End of
-iBootStage2 serial output.`` line, and the boot CPU keeps a host core busy
-without exiting to QEMU. Hypervisor.framework implements the calls only for
-VMs created with a private ISA setting, which needs an entitlement that only
-Apple-signed binaries can hold. QEMU does not use it.
+and loops forever when one fails, with ``hvc #0; cbnz x0, .``.
+Hypervisor.framework implements the calls only for VMs created with a
+private ISA setting, which needs an entitlement that only Apple-signed
+binaries can hold. QEMU does not use it. Instead, when iBoot enters the
+kernel, the machine replaces each of those loops with a ``nop`` in the memory
+iBoot loaded the kernel into, so the kernel carries on as macOS 13's does.
+This takes the per-process keys away from the guest's pointer
+authentication. Without it, such a guest stops right after iBoot hands over
+to the kernel: the serial console ends with iBoot's ``End of iBootStage2
+serial output.`` line, and the boot CPU keeps a host core busy without
+exiting to QEMU.
+
+The machine has no Secure Enclave. From macOS 15 on, the guest's APFS then
+panics on its unencrypted data volume ("unencrypted data volume is not
+allowed") unless the device tree's ``/filesystems`` node has a
+``DoNotUseSEP`` property, and the guest resets and boots again, over and
+over. When iBoot enters the kernel, the machine also adds such a node to the
+device tree iBoot hands the kernel, if the tree has no ``/filesystems``
+node. macOS 13's tree has one, which is left as it is.
+
+To catch iBoot entering the kernel, guest RAM is not executable from reset.
+Each page iBoot runs becomes executable on its first instruction fetch, until
+a fetch lands between the boot arguments' ``physBase`` and
+``topOfKernelData`` with ``x0`` at those boot arguments, as iBoot enters the
+kernel. All of RAM is executable from then on.
 
 Display
 -------

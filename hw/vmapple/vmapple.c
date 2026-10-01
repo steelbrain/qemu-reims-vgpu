@@ -16,6 +16,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
+#include "qemu/cacheflush.h"
+#include "qemu/cutils.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
 #include "qemu/guest-random.h"
@@ -47,11 +49,13 @@
 #include "qobject/qlist.h"
 #include "standard-headers/linux/input.h"
 #include "system/hvf.h"
+#include "system/hvf_int.h"
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
 #include "target/arm/gtimer.h"
 #include "target/arm/cpu.h"
+#include "target/arm/hvf_arm.h"
 
 struct VMAppleMachineState {
     MachineState parent;
@@ -457,12 +461,157 @@ static void create_pcie(VMAppleMachineState *vms)
     }
 }
 
+/*
+ * macOS 14 and later need two changes to the kernel's memory to boot here,
+ * made when iBoot enters the kernel. From reset, RAM is not executable: each
+ * page iBoot runs becomes executable on its first instruction fetch, until a
+ * fetch lands in the kernel's memory with x0 at the boot arguments. Only the
+ * boot CPU runs then. The changes leave macOS 13 as it was.
+ */
+
+/* A host pointer to [pa, pa + len), if guest RAM holds all of it. */
+static uint8_t *vmapple_ram(VMAppleMachineState *vms, uint64_t pa,
+                            uint64_t len)
+{
+    MachineState *ms = MACHINE(vms);
+    uint64_t off = pa - vms->memmap[VMAPPLE_MEM].base;
+
+    if (pa < vms->memmap[VMAPPLE_MEM].base || off > ms->ram_size ||
+        len > ms->ram_size - off) {
+        return NULL;
+    }
+    return (uint8_t *)memory_region_get_ram_ptr(ms->ram) + off;
+}
+
+/*
+ * Hypervisor.framework fails the kernel's pointer authentication hypercalls,
+ * and from macOS 14 on the kernel spins on each failure with
+ * "hvc #0; cbnz x0, .". Take out the spins: the kernel then runs on the
+ * firmware's keys, as macOS 13's does.
+ */
+static void vmapple_skip_pac_waits(uint8_t *mem, uint64_t size)
+{
+    for (uint64_t off = 4; off + 4 <= size; off += 4) {
+        if (ldl_le_p(mem + off) == 0xb5000000 &&      /* cbnz x0, . */
+            ldl_le_p(mem + off - 4) == 0xd4000002) {  /* hvc #0 */
+            stl_le_p(mem + off, 0xd503201f);          /* nop */
+            flush_idcache_range((uintptr_t)mem + off, (uintptr_t)mem + off,
+                                4);
+        }
+    }
+}
+
+/*
+ * A device tree node: a property count, a child count, its properties, then
+ * its children. A property is a 32-byte name, a 32-bit length whose top bit
+ * is a flag, and its value, padded to 4 bytes.
+ */
+static const struct QEMU_PACKED {
+    uint32_t props, children;
+    struct QEMU_PACKED {
+        char name[32];
+        uint32_t len;
+        char value[12];
+    } name;
+    struct QEMU_PACKED {
+        char name[32];
+        uint32_t len, value;
+    } no_sep;
+} vmapple_filesystems = {
+    const_le32(2), 0,
+    { "name", const_le32(12), "filesystems" },
+    { "DoNotUseSEP", const_le32(4), const_le32(1) },
+};
+
+/*
+ * The machine has no Secure Enclave, and from macOS 15 on APFS panics on the
+ * unencrypted data volume unless the device tree has /filesystems/DoNotUseSEP.
+ * If the tree has no /filesystems, append that node as the root's last child,
+ * in the zeroes that pad the tree to its last 16 KiB page, and cover it with
+ * the tree's length in the boot arguments.
+ */
+static void vmapple_no_sep(VMAppleMachineState *vms, uint8_t *args)
+{
+    /* deviceTreeP - virtBase + physBase, and deviceTreeLength */
+    uint64_t pa = ldq_le_p(args + 0x60) - ldq_le_p(args + 8) +
+                  ldq_le_p(args + 16);
+    uint64_t len = ldl_le_p(args + 0x68), end = 0, nodes, props;
+    uint64_t room = ROUND_UP(pa + len, 16 * KiB) - pa;
+    uint64_t size = sizeof(vmapple_filesystems);
+    uint8_t *dt = vmapple_ram(vms, pa, room);
+
+    if (!dt) {
+        return;
+    }
+    /* The tree's end: its nodes come in order, each before its children */
+    for (nodes = 1; nodes; nodes--) {
+        if (end + 8 > len) {
+            return;
+        }
+        props = ldl_le_p(dt + end);
+        nodes += ldl_le_p(dt + end + 4);
+        for (end += 8; props; props--) {
+            if (end + 36 > len) {
+                return;
+            }
+            end += 36 + ROUND_UP(ldl_le_p(dt + end + 32) & INT32_MAX, 4);
+        }
+    }
+    if (end + size > room || !buffer_is_zero(dt + end, size) ||
+        memmem(dt, end, &vmapple_filesystems.name,
+               sizeof(vmapple_filesystems.name))) {
+        return;
+    }
+    memcpy(dt + end, &vmapple_filesystems, size);
+    stl_le_p(dt + 4, ldl_le_p(dt + 4) + 1);
+    stl_le_p(args + 0x68, MAX(len, end + size));
+}
+
+static bool vmapple_exec_fault(CPUState *cpu, hwaddr ipa)
+{
+    VMAppleMachineState *vms = VMAPPLE_MACHINE(qdev_get_machine());
+    uint64_t x0, base = 0, top = 0;
+    uint8_t *args, *kernel;
+
+    if (!vmapple_ram(vms, ipa, 1)) {
+        return false;
+    }
+    /* XNU's boot_args, version 2: physBase and topOfKernelData */
+    assert_hvf_ok(hv_vcpu_get_reg(cpu->accel->fd, HV_REG_X0, &x0));
+    args = vmapple_ram(vms, x0, 0x70);
+    if (args && lduw_le_p(args + 2) == 2) {
+        base = ldq_le_p(args + 16);
+        top = ldq_le_p(args + 32);
+    }
+    kernel = vmapple_ram(vms, base, top - base);
+    if (ipa < base || ipa >= top || !kernel) {
+        /* Still in iBoot */
+        assert_hvf_ok(hv_vm_protect(ipa & qemu_real_host_page_mask(),
+                                    qemu_real_host_page_size(),
+                                    HV_MEMORY_READ | HV_MEMORY_WRITE |
+                                    HV_MEMORY_EXEC));
+        return true;
+    }
+    vmapple_no_sep(vms, args);
+    vmapple_skip_pac_waits(kernel, top - base);
+    hvf_arm_exec_fault = NULL;
+    assert_hvf_ok(hv_vm_protect(vms->memmap[VMAPPLE_MEM].base,
+                                MACHINE(vms)->ram_size,
+                                HV_MEMORY_READ | HV_MEMORY_WRITE |
+                                HV_MEMORY_EXEC));
+    return true;
+}
+
 static void vmapple_reset(void *opaque)
 {
     VMAppleMachineState *vms = opaque;
     hwaddr base = vms->memmap[VMAPPLE_FIRMWARE].base;
 
     cpu_set_pc(first_cpu, base);
+    hvf_arm_exec_fault = vmapple_exec_fault;
+    assert_hvf_ok(hv_vm_protect(vms->memmap[VMAPPLE_MEM].base,
+                                MACHINE(vms)->ram_size,
+                                HV_MEMORY_READ | HV_MEMORY_WRITE));
 }
 
 static void mach_vmapple_init(MachineState *machine)

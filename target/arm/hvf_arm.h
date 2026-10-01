@@ -24,6 +24,12 @@ void hvf_arm_init_debug(void);
 void hvf_arm_set_cpu_features_from_host(ARMCPU *cpu);
 
 /*
+ * If set, called on a stage 2 fault on an instruction fetch, with the fault's
+ * IPA. Returns true if it handled the fault.
+ */
+extern bool (*hvf_arm_exec_fault)(CPUState *cpu, hwaddr ipa);
+
+/*
  * We need access to types from macOS SDK >=15.2, so expose stubs if the
  * headers are not available until we raise our minimum macOS version.
  */
