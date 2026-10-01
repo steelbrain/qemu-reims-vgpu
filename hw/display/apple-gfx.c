@@ -840,18 +840,26 @@ static void apple_gfx_events_free(AppleGFXState *s)
 }
 
 /*
+ * The whole millimetres a macOS guest is told a mode @width pixels wide is
+ * across at @ppi pixels per inch: the library tells it width / (ppi /
+ * 25.46) millimetres, which the display's settings page holds as a float
+ * and in whole millimetres, rounded to nearest, in 16 bits.
+ */
+static uint64_t apple_gfx_guest_millimeters(int width, int ppi)
+{
+    float millimeters = width / (ppi / 25.46);
+
+    return (uint64_t)((double)millimeters + 0.5);
+}
+
+/*
  * The whole centimetres a macOS guest reads a mode @width pixels wide as,
- * told @ppi pixels per inch: the library tells it width / (ppi / 25.46)
- * millimetres, which the display's settings page holds as a float and in
- * whole millimetres, rounded to nearest, and the guest rounds those up to
- * whole centimetres.
+ * told @ppi pixels per inch: its whole millimetres, rounded up to whole
+ * centimetres.
  */
 static uint64_t apple_gfx_guest_centimeters(int width, int ppi)
 {
-    float millimeters = width / (ppi / 25.46);
-    uint64_t whole = (uint64_t)((double)millimeters + 0.5);
-
-    return (whole + 9) / 10;
+    return (apple_gfx_guest_millimeters(width, ppi) + 9) / 10;
 }
 
 /*
@@ -861,14 +869,16 @@ static uint64_t apple_gfx_guest_centimeters(int width, int ppi)
  * (146.667 ppi), for modes from 1920 pixels wide and 29 cm, and 1x at up to
  * 3811 pixels across 66 (146.666 ppi), for modes up to 3811 pixels wide.
  * Modes of other widths need not follow it: a mode 5832 pixels wide ran
- * HiDPI at 128.8 ppi, and 1280x800 ran 1x at 216.7 ppi across 15 cm.
+ * HiDPI at 128.8 ppi, and 1280x800 ran 1x at 216.7 ppi across 15 cm. A
+ * width of more than 65535 millimetres, which the settings page's 16 bits
+ * do not hold, was not measured either.
  */
 static bool apple_gfx_guest_scale_unknown(int width, int ppi)
 {
     uint64_t cm = apple_gfx_guest_centimeters(width, ppi);
     uint64_t w = width;
 
-    if (cm == 0) {
+    if (cm == 0 || apple_gfx_guest_millimeters(width, ppi) > UINT16_MAX) {
         return true;
     }
     if (w * 35 >= 2021 * cm) {
