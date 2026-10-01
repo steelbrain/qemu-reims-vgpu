@@ -117,6 +117,10 @@ struct USBVMAppleTabletState {
     uint32_t queue_count;
     /* The last report queued, which the guest reads last */
     VMAppleTabletReport last;
+    /* Reports were dropped, the queue being full; see vmapple_tablet_push() */
+    bool overflow;
+    /* The phases of the last scroll report dropped that had some */
+    uint16_t owed_phases;
 
     uint8_t idle;
     uint8_t multiplier;
@@ -315,49 +319,77 @@ static bool vmapple_tablet_report_scrolls(const VMAppleTabletReport *r)
 static void vmapple_tablet_enqueue(USBVMAppleTabletState *s,
                                    const VMAppleTabletReport *r)
 {
-    VMAppleTabletReport *last;
-
-    if (s->queue_count < VMAPPLE_TABLET_QUEUE_LENGTH) {
-        s->queue[(s->queue_head + s->queue_count++) %
-                 VMAPPLE_TABLET_QUEUE_LENGTH] = *r;
-        s->last = *r;
-        return;
-    }
-
-    /* Full: fold the report into the last one. */
-    trace_usb_vmapple_tablet_queue_full();
-    last = &s->queue[(s->queue_head + s->queue_count - 1) %
-                     VMAPPLE_TABLET_QUEUE_LENGTH];
-    last->buttons = r->buttons;
-    last->x = r->x;
-    last->y = r->y;
-    last->wheel = MIN(MAX(last->wheel + r->wheel, -INT16_MAX), INT16_MAX);
-    last->pan = MIN(MAX(last->pan + r->pan, -INT16_MAX), INT16_MAX);
-    last->scroll_y = MIN(MAX((int64_t)last->scroll_y + r->scroll_y,
-                             INT32_MIN), INT32_MAX);
-    last->scroll_x = MIN(MAX((int64_t)last->scroll_x + r->scroll_x,
-                             INT32_MIN), INT32_MAX);
-    last->phases = r->phases;
-    s->last = *last;
+    assert(s->queue_count < VMAPPLE_TABLET_QUEUE_LENGTH);
+    s->queue[(s->queue_head + s->queue_count++) %
+             VMAPPLE_TABLET_QUEUE_LENGTH] = *r;
+    s->last = *r;
 }
 
-/* Queue @r, after a report that returns the scroll fields to 0 if needed. */
+/*
+ * Queue @r, after a report that returns the scroll fields to 0 if needed.
+ *
+ * A full queue drops @r, and every report after it until the guest has read
+ * the queue empty, which then gets what the guest missed, from
+ * vmapple_tablet_resync().  Merging @r into the last report queued instead
+ * would lose it where the two differ in kind: macOS ignores the pointer and
+ * buttons of a scroll report, and then sees no change in a pointer report
+ * that repeats them, so a button released while the queue is full would
+ * stay held.
+ */
 static void vmapple_tablet_push(USBVMAppleTabletState *s,
                                 const VMAppleTabletReport *r)
 {
-    if (vmapple_tablet_report_scrolls(&s->last) &&
-        !vmapple_tablet_report_scrolls(r)) {
-        VMAppleTabletReport settle = {
+    bool settle = vmapple_tablet_report_scrolls(&s->last) &&
+                  !vmapple_tablet_report_scrolls(r);
+
+    trace_usb_vmapple_tablet_report(r->buttons, r->x, r->y, r->wheel, r->pan,
+                                    r->scroll_y, r->scroll_x, r->phases);
+    if (s->overflow ||
+        s->queue_count + settle >= VMAPPLE_TABLET_QUEUE_LENGTH) {
+        trace_usb_vmapple_tablet_queue_full();
+        s->overflow = true;
+        if (r->phases) {
+            s->owed_phases = r->phases;
+        }
+        return;
+    }
+    if (settle) {
+        VMAppleTabletReport zero = {
             .buttons = s->last.buttons,
             .x = s->last.x,
             .y = s->last.y,
         };
 
-        vmapple_tablet_enqueue(s, &settle);
+        vmapple_tablet_enqueue(s, &zero);
     }
-    trace_usb_vmapple_tablet_report(r->buttons, r->x, r->y, r->wheel, r->pan,
-                                    r->scroll_y, r->scroll_x, r->phases);
     vmapple_tablet_enqueue(s, r);
+}
+
+/*
+ * Once the guest has read the queue empty after reports were dropped: the
+ * phases of the last scrolling dropped, so that a gesture the guest missed
+ * the end of ends, and the pointer and buttons as they are.
+ */
+static void vmapple_tablet_resync(USBVMAppleTabletState *s)
+{
+    VMAppleTabletReport scroll = {
+        .buttons = s->last.buttons,
+        .x = s->last.x,
+        .y = s->last.y,
+        .phases = s->owed_phases,
+    };
+    VMAppleTabletReport pointer = {
+        .buttons = s->buttons,
+        .x = s->x,
+        .y = s->y,
+    };
+
+    s->overflow = false;
+    s->owed_phases = 0;
+    if (scroll.phases) {
+        vmapple_tablet_push(s, &scroll);
+    }
+    vmapple_tablet_push(s, &pointer);
 }
 
 static uint16_t vmapple_tablet_phases(InputScrollPhase phase,
@@ -584,6 +616,8 @@ static void usb_vmapple_tablet_handle_reset(USBDevice *dev)
     s->notch_rest_x = 0;
     s->queue_head = 0;
     s->queue_count = 0;
+    s->overflow = false;
+    s->owed_phases = 0;
     /* The first report the guest reads, which it takes as a scroll */
     vmapple_tablet_enqueue(s, &nothing);
     s->idle = 0;
@@ -684,6 +718,9 @@ static void usb_vmapple_tablet_handle_data(USBDevice *dev, USBPacket *p)
         qemu_input_handler_activate(s->hs);
         s->input_active = true;
     }
+    if (!s->queue_count && s->overflow) {
+        vmapple_tablet_resync(s);
+    }
     if (!s->queue_count) {
         p->status = USB_RET_NAK;
         return;
@@ -749,6 +786,25 @@ static int usb_vmapple_tablet_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static bool usb_vmapple_tablet_overflow_needed(void *opaque)
+{
+    USBVMAppleTabletState *s = opaque;
+
+    return s->overflow;
+}
+
+static const VMStateDescription vmstate_usb_vmapple_tablet_overflow = {
+    .name = "usb-vmapple-tablet/overflow",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = usb_vmapple_tablet_overflow_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(overflow, USBVMAppleTabletState),
+        VMSTATE_UINT16(owed_phases, USBVMAppleTabletState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_usb_vmapple_tablet = {
     .name = "usb-vmapple-tablet",
     .version_id = 1,
@@ -773,6 +829,10 @@ static const VMStateDescription vmstate_usb_vmapple_tablet = {
         VMSTATE_UINT8(multiplier, USBVMAppleTabletState),
         VMSTATE_UINT8(smooth, USBVMAppleTabletState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_usb_vmapple_tablet_overflow,
+        NULL
     }
 };
 
