@@ -482,6 +482,17 @@ static void vmapple_tablet_input_sync(DeviceState *dev)
     USBVMAppleTabletState *s = USB_VMAPPLE_TABLET(dev);
     bool pushed = false;
 
+    /* The pointer first, so that the scrolling is where the pointer went. */
+    if (s->pointer_changed) {
+        VMAppleTabletReport r = {
+            .buttons = s->buttons,
+            .x = s->x,
+            .y = s->y,
+        };
+
+        vmapple_tablet_push(s, &r);
+        pushed = true;
+    }
     if (s->scrolled || s->notches_y || s->notches_x) {
         const int64_t notch = VMAPPLE_TABLET_NOTCH_PIXELS * 256;
         int64_t units = vmapple_tablet_notch_units(s);
@@ -501,16 +512,6 @@ static void vmapple_tablet_input_sync(DeviceState *dev)
             .scroll_x = vmapple_tablet_lines(s->scroll_x +
                                              s->notches_x * notch),
             .phases = s->scrolled ? s->phases : 0,
-        };
-
-        vmapple_tablet_push(s, &r);
-        pushed = true;
-    }
-    if (s->pointer_changed) {
-        VMAppleTabletReport r = {
-            .buttons = s->buttons,
-            .x = s->x,
-            .y = s->y,
         };
 
         vmapple_tablet_push(s, &r);
