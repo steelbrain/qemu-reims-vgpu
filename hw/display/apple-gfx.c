@@ -583,6 +583,10 @@ static void apple_gfx_write(void *opaque, hwaddr offset, uint64_t val,
 
     rvg_device_mmio_write(s->pgdev, offset, val);
     trace_apple_gfx_write(offset, val);
+    /* Outside the library's call, as the hook may take the BQL */
+    if (s->mmio_written) {
+        s->mmio_written(s, offset, val);
+    }
 }
 
 static const MemoryRegionOps apple_gfx_ops = {

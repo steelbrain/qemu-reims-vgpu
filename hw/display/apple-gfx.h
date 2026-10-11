@@ -57,6 +57,8 @@ struct AppleGFXState {
     /* Initialised on init/realize() */
     MemoryRegion iomem_gfx;
     RvgDevice *pgdev;
+    /* Called after the library takes a guest write; may take the BQL */
+    void (*mmio_written)(AppleGFXState *s, hwaddr offset, uint32_t value);
     /*
      * Runs the renders into the surfaces: each frame's encode, wait and read,
      * off the main loop.

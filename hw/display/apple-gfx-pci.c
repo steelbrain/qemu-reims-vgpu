@@ -13,10 +13,15 @@
  * macOS VMs.
  *
  * Its default option ROM is the reims-vgpu package's EFI driver for the
- * device, which QEMU's build installs with its data files.
+ * device, which QEMU's build installs with its data files. BAR 2 shows the
+ * RAM of the ROM's framebuffer: macOS without a driver of the device's own
+ * (installers, recovery) takes a boot framebuffer over only inside a BAR.
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
+#include "system/address-spaces.h"
+#include "hw/core/boards.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
 #include "apple-gfx.h"
@@ -28,7 +33,18 @@ struct AppleGFXPCIState {
     PCIDevice parent_obj;
 
     AppleGFXState common;
+    bool efi_fb_bar;
+    MemoryRegion efi_fb_bar_mr; /* BAR 2 */
+    MemoryRegion efi_fb; /* in BAR 2: an alias of the machine's RAM */
 };
+
+#define APPLE_GFX_PCI_EFI_FB_BAR_SIZE (64 << 20)
+/* The library's page for the EFI registers: APV_PAGE_SHIFT in reims-vgpu */
+#ifdef HOST_X86_64
+#define APPLE_GFX_PCI_PAGE_SHIFT 12
+#else
+#define APPLE_GFX_PCI_PAGE_SHIFT 14
+#endif
 
 static void apple_gfx_pci_init(Object *obj)
 {
@@ -77,6 +93,42 @@ static void apple_gfx_pci_raise_interrupt_cb(void *ctx, uint32_t vector)
                             apple_gfx_pci_raise_interrupt, job);
 }
 
+/*
+ * After a write to 0x1210, BAR 2 shows the run of RAM at the framebuffer's
+ * start, up to 64 MiB: only RAM the guest already reaches there, so not SMRAM
+ * or other RAM the flat view hides. Only these writes and a reset change it,
+ * so the kernel's draws after EFI goes off still land in RAM.
+ */
+static void apple_gfx_pci_mmio_written(AppleGFXState *common, hwaddr offset,
+                                       uint32_t value)
+{
+    AppleGFXPCIState *s = container_of(common, AppleGFXPCIState, common);
+    MemoryRegionSection sec = {};
+    uint32_t start;
+    bool ram;
+
+    if (offset != 0x1210) {
+        return;
+    }
+    BQL_LOCK_GUARD(); /* under KVM the access comes without it */
+    /* The library's start, not this write's: vCPUs' hooks race to the BQL */
+    start = rvg_device_mmio_read(common->pgdev, 0x1210);
+    if (start) {
+        sec = memory_region_find(get_system_memory(),
+                                 (hwaddr)start << APPLE_GFX_PCI_PAGE_SHIFT,
+                                 APPLE_GFX_PCI_EFI_FB_BAR_SIZE);
+    }
+    ram = sec.mr == MACHINE(qdev_get_machine())->ram;
+    memory_region_transaction_begin();
+    if (ram) {
+        memory_region_set_alias_offset(&s->efi_fb, sec.offset_within_region);
+        memory_region_set_size(&s->efi_fb, int128_get64(sec.size));
+    }
+    memory_region_set_enabled(&s->efi_fb, ram);
+    memory_region_transaction_commit();
+    memory_region_unref(sec.mr);
+}
+
 static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
 {
     AppleGFXPCIState *s = APPLE_GFX_PCI(dev);
@@ -89,10 +141,25 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
         .struct_size = sizeof(config),
         .callbacks = &callbacks,
     };
+    MemoryRegion *ram = MACHINE(qdev_get_machine())->ram;
     int ret;
 
     pci_register_bar(dev, RVG_PCI_BAR_MMIO,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->common.iomem_gfx);
+    /* A second KVM slot onto a guest_memfd's RAM would be refused */
+    if (s->efi_fb_bar && ram && !memory_region_has_guest_memfd(ram)) {
+        memory_region_init(&s->efi_fb_bar_mr, OBJECT(dev),
+                           "apple-gfx-pci.efi-fb-bar",
+                           APPLE_GFX_PCI_EFI_FB_BAR_SIZE);
+        memory_region_init_alias(&s->efi_fb, OBJECT(dev),
+                                 "apple-gfx-pci.efi-fb", ram, 0,
+                                 APPLE_GFX_PCI_EFI_FB_BAR_SIZE);
+        memory_region_set_enabled(&s->efi_fb, false);
+        memory_region_add_subregion(&s->efi_fb_bar_mr, 0, &s->efi_fb);
+        pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY |
+                         PCI_BASE_ADDRESS_MEM_PREFETCH, &s->efi_fb_bar_mr);
+        s->common.mmio_written = apple_gfx_pci_mmio_written;
+    }
 
     ret = msi_init(dev, 0x0 /* config offset; 0 = find space */,
                    RVG_PCI_MSI_VECTORS, true /* msi64bit */,
@@ -109,6 +176,9 @@ static void apple_gfx_pci_reset(Object *obj, ResetType type)
     AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
 
     rvg_device_reset(s->common.pgdev);
+    if (s->common.mmio_written) {
+        memory_region_set_enabled(&s->efi_fb, false);
+    }
 }
 
 static const Property apple_gfx_pci_properties[] = {
@@ -124,6 +194,8 @@ static const Property apple_gfx_pci_properties[] = {
      * own modes at its density.
      */
     DEFINE_PROP_STRING("resolution", AppleGFXPCIState, common.resolution),
+    /* BAR 2, the EFI framebuffer's window for guests without a driver */
+    DEFINE_PROP_BOOL("efi-framebuffer-bar", AppleGFXPCIState, efi_fb_bar, true),
 };
 
 static void apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
