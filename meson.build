@@ -882,7 +882,7 @@ elif host_os == 'openbsd'
 endif
 
 # apple-gfx drives reims-vgpu's C API (reims_vgpu.h), a library found
-# through pkg-config: reims-vgpu.pc, which paravirt-decompile's `cargo
+# through pkg-config: reims-vgpu.pc, which reims-vgpu's `cargo
 # xtask dist` writes into its target/dist/lib/pkgconfig. It is linked
 # statically, so the binary records no path to it. The library runs on
 # macOS, under HVF, and on Linux, under KVM.

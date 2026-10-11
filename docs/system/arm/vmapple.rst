@@ -20,7 +20,7 @@ To run the vmapple machine model, you need to
  * Build QEMU with apple-gfx, which the machine's display needs. apple-gfx
    drives reims-vgpu's C API, a library that pkg-config finds as
    ``reims-vgpu``: pass ``--enable-pvg`` with ``PKG_CONFIG_PATH`` naming the
-   directory of its ``reims-vgpu.pc``. paravirt-decompile's ``cargo xtask
+   directory of its ``reims-vgpu.pc``. reims-vgpu's ``cargo xtask
    dist`` writes one into its ``target/dist/lib/pkgconfig``; its ``make
    qemu`` builds that and QEMU together. Without pvg the vmapple machine is
    left out of the build.
