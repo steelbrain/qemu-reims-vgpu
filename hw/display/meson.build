@@ -65,8 +65,18 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
 
 system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
 
-system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.c', 'apple-gfx-pci.c')])
-system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.c', 'apple-gfx-mmio.c')])
+# Only macOS naps an application; elsewhere apple-gfx's hold does nothing.
+if host_os == 'darwin'
+  apple_gfx_activity = [files('apple-gfx-activity.m'), foundation]
+else
+  apple_gfx_activity = files('apple-gfx-activity-stub.c')
+endif
+system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],
+              if_true: [files('apple-gfx.c', 'apple-gfx-pci.c'),
+                        apple_gfx_activity])
+system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],
+              if_true: [files('apple-gfx.c', 'apple-gfx-mmio.c'),
+                        apple_gfx_activity])
 
 if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   virtio_gpu_ss = ss.source_set()

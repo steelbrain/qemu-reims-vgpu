@@ -16,7 +16,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu/aio-wait.h"
+#include "qemu/main-loop.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "apple-gfx.h"
@@ -35,69 +35,29 @@ struct AppleGFXMMIOState {
     RvgIOSurfaceDevice *pgiosfc;
 };
 
-typedef struct AppleGFXMMIOJob {
-    AppleGFXMMIOState *state;
-    uint64_t offset;
-    uint64_t value;
-    bool completed;
-} AppleGFXMMIOJob;
-
 /*
  * The IOSurface device's registers are 64 bits wide, and QEMU reads and
- * writes them as 32: a value read is truncated, then zero-extended into
- * job->value, and a value written is truncated.
+ * writes them as 32: a value read is truncated, then zero-extended, and a
+ * value written is truncated. The vCPU calls the library itself, as
+ * apple-gfx.c's accesses do: an access waits only on the IOSurface device's
+ * thread, whose one callback schedules a BH.
  */
-static int iosfc_do_read(void *opaque)
-{
-    AppleGFXMMIOJob *job = opaque;
-    job->value = (uint32_t)rvg_iosurface_device_mmio_read(job->state->pgiosfc,
-                                                          job->offset);
-    qatomic_set(&job->completed, true);
-    aio_wait_kick();
-    return 0;
-}
-
 static uint64_t iosfc_read(void *opaque, hwaddr offset, unsigned size)
 {
     AppleGFXMMIOState *s = opaque;
-    AppleGFXMMIOJob job = {
-        .state = s,
-        .offset = offset,
-        .completed = false,
-    };
+    uint64_t value = (uint32_t)rvg_iosurface_device_mmio_read(s->pgiosfc,
+                                                              offset);
 
-    /* On a pool thread, as apple-gfx.c's apple_gfx_write says. */
-    thread_pool_submit_immediate(s->common.pool, iosfc_do_read, &job, NULL);
-    AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
-
-    trace_apple_gfx_mmio_iosfc_read(offset, job.value);
-    return job.value;
-}
-
-static int iosfc_do_write(void *opaque)
-{
-    AppleGFXMMIOJob *job = opaque;
-    rvg_iosurface_device_mmio_write(job->state->pgiosfc, job->offset,
-                                    (uint32_t)job->value);
-    qatomic_set(&job->completed, true);
-    aio_wait_kick();
-    return 0;
+    trace_apple_gfx_mmio_iosfc_read(offset, value);
+    return value;
 }
 
 static void iosfc_write(void *opaque, hwaddr offset, uint64_t val,
                         unsigned size)
 {
     AppleGFXMMIOState *s = opaque;
-    AppleGFXMMIOJob job = {
-        .state = s,
-        .offset = offset,
-        .value = val,
-        .completed = false,
-    };
 
-    thread_pool_submit_immediate(s->common.pool, iosfc_do_write, &job, NULL);
-    AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
-
+    rvg_iosurface_device_mmio_write(s->pgiosfc, offset, (uint32_t)val);
     trace_apple_gfx_mmio_iosfc_write(offset, val);
 }
 
@@ -126,6 +86,7 @@ static void raise_irq_bh(void *opaque)
 static void apple_gfx_mmio_iosfc_raise_interrupt_cb(void *ctx, uint32_t vector)
 {
     AppleGFXMMIOState *s = ctx;
+
     trace_apple_gfx_iosfc_raise_irq(vector);
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             raise_irq_bh, &s->irq_iosfc);
@@ -135,7 +96,7 @@ static bool apple_gfx_mmio_create_iosurface_device(AppleGFXMMIOState *s,
                                                    Error **errp)
 {
     /* The library copies the ranges. */
-    g_autoptr(GArray) memory_ranges = apple_gfx_new_memory_ranges();
+    g_autoptr(GArray) memory_ranges = apple_gfx_new_memory_ranges(NULL);
     RvgMemoryMap memory_map = {
         .ranges = (const RvgMemoryRange *)memory_ranges->data,
         .range_count = memory_ranges->len,
@@ -163,11 +124,13 @@ static bool apple_gfx_mmio_create_iosurface_device(AppleGFXMMIOState *s,
 
 /*
  * On a library thread (a FIFO's or the device's reporting thread), or inside
- * a call that may call back, such as apple_gfx_mmio_reset's.
+ * a call that may call back: an MMIO access, on the vCPU's thread, or
+ * apple_gfx_mmio_reset's.
  */
 static void apple_gfx_mmio_raise_interrupt_cb(void *ctx, uint32_t vector)
 {
     AppleGFXMMIOState *s = ctx;
+
     trace_apple_gfx_raise_irq(vector);
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             raise_irq_bh, &s->irq_gfx);
@@ -210,9 +173,17 @@ static void apple_gfx_mmio_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq_iosfc);
 }
 
+static void apple_gfx_mmio_finalize(Object *obj)
+{
+    AppleGFXMMIOState *s = APPLE_GFX_MMIO(obj);
+
+    apple_gfx_common_finalize(&s->common);
+}
+
 static void apple_gfx_mmio_reset(Object *obj, ResetType type)
 {
     AppleGFXMMIOState *s = APPLE_GFX_MMIO(obj);
+
     rvg_device_reset(s->common.pgdev);
 }
 
@@ -223,9 +194,10 @@ static const Property apple_gfx_mmio_properties[] = {
     /* The guest's display ports, 1 to RVG_MAX_DISPLAY_PORTS. */
     DEFINE_PROP_UINT32("displays", AppleGFXMMIOState, common.num_displays, 1),
     /*
-     * In window mode, the mode the guest runs first, at 1x, scaled by the
-     * window: "<width>x<height>" (default 1920x1080), or "host" for the host
-     * screen's own modes at its density.
+     * In window mode, the mode the guest runs first, scaled by the window:
+     * "<width>x<height>" (default 1920x1080), at 1x or followed by "@<ppi>",
+     * the density the guest is told for it, or "host" for the host screen's
+     * own modes at its density.
      */
     DEFINE_PROP_STRING("resolution", AppleGFXMMIOState, common.resolution),
 };
@@ -249,6 +221,7 @@ static const TypeInfo apple_gfx_mmio_types[] = {
         .instance_size = sizeof(AppleGFXMMIOState),
         .class_init    = apple_gfx_mmio_class_init,
         .instance_init = apple_gfx_mmio_init,
+        .instance_finalize = apple_gfx_mmio_finalize,
     }
 };
 DEFINE_TYPES(apple_gfx_mmio_types)

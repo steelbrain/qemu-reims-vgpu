@@ -2404,7 +2404,8 @@ static bool hvf_emulate_isv0_mmio(CPUState *cpu, hwaddr ipa, uint32_t *insn_out)
         /* Load/store pair (incl. no-allocate): C4.1.66 op0=x101. */
         uint32_t opc = extract32(insn, 30, 2);
         bool is_vector = extract32(insn, 26, 1);
-        uint32_t mode = extract32(insn, 23, 2);   /* 0=STNP/LDNP 1=post 2=offset 3=pre */
+        /* 0=STNP/LDNP 1=post 2=offset 3=pre */
+        uint32_t mode = extract32(insn, 23, 2);
         bool is_load = extract32(insn, 22, 1);
         int64_t imm7 = sextract32(insn, 15, 7);
         uint32_t rt2 = extract32(insn, 10, 5);
@@ -2430,7 +2431,7 @@ static bool hvf_emulate_isv0_mmio(CPUState *cpu, hwaddr ipa, uint32_t *insn_out)
             return false;                   /* unallocated / STGP */
         }
         if (wback && rn == 31) {
-            return false;                   /* SP-based MMIO writeback: refuse */
+            return false;               /* SP-based MMIO writeback: refuse */
         }
 
         for (int i = 0; i < 2; i++) {
@@ -2439,10 +2440,12 @@ static bool hvf_emulate_isv0_mmio(CPUState *cpu, hwaddr ipa, uint32_t *insn_out)
             uint8_t buf[16] = { 0 };
 
             if (is_load) {
-                address_space_read(as, addr, MEMTXATTRS_UNSPECIFIED, buf, esize);
+                address_space_read(as, addr, MEMTXATTRS_UNSPECIFIED, buf,
+                                   esize);
                 if (is_vector) {
                     env->vfp.zregs[reg].d[0] = ldq_le_p(buf);
-                    env->vfp.zregs[reg].d[1] = esize == 16 ? ldq_le_p(buf + 8) : 0;
+                    env->vfp.zregs[reg].d[1] =
+                        esize == 16 ? ldq_le_p(buf + 8) : 0;
                 } else if (reg != 31) {
                     uint64_t v = esize == 4 ? ldl_le_p(buf) : ldq_le_p(buf);
                     env->xregs[reg] = sext ? sextract64(v, 0, 32) : v;
@@ -2460,7 +2463,8 @@ static bool hvf_emulate_isv0_mmio(CPUState *cpu, hwaddr ipa, uint32_t *insn_out)
                         stq_le_p(buf, env->xregs[reg]);
                     }
                 }
-                address_space_write(as, addr, MEMTXATTRS_UNSPECIFIED, buf, esize);
+                address_space_write(as, addr, MEMTXATTRS_UNSPECIFIED, buf,
+                                    esize);
             }
         }
         if (wback) {
@@ -2474,7 +2478,7 @@ static bool hvf_emulate_isv0_mmio(CPUState *cpu, hwaddr ipa, uint32_t *insn_out)
         /*
          * Load/store single GPR, imm9/register-offset forms: bits[29:24]=
          * 111000. The pre/post-indexed (writeback) forms report ISV=0
-         * because the syndrome cannot describe the base update — macOS 13+
+         * because the syndrome cannot describe the base update: macOS 13+
          * uses e.g. "str w9, [x8, #128]!" on MMIO.
          */
         uint32_t size = extract32(insn, 30, 2);
@@ -2512,7 +2516,8 @@ static bool hvf_emulate_isv0_mmio(CPUState *cpu, hwaddr ipa, uint32_t *insn_out)
                 stq_le_p(buf, env->xregs[rt]);
             }
             address_space_write(as, ipa, MEMTXATTRS_UNSPECIFIED, buf, esize);
-        } else {                        /* load: 01 zext, 10 sext→X, 11 sext→W */
+        } else {
+            /* load: 01 zext, 10 sext to X, 11 sext to W */
             uint64_t v;
 
             address_space_read(as, ipa, MEMTXATTRS_UNSPECIFIED, buf, esize);
@@ -2573,7 +2578,7 @@ static bool hvf_emulate_isv0_mmio(CPUState *cpu, hwaddr ipa, uint32_t *insn_out)
             }
         }
         if (wback && rn == 31) {
-            return false;                   /* SP-based MMIO writeback: refuse */
+            return false;               /* SP-based MMIO writeback: refuse */
         }
 
         if (is_load) {

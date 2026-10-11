@@ -38,12 +38,14 @@ typedef struct AppleGFXDisplay {
     QEMUCursor *cursor;
     DisplaySurface *surface;
     RvgFrameTarget *target; /* The surface's size, BGRA8; NULL if refused */
-    /* # guest frames in the rendering pipeline; in window mode, gfx_update's */
-    int8_t pending_frames;
-    bool gfx_update_requested; /* QEMU display system wants a new frame */
-    bool new_frame_ready; /* Guest has rendered a frame, ready to be used */
-    uint32_t rendering_frame_width;
-    uint32_t rendering_frame_height;
+    bool rendering; /* A render into the surface is under way */
+    /*
+     * The guest presented a frame, or the surface changed, since the last
+     * render began
+     */
+    bool frame_dirty;
+    /* Until then, on QEMU_CLOCK_REALTIME, a listener shows the surface */
+    int64_t watched_until_ms;
     bool cursor_show;
 } AppleGFXDisplay;
 
@@ -56,8 +58,8 @@ struct AppleGFXState {
     MemoryRegion iomem_gfx;
     RvgDevice *pgdev;
     /*
-     * Runs the library's MMIO calls, which may block and call back, off the
-     * vCPU thread, and the frame encodes off the main loop.
+     * Runs the renders into the surfaces: each frame's encode, wait and read,
+     * off the main loop.
      */
     ThreadPool *pool;
     AppleGFXDisplayMode *display_modes;
@@ -65,6 +67,7 @@ struct AppleGFXState {
     uint32_t num_displays; /* 1 to RVG_MAX_DISPLAY_PORTS, on ports 0 up */
     /*
      * The mode a window display offers the guest first: "<width>x<height>",
+     * optionally followed by "@<ppi>", the density the guest is told for it,
      * or "host" for the host screen's own modes; NULL is 1920x1080.
      */
     char *resolution;
@@ -73,6 +76,8 @@ struct AppleGFXState {
      * and sends its input (-display none, unless REIMS_VGPU_WINDOW=0).
      */
     bool window;
+    /* Realize began a hold on the activity against App Nap. */
+    bool holds_activity;
     AppleGFXDisplay displays[RVG_MAX_DISPLAY_PORTS];
 
     /*
@@ -87,15 +92,29 @@ struct AppleGFXState {
     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
 };
 
-void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char* obj_name);
+void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char *obj_name);
 /*
  * Makes the device from @config, which the bus variant fills in with its
  * callbacks and flags, then its displays and their consoles.
  */
 bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                               RvgDeviceConfig *config, Error **errp);
-/* The guest's RAM, as RvgMemoryRange elements: an RvgMemoryMap's ranges. */
-GArray *apple_gfx_new_memory_ranges(void);
+/* Ends the hold on the activity against App Nap that realize began. */
+void apple_gfx_common_finalize(AppleGFXState *s);
+/*
+ * The process's user-initiated activity, which keeps App Nap from slowing
+ * the VM (apple-gfx-activity.m): begun at the first hold, ended at the last
+ * hold's end. Under the BQL. On hosts without App Nap they do nothing
+ * (apple-gfx-activity-stub.c).
+ */
+void apple_gfx_activity_begin(void);
+void apple_gfx_activity_end(void);
+/*
+ * The guest's RAM, as RvgMemoryRange elements: an RvgMemoryMap's ranges.
+ * Unless @files is NULL, it gets the file behind each range, as
+ * RvgMemoryRangeFile elements in the same order, fd -1 where there is none.
+ */
+GArray *apple_gfx_new_memory_ranges(GArray **files);
 
 extern const PropertyInfo qdev_prop_apple_gfx_display_mode;
 

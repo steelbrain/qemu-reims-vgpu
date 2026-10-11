@@ -37,6 +37,13 @@ static void apple_gfx_pci_init(Object *obj)
     apple_gfx_common_init(obj, &s->common, TYPE_APPLE_GFX_PCI);
 }
 
+static void apple_gfx_pci_finalize(Object *obj)
+{
+    AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
+
+    apple_gfx_common_finalize(&s->common);
+}
+
 typedef struct AppleGFXPCIInterruptJob {
     PCIDevice *device;
     uint32_t vector;
@@ -54,7 +61,8 @@ static void apple_gfx_pci_raise_interrupt(void *opaque)
 
 /*
  * On a library thread (a FIFO's or the device's reporting thread), or inside
- * a call that may call back, such as apple_gfx_pci_reset's.
+ * a call that may call back: an MMIO access, on the vCPU's thread, or
+ * apple_gfx_pci_reset's.
  */
 static void apple_gfx_pci_raise_interrupt_cb(void *ctx, uint32_t vector)
 {
@@ -62,7 +70,7 @@ static void apple_gfx_pci_raise_interrupt_cb(void *ctx, uint32_t vector)
     AppleGFXPCIInterruptJob *job;
 
     trace_apple_gfx_raise_irq(vector);
-    job = g_malloc0(sizeof(*job));
+    job = g_new0(AppleGFXPCIInterruptJob, 1);
     job->device = dev;
     job->vector = vector;
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
@@ -99,6 +107,7 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
 static void apple_gfx_pci_reset(Object *obj, ResetType type)
 {
     AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
+
     rvg_device_reset(s->common.pgdev);
 }
 
@@ -109,9 +118,10 @@ static const Property apple_gfx_pci_properties[] = {
     /* The guest's display ports, 1 to RVG_MAX_DISPLAY_PORTS. */
     DEFINE_PROP_UINT32("displays", AppleGFXPCIState, common.num_displays, 1),
     /*
-     * In window mode, the mode the guest runs first, at 1x, scaled by the
-     * window: "<width>x<height>" (default 1920x1080), or "host" for the host
-     * screen's own modes at its density.
+     * In window mode, the mode the guest runs first, scaled by the window:
+     * "<width>x<height>" (default 1920x1080), at 1x or followed by "@<ppi>",
+     * the density the guest is told for it, or "host" for the host screen's
+     * own modes at its density.
      */
     DEFINE_PROP_STRING("resolution", AppleGFXPCIState, common.resolution),
 };
@@ -143,6 +153,7 @@ static const TypeInfo apple_gfx_pci_types[] = {
         .instance_size = sizeof(AppleGFXPCIState),
         .class_init    = apple_gfx_pci_class_init,
         .instance_init = apple_gfx_pci_init,
+        .instance_finalize = apple_gfx_pci_finalize,
         .interfaces = (const InterfaceInfo[]) {
             { INTERFACE_PCIE_DEVICE },
             { },
