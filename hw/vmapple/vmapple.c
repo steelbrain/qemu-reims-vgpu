@@ -766,6 +766,11 @@ static GlobalProperty vmapple_compat_defaults[] = {
      * mapping in the XHCI controller works around the problem.
      */
     { TYPE_XHCI_PCI, "conditional-intr-mapping", "on" },
+    /*
+     * macOS 27's virtio PCI transport never starts a device whose
+     * capabilities are linked from high offsets to low.
+     */
+    { "virtio-net-pci-base", "x-ascending-capabilities", "on" },
 };
 
 static char *vmapple_get_tablet(Object *obj, Error **errp)
