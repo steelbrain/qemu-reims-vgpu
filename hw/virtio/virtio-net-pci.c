@@ -36,9 +36,12 @@ DECLARE_INSTANCE_CHECKER(VirtIONetPCI, VIRTIO_NET_PCI,
 struct VirtIONetPCI {
     VirtIOPCIProxy parent_obj;
     VirtIONet vdev;
+    bool ascending_capabilities;
 };
 
 static const Property virtio_net_properties[] = {
+    DEFINE_PROP_BOOL("x-ascending-capabilities", VirtIONetPCI,
+                     ascending_capabilities, false),
     DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
@@ -61,6 +64,28 @@ static void virtio_net_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
     virtio_net_set_netclient_name(&dev->vdev, qdev->id,
                                   object_get_typename(OBJECT(qdev)));
     qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
+
+    if (dev->ascending_capabilities && qdev_is_realized(vdev)) {
+        uint8_t *config = vpci_dev->pci_dev.config;
+        bool capabilities[PCI_CONFIG_SPACE_SIZE] = { false };
+        unsigned offset, previous = PCI_CAPABILITY_LIST;
+
+        /* Local Golden Gate workaround: its cached and fallback capability
+         * lookups revisit PCI_CFG and NOTIFY forever on descending lists.
+         * Keep capability contents and offsets; only reorder the links. */
+        for (offset = config[PCI_CAPABILITY_LIST]; offset;
+             offset = config[offset + PCI_CAP_LIST_NEXT]) {
+            capabilities[offset] = true;
+        }
+        for (offset = PCI_CONFIG_HEADER_SIZE; offset < PCI_CONFIG_SPACE_SIZE;
+             offset++) {
+            if (capabilities[offset]) {
+                config[previous] = offset;
+                previous = offset + PCI_CAP_LIST_NEXT;
+            }
+        }
+        config[previous] = 0;
+    }
 }
 
 static void virtio_net_pci_class_init(ObjectClass *klass, const void *data)

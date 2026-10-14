@@ -16,6 +16,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/pci/pci.h"
 #include "hw/vmapple/vmapple.h"
 #include "hw/virtio/virtio-blk.h"
 #include "hw/virtio/virtio-pci.h"
@@ -44,6 +45,8 @@ typedef struct VMAppleVirtIOBlk {
 OBJECT_DECLARE_SIMPLE_TYPE(VMAppleVirtIOBlkPCI, VMAPPLE_VIRTIO_BLK_PCI)
 
 #define VIRTIO_BLK_T_APPLE_BARRIER     0x10000
+#define VMAPPLE_PCI_VNDR_SIZE 14
+#define VMAPPLE_PCI_VNDR_DISABLE_ENCRYPTION 1
 
 static bool vmapple_virtio_blk_handle_unknown_request(VirtIOBlockReq *req,
                                                       MultiReqBuffer *mrb,
@@ -125,6 +128,10 @@ static void vmapple_virtio_blk_pci_realize(VirtIOPCIProxy *vpci_dev, Error **err
     VMAppleVirtIOBlkPCI *dev = VMAPPLE_VIRTIO_BLK_PCI(vpci_dev);
     DeviceState *vdev = DEVICE(&dev->vdev);
     VirtIOBlkConf *conf = &dev->vdev.parent_obj.conf;
+    int offset;
+    uint8_t capabilities[PCI_CONFIG_SPACE_SIZE] = { 0 };
+    uint8_t *config = vpci_dev->pci_dev.config;
+    int previous = PCI_CAPABILITY_LIST;
 
     if (dev->variant == VM_APPLE_VIRTIO_BLK_VARIANT_UNSPECIFIED) {
         error_setg(errp, "vmapple virtio block device variant unspecified");
@@ -162,6 +169,38 @@ static void vmapple_virtio_blk_pci_realize(VirtIOPCIProxy *vpci_dev, Error **err
     pci_config_set_vendor_id(vpci_dev->pci_dev.config, PCI_VENDOR_ID_APPLE);
     pci_config_set_device_id(vpci_dev->pci_dev.config,
                              PCI_DEVICE_ID_APPLE_VIRTIO_BLK);
+    pci_set_word(vpci_dev->pci_dev.config + PCI_SUBSYSTEM_ID, 0x1100);
+
+    /* A non-FileVault Golden Gate root disk requires Apple's vendor
+     * capability to advertise that transport encryption is disabled. */
+    offset = pci_add_capability(&vpci_dev->pci_dev, PCI_CAP_ID_VNDR, 0,
+                                VMAPPLE_PCI_VNDR_SIZE, errp);
+    if (offset < 0) {
+        return;
+    }
+    pci_set_byte(vpci_dev->pci_dev.config + offset + 2,
+                 VMAPPLE_PCI_VNDR_SIZE);
+    pci_set_byte(vpci_dev->pci_dev.config + offset + 3, 9);
+    pci_set_word(vpci_dev->pci_dev.config + offset + 4, PCI_VENDOR_ID_APPLE);
+    pci_set_byte(vpci_dev->pci_dev.config + offset + 6,
+                 VMAPPLE_PCI_VNDR_DISABLE_ENCRYPTION);
+
+    /* Golden Gate's cached capability lookup and its fallback disagree on
+     * descending lists: the storage probe alternates between the final
+     * vendor capability and VIRTIO_PCI_CAP_PCI_CFG forever. Keep the same
+     * capabilities and offsets, but enumerate them in address order. */
+    for (offset = config[PCI_CAPABILITY_LIST]; offset;
+         offset = config[offset + PCI_CAP_LIST_NEXT]) {
+        capabilities[offset] = 1;
+    }
+    for (offset = PCI_CONFIG_HEADER_SIZE; offset < PCI_CONFIG_SPACE_SIZE;
+         offset++) {
+        if (capabilities[offset]) {
+            config[previous] = offset;
+            previous = offset + PCI_CAP_LIST_NEXT;
+        }
+    }
+    config[previous] = 0;
 }
 
 static void vmapple_virtio_blk_pci_class_init(ObjectClass *klass,
