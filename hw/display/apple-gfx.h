@@ -18,6 +18,7 @@
 
 #define TYPE_APPLE_GFX_MMIO         "apple-gfx-mmio"
 #define TYPE_APPLE_GFX_PCI          "apple-gfx-pci"
+#define TYPE_APPLE_GFX_IOSURFACE_PCI "apple-gfx-iosurface-pci"
 
 typedef struct AppleGFXDisplayMode {
     uint16_t width_px;
