@@ -221,3 +221,19 @@ apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 apple_gfx_pci_iosfc_read(uint64_t offset, uint64_t res, unsigned size) "offset=0x%"PRIx64" res=0x%"PRIx64" size=%u"
 apple_gfx_pci_iosfc_write(uint64_t offset, uint64_t val, unsigned size) "offset=0x%"PRIx64" val=0x%"PRIx64" size=%u"
 
+# apple-videotoolbox-pci.c
+apple_videotoolbox_from_guest(size_t length, size_t room, int32_t status) "length=%zu room=%zu status=%d"
+apple_videotoolbox_send_to_guest(size_t length) "length=%zu"
+apple_videotoolbox_to_guest(size_t length, size_t room) "length=%zu room=%zu"
+apple_videotoolbox_set_status(uint8_t status) "status=0x%x"
+apple_videotoolbox_reset(void) ""
+apple_videotoolbox_work(size_t length) "length=%zu"
+apple_videotoolbox_drain_worker(bool discarded) "discarded=%d"
+
+# apple-m2scaler-pci.c
+apple_m2scaler_request(size_t length, size_t room, uint32_t outcome, uint32_t type, uint32_t status) "length=%zu room=%zu outcome=%u type=%u status=0x%x"
+apple_m2scaler_set_status(uint8_t status) "status=0x%x"
+apple_m2scaler_reset(void) ""
+apple_m2scaler_features_refused(void) ""
+apple_m2scaler_work(size_t length) "length=%zu"
+apple_m2scaler_drain(bool discarded) "discarded=%d"

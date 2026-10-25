@@ -74,6 +74,14 @@ endif
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],
               if_true: [files('apple-gfx.c', 'apple-gfx-pci.c'),
                         apple_gfx_activity])
+# The VideoToolbox device's transport; reims-vgpu's video device is its host
+# side.
+system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_VIDEO_PCI'],
+              if_true: files('apple-videotoolbox-pci.c'))
+# The M2 scaler device's transport; reims-vgpu's scaler device is its host
+# side.
+system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_SCALER_PCI'],
+              if_true: files('apple-m2scaler-pci.c'))
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],
               if_true: [files('apple-gfx.c', 'apple-gfx-mmio.c'),
                         apple_gfx_activity])
