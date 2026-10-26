@@ -18,6 +18,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/vmapple/vmapple.h"
 #include "migration/vmstate.h"
+#include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -559,10 +560,45 @@ static void aes_init(Object *obj)
     s->as = &address_space_memory;
 }
 
+/*
+ * The guest's DATA commands run on QEMU's ciphers. A build that found no
+ * crypto library (gnutls, nettle or libgcrypt) has none: each DATA command
+ * then fails, stays at the head of the FIFO, and the guest waits for it
+ * forever. A macOS guest sends one as it mounts its root volume, so refuse
+ * to start rather than hang there.
+ */
+static void aes_realize(DeviceState *dev, Error **errp)
+{
+    static const QCryptoCipherAlgo algs[] = {
+        QCRYPTO_CIPHER_ALGO_AES_128,
+        QCRYPTO_CIPHER_ALGO_AES_192,
+        QCRYPTO_CIPHER_ALGO_AES_256,
+    };
+    static const QCryptoCipherMode modes[] = {
+        QCRYPTO_CIPHER_MODE_ECB,
+        QCRYPTO_CIPHER_MODE_CBC,
+    };
+
+    for (size_t a = 0; a < ARRAY_SIZE(algs); a++) {
+        for (size_t m = 0; m < ARRAY_SIZE(modes); m++) {
+            if (!qcrypto_cipher_supports(algs[a], modes[m])) {
+                error_setg(errp, "%s needs %s in %s mode, which this QEMU "
+                           "lacks: build it with a crypto library (gnutls, "
+                           "nettle or libgcrypt)", TYPE_APPLE_AES,
+                           QCryptoCipherAlgo_str(algs[a]),
+                           QCryptoCipherMode_str(modes[m]));
+                return;
+            }
+        }
+    }
+}
+
 static void aes_class_init(ObjectClass *klass, const void *data)
 {
+    DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
+    dc->realize = aes_realize;
     rc->phases.hold = aes_reset;
 }
 
