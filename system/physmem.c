@@ -1757,6 +1757,14 @@ static void *file_ram_alloc(RAMBlock *block,
     if (kvm_enabled()) {
         block->mr->align = MAX(block->mr->align, QEMU_VMALLOC_ALIGN);
     }
+#elif defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+    /*
+     * As anonymous RAM: a file of base pages (a memfd's shmem) can be backed
+     * by transparent huge pages, which the kernel maps, and KVM then maps,
+     * 2 MiB at a time only where the mapping's address keeps the file's
+     * offset in a huge page; at the base page's alignment it never does.
+     */
+    block->mr->align = MAX(block->mr->align, QEMU_VMALLOC_ALIGN);
 #endif
 
     if (memory < block->page_size) {
