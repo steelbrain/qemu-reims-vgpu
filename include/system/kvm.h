@@ -539,6 +539,16 @@ bool kvm_dirty_ring_enabled(void);
 
 uint32_t kvm_dirty_ring_size(void);
 
+typedef void (*KVMDirtySlotFn)(void *opaque, uint32_t slot, uint64_t gpa,
+                               uint64_t size, uint64_t ram_addr);
+
+/*
+ * Under the slots' lock, calls @fn (unless NULL) for each slot logging dirty
+ * pages. Returns the VM's fd, or -1 (no call) unless the log is manual and
+ * initially set, without the dirty ring or global dirty tracking.
+ */
+int kvm_dirty_log_for_each_slot(KVMDirtySlotFn fn, void *opaque);
+
 void kvm_mark_guest_state_protected(void);
 
 /**

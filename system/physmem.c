@@ -1185,6 +1185,29 @@ DirtyBitmapSnapshot *physical_memory_snapshot_and_clear_dirty
     return snap;
 }
 
+void physical_memory_take_dirty(ram_addr_t start, ram_addr_t length,
+                                unsigned client, unsigned long *bitmap)
+{
+    unsigned long page = start >> TARGET_PAGE_BITS;
+    unsigned long end = (start + length) >> TARGET_PAGE_BITS;
+
+    assert(QEMU_IS_ALIGNED(page | end, BITS_PER_LONG));
+    WITH_RCU_READ_LOCK_GUARD() {
+        DirtyMemoryBlocks *blocks =
+            qatomic_rcu_read(&ram_list.dirty_memory[client]);
+
+        for (; page < end; page += BITS_PER_LONG, bitmap++) {
+            unsigned long i = page / DIRTY_MEMORY_BLOCK_SIZE;
+            unsigned long *word =
+                &blocks->blocks[i][BIT_WORD(page % DIRTY_MEMORY_BLOCK_SIZE)];
+
+            if (qatomic_read(word)) {
+                *bitmap |= qatomic_xchg(word, 0);
+            }
+        }
+    }
+}
+
 bool physical_memory_snapshot_get_dirty(DirtyBitmapSnapshot *snap,
                                             ram_addr_t start,
                                             ram_addr_t length)

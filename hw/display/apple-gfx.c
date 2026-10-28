@@ -24,6 +24,11 @@
 #include "qapi/qapi-commands-ui.h"
 #include "system/address-spaces.h"
 #include "migration/blocker.h"
+#include "exec/target_page.h"
+#include "hw/core/boards.h"
+#include "hw/core/cpu.h"
+#include "system/kvm.h"
+#include "system/physmem.h"
 #include "system/memory.h"
 #include "system/ramblock.h"
 #include "system/runstate.h"
@@ -737,6 +742,72 @@ static bool apple_gfx_memory_files(GArray *ranges, GArray *files,
 }
 
 /*
+ * The dirty source: under KVM the library reads the guest RAM's dirty log on
+ * the VM's fd, from its own thread, which never holds the BQL. The RAM logs
+ * from the first harvest on (a BH): KVM maps a logged slot 4 KiB at a time.
+ * flush_vcpus waits until each vCPU in KVM_RUN has left it once, draining its
+ * page-modification log, which KVM_GET_DIRTY_LOG only kicks. QEMU's own DMA
+ * (the scaler's writes) marks DIRTY_MEMORY_VGA, which the library takes too.
+ */
+static void apple_gfx_dirty_start_bh(void *opaque)
+{
+    memory_region_set_log(current_machine->ram, true, DIRTY_MEMORY_VGA);
+}
+
+static void apple_gfx_dirty_start(void *ctx)
+{
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), apple_gfx_dirty_start_bh,
+                            NULL);
+}
+
+static bool apple_gfx_dirty_flush_vcpus(void *ctx, uint64_t timeout_ns)
+{
+    int64_t deadline = get_clock() + timeout_ns;
+    g_autofree uint32_t *seq = g_new(uint32_t, current_machine->smp.max_cpus);
+    bool ok = true;
+    CPUState *cpu;
+
+    rcu_register_thread();
+    WITH_RCU_READ_LOCK_GUARD() {
+        CPU_FOREACH(cpu) {
+            seq[cpu->cpu_index] = qatomic_read(&cpu->kvm_run_seq);
+            if (seq[cpu->cpu_index] & 1) {
+                qemu_cpu_kick(cpu);
+            }
+        }
+        CPU_FOREACH(cpu) {
+            uint32_t was = seq[cpu->cpu_index];
+
+            while (ok && (was & 1) &&
+                   qatomic_load_acquire(&cpu->kvm_run_seq) == was) {
+                g_thread_yield();
+                ok = get_clock() < deadline;
+            }
+        }
+    }
+    rcu_unregister_thread();
+    return ok;
+}
+
+/* rvg_dirty_slot takes QEMU's own writes (apple_gfx_dirty_take), under RCU. */
+static bool apple_gfx_dirty_for_each_slot(void *ctx, void *slot_ctx)
+{
+    bool ok;
+
+    rcu_register_thread();
+    ok = kvm_dirty_log_for_each_slot(rvg_dirty_slot, slot_ctx) >= 0;
+    rcu_unregister_thread();
+    return ok;
+}
+
+static void apple_gfx_dirty_take(void *ctx, uint64_t host_offset,
+                                 uint64_t length, uint64_t *words)
+{
+    physical_memory_take_dirty(host_offset, length, DIRTY_MEMORY_VGA,
+                               (unsigned long *)words);
+}
+
+/*
  * The display's callbacks. The library calls them on its display thread,
  * one at a time, in the order the guest's display events came.
  */
@@ -1046,6 +1117,14 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         .height_millimeters = 300.,
         .callbacks = &display_callbacks,
     };
+    RvgDirtySource dirty_source = {
+        .struct_size = sizeof(dirty_source),
+        .kvm_vm_fd = kvm_dirty_log_for_each_slot(NULL, NULL),
+        .start = apple_gfx_dirty_start,
+        .flush_vcpus = apple_gfx_dirty_flush_vcpus,
+        .for_each_slot = apple_gfx_dirty_for_each_slot,
+        .take_host_writes = apple_gfx_dirty_take,
+    };
     RvgStatus status;
     uint32_t i;
 
@@ -1082,6 +1161,11 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     config->display_port_count = s->num_displays;
     config->metal_registry_id = 0; /* the system's default Metal device */
     config->memory_map = &memory_map;
+    if (dirty_source.kvm_vm_fd >= 0 && current_machine->ram &&
+        qemu_real_host_page_size() == 4096 &&
+        qemu_target_page_size() == 4096) {
+        config->dirty_source = &dirty_source;
+    }
 
     s->pool = thread_pool_new();
     qemu_mutex_init(&s->event_lock);

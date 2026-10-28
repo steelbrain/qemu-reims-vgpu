@@ -2673,6 +2673,32 @@ uint32_t kvm_dirty_ring_size(void)
     return kvm_state->kvm_dirty_ring_size;
 }
 
+int kvm_dirty_log_for_each_slot(KVMDirtySlotFn fn, void *opaque)
+{
+    KVMState *s = kvm_state;
+
+    if (!s || s->kvm_dirty_ring_size || global_dirty_tracking ||
+        (~s->manual_dirty_log_protect & (KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE |
+                                         KVM_DIRTY_LOG_INITIALLY_SET))) {
+        return -1;
+    }
+    kvm_slots_lock();
+    for (int i = 0; fn && i < s->nr_as; i++) {
+        KVMMemoryListener *kml = s->as[i].ml;
+
+        for (int j = 0; kml && j < kml->nr_slots_allocated; j++) {
+            KVMSlot *mem = &kml->slots[j];
+
+            if (mem->memory_size && (mem->flags & KVM_MEM_LOG_DIRTY_PAGES)) {
+                fn(opaque, kml->as_id << 16 | mem->slot, mem->start_addr,
+                   mem->memory_size, mem->ram_start_offset);
+            }
+        }
+    }
+    kvm_slots_unlock();
+    return s->vmfd;
+}
+
 static int do_kvm_create_vm(KVMState *s, int type)
 {
     int ret;
@@ -3461,7 +3487,9 @@ int kvm_cpu_exec(CPUState *cpu)
             kvm_cpu_kick_self();
         }
 
+        qatomic_inc(&cpu->kvm_run_seq);
         run_ret = kvm_vcpu_ioctl(cpu, KVM_RUN, 0);
+        qatomic_inc(&cpu->kvm_run_seq);
 
         /*
          * After writing cpu->exit_request, cpu_exit() sends a signal that writes
