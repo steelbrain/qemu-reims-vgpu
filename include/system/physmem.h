@@ -101,6 +101,9 @@ physical_memory_snapshot_and_clear_dirty(MemoryRegion *mr, hwaddr offset,
 bool physical_memory_snapshot_get_dirty(DirtyBitmapSnapshot *snap,
                                         ram_addr_t start,
                                         ram_addr_t length);
+/* Moves @client's dirty bits into @bitmap a word at a time, not KVM's. */
+void physical_memory_take_dirty(ram_addr_t start, ram_addr_t length,
+                                unsigned client, unsigned long *bitmap);
 int ram_block_rebind(Error **errp);
 
 #endif
