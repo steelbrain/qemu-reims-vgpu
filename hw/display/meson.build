@@ -82,6 +82,10 @@ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_VIDEO_PCI'],
 # side.
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_SCALER_PCI'],
               if_true: files('apple-m2scaler-pci.c'))
+# The reims-graphics device's transport; reims-vgpu's graphics device is its
+# host side.
+system_ss.add(when: [pvg, 'CONFIG_REIMS_GRAPHICS_PCI'],
+              if_true: files('reims-graphics-pci.c'))
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],
               if_true: [files('apple-gfx.c', 'apple-gfx-mmio.c'),
                         apple_gfx_activity])
