@@ -3427,6 +3427,12 @@ foreach target : target_dirs
                         target in accelerator_targets.get('CONFIG_KVM', []))
       target_kconfig += 'CONFIG_MAC_PVG=y'
     endif
+    # The reims-graphics device's region is plain host memory the guest maps,
+    # whatever its architecture or accelerator, so every target may have it:
+    # x86-64 guests under TCG on a Mac among them.
+    if pvg.found()
+      target_kconfig += 'CONFIG_REIMS_GRAPHICS=y'
+    endif
 
     config_input = meson.get_external_property(target, 'default')
     config_devices_mak = target + '-config-devices.mak'
