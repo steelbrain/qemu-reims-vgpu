@@ -43,7 +43,9 @@
 #include "migration/blocker.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
+#include "system/address-spaces.h"
 #include "system/memory.h"
+#include "system/ramblock.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
 #include "ui/console.h"
@@ -491,6 +493,54 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
     }
 }
 
+typedef struct ReimsGraphicsMemoryWalk {
+    GArray *ranges;
+    GArray *files;
+    bool every_range_has_a_file;
+} ReimsGraphicsMemoryWalk;
+
+/*
+ * One range of the guest's RAM, and the file behind it: a shared mapping of
+ * a file in pages of the host's size, which the library's views of an
+ * IOSurface's pages map again. Any other RAM (anonymous, private or huge
+ * pages) has none.
+ */
+static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
+                                            const MemoryRegion *mr,
+                                            hwaddr offset_in_region,
+                                            void *opaque)
+{
+    ReimsGraphicsMemoryWalk *walk = opaque;
+    RAMBlock *rb = mr->ram_block;
+    void *host;
+    RvgMemoryRange range;
+    RvgMemoryRangeFile file = { .fd = -1 };
+    int fd;
+
+    if (!memory_access_is_direct(mr, true, MEMTXATTRS_UNSPECIFIED)) {
+        return false;
+    }
+    /* q35's RAM above 4 GiB is an alias of the block past the part below. */
+    host = (uint8_t *)memory_region_get_ram_ptr(mr) + offset_in_region;
+    range = (RvgMemoryRange) {
+        .physical_address = int128_get64(start),
+        .physical_length = int128_get64(len),
+        .host_address = host,
+    };
+    fd = memory_region_get_fd(mr);
+    if (fd >= 0 && qemu_ram_is_shared(rb) &&
+        qemu_ram_pagesize(rb) == qemu_real_host_page_size()) {
+        file.fd = fd;
+        file.offset = qemu_ram_block_host_offset(rb, host) +
+                      qemu_ram_get_fd_offset(rb);
+    } else {
+        walk->every_range_has_a_file = false;
+    }
+    g_array_append_val(walk->ranges, range);
+    g_array_append_val(walk->files, file);
+    return false;
+}
+
 static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
 {
     ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(dev);
@@ -517,6 +567,16 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .callbacks = &callbacks,
         .window = reims_graphics_window_wanted() ? &window_config : NULL,
     };
+    g_autoptr(GArray) ranges = g_array_new(false, false,
+                                           sizeof(RvgMemoryRange));
+    g_autoptr(GArray) files = g_array_new(false, false,
+                                          sizeof(RvgMemoryRangeFile));
+    ReimsGraphicsMemoryWalk walk = {
+        .ranges = ranges,
+        .files = files,
+        .every_range_has_a_file = true,
+    };
+    RvgMemoryMap memory_map;
     RvgStatus status;
     uint8_t *base;
     uint64_t size;
@@ -527,6 +587,29 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         if (migrate_add_blocker(&reims_graphics_mig_blocker, errp) < 0) {
             return;
         }
+    }
+
+    /*
+     * The guest's RAM, through which the GPU uses an IOSurface's own pages in
+     * place. The library's views of them need the file behind each range; RAM
+     * without one (not a shared memfd, or huge pages) gets no map, and each
+     * surface's GPU view stays a copy of its pages in the region. The library
+     * keeps views of the map's pages while the device lives, so they must stay
+     * the guest's RAM: no balloon or hot-unplug may discard them.
+     */
+    flatview_for_each_range(address_space_to_flatview(&address_space_memory),
+                            reims_graphics_add_memory_range, &walk);
+    if (walk.ranges->len > 0 && walk.every_range_has_a_file) {
+        memory_map = (RvgMemoryMap) {
+            .ranges = (const RvgMemoryRange *)walk.ranges->data,
+            .range_count = walk.ranges->len,
+        };
+        config.memory_map = &memory_map;
+        config.memory_files = (const RvgMemoryRangeFile *)walk.files->data;
+    } else {
+        warn_report("%s: guest RAM is not a shared memfd in pages of the "
+                    "host's size: IOSurfaces are copied for the GPU",
+                    TYPE_REIMS_GRAPHICS_PCI);
     }
 
     /* The window's input runs from here on; the callbacks need the BH. */
