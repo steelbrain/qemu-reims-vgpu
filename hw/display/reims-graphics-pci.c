@@ -20,8 +20,10 @@
  *    logging covers only the allocations, where the guest's scanout lies,
  *    and the rings' constant writes are never logged.
  *  - The library's callbacks run on its own threads with none of its locks
- *    held: an interrupt is raised by a BH, and scanout_written takes the BQL
- *    to read and clear the allocations' dirty log.
+ *    held: scanout_written takes the BQL to read and clear the allocations'
+ *    dirty log. An interrupt is raised by a write of the vector's irqfd,
+ *    where the accelerator injects MSI-X through one (KVM's in-kernel
+ *    irqchip) and MSI-X is enabled, and by a BH otherwise.
  *
  * Under -display none the library opens a window for the display, unless
  * REIMS_VGPU_WINDOW is "0", as apple-gfx does: the window keeps the size the
@@ -43,6 +45,7 @@
 #include "migration/blocker.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
+#include "system/accel-irq.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/ramblock.h"
@@ -75,6 +78,8 @@ struct ReimsGraphicsPCIState {
     EventNotifier doorbell;
     bool doorbell_made;  /* the notifier is initialised */
     bool doorbell_added; /* the notifier is BAR 0's ioeventfd */
+    EventNotifier irqfd; /* the vector's, where the accelerator has irqfds */
+    bool irqfd_made;     /* the notifier is initialised */
     RvgGraphicsDevice *device;
     QemuConsole *con;
 
@@ -85,7 +90,13 @@ struct ReimsGraphicsPCIState {
 
     /* Mutable state (BQL protected) */
     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
+    int irqfd_virq;         /* the vector's MSI route while MSI-X is enabled */
+    bool irqfd_unmasked;    /* the irqfd is the route's */
+    /* Atomic, set under the BQL: whether a raise writes the irqfd. */
+    bool irqfd_on;
 };
+
+QEMU_BUILD_BUG_ON(RVG_GRAPHICS_MSIX_VECTORS != 1);
 
 static Error *reims_graphics_mig_blocker;
 
@@ -106,15 +117,151 @@ static void reims_graphics_pci_raise_interrupt(void *opaque)
     g_free(job);
 }
 
-/* On the library's control or refresh thread, never inside a call of ours. */
+/*
+ * On the library's threads, never inside a call of ours, after the library's
+ * write of what the interrupt reports: the irqfd's write follows it on the
+ * same thread, so the guest takes the interrupt after it sees the write, as
+ * it does through the BH.
+ */
 static void reims_graphics_pci_raise_interrupt_cb(void *ctx, uint32_t vector)
 {
-    ReimsGraphicsInterruptJob *job = g_new0(ReimsGraphicsInterruptJob, 1);
+    ReimsGraphicsPCIState *s = ctx;
+    ReimsGraphicsInterruptJob *job;
 
+    if (qatomic_load_acquire(&s->irqfd_on)) {
+        event_notifier_set(&s->irqfd);
+        return;
+    }
+    job = g_new0(ReimsGraphicsInterruptJob, 1);
     job->device = ctx;
     job->vector = vector;
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             reims_graphics_pci_raise_interrupt, job);
+}
+
+/*
+ * The vector through its irqfd, set up while MSI-X is enabled, as ivshmem
+ * does. What the guest sees is what msix_notify gives it: an interrupt the
+ * vector takes while it is masked is its pending bit, and one raised while
+ * MSI-X is disabled is dropped.
+ */
+
+static int reims_graphics_pci_vector_unmask(PCIDevice *dev, unsigned vector,
+                                            MSIMessage msg)
+{
+    ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(dev);
+    int ret;
+
+    ret = accel_irqchip_update_msi_route(s->irqfd_virq, msg, dev);
+    if (ret < 0) {
+        return ret;
+    }
+    accel_irqchip_commit_routes();
+    /*
+     * Raised while the vector was masked: its pending bit, as msix_notify sets
+     * it, which msix_handle_mask_update delivers once this returns.
+     */
+    if (event_notifier_test_and_clear(&s->irqfd)) {
+        msix_set_pending(dev, vector);
+    }
+    ret = accel_irqchip_add_irqfd_notifier_gsi(&s->irqfd, NULL, s->irqfd_virq);
+    if (ret < 0) {
+        return ret;
+    }
+    s->irqfd_unmasked = true;
+    return 0;
+}
+
+static void reims_graphics_pci_vector_mask(PCIDevice *dev, unsigned vector)
+{
+    ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(dev);
+
+    if (accel_irqchip_remove_irqfd_notifier_gsi(&s->irqfd,
+                                                s->irqfd_virq) < 0) {
+        error_report("%s: remove_irqfd_notifier_gsi failed",
+                     TYPE_REIMS_GRAPHICS_PCI);
+        return;
+    }
+    s->irqfd_unmasked = false;
+}
+
+static void reims_graphics_pci_vector_poll(PCIDevice *dev,
+                                           unsigned int vector_start,
+                                           unsigned int vector_end)
+{
+    ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(dev);
+
+    if (vector_start == 0 && vector_end > 0 && msix_is_masked(dev, 0) &&
+        event_notifier_test_and_clear(&s->irqfd)) {
+        msix_set_pending(dev, 0);
+    }
+}
+
+static void reims_graphics_pci_irqfd_enable(ReimsGraphicsPCIState *s)
+{
+    PCIDevice *dev = PCI_DEVICE(s);
+    AccelRouteChange c;
+    int virq;
+
+    /* Raised while MSI-X was disabled: dropped, as the BH drops it. */
+    event_notifier_test_and_clear(&s->irqfd);
+    c = accel_irqchip_begin_route_changes();
+    virq = accel_irqchip_add_msi_route(&c, 0, dev);
+    if (virq < 0) {
+        error_report("%s: add_msi_route failed: interrupts go through a BH",
+                     TYPE_REIMS_GRAPHICS_PCI);
+        return;
+    }
+    accel_irqchip_commit_route_changes(&c);
+    s->irqfd_virq = virq;
+    if (msix_set_vector_notifiers(dev, reims_graphics_pci_vector_unmask,
+                                  reims_graphics_pci_vector_mask,
+                                  reims_graphics_pci_vector_poll) < 0) {
+        error_report("%s: set_vector_notifiers failed: interrupts go "
+                     "through a BH", TYPE_REIMS_GRAPHICS_PCI);
+        accel_irqchip_release_virq(virq);
+        s->irqfd_virq = -1;
+        return;
+    }
+    qatomic_store_release(&s->irqfd_on, true);
+}
+
+/*
+ * A raise that still writes the irqfd after this leaves a count there, which
+ * the next enable drops.
+ */
+static void reims_graphics_pci_irqfd_disable(ReimsGraphicsPCIState *s)
+{
+    PCIDevice *dev = PCI_DEVICE(s);
+
+    if (!dev->msix_vector_use_notifier) {
+        return;
+    }
+    qatomic_store_release(&s->irqfd_on, false);
+    msix_unset_vector_notifiers(dev);
+    /* Where MSI-X was already disabled, unset called no mask notifier. */
+    if (s->irqfd_unmasked) {
+        reims_graphics_pci_vector_mask(dev, 0);
+    }
+    accel_irqchip_release_virq(s->irqfd_virq);
+    s->irqfd_virq = -1;
+}
+
+static void reims_graphics_pci_write_config(PCIDevice *dev, uint32_t address,
+                                            uint32_t val, int len)
+{
+    ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(dev);
+    bool was_enabled = msix_enabled(dev);
+
+    pci_default_write_config(dev, address, val, len);
+    if (!s->irqfd_made) {
+        return;
+    }
+    if (!was_enabled && msix_enabled(dev)) {
+        reims_graphics_pci_irqfd_enable(s);
+    } else if (was_enabled && !msix_enabled(dev)) {
+        reims_graphics_pci_irqfd_disable(s);
+    }
 }
 
 /*
@@ -454,8 +601,8 @@ static void reims_graphics_pci_init(Object *obj)
  * unmapped. The library's threads end without being waited for, and its
  * region stays mapped until they and the window's GPU work let it go. A
  * callback they or the window run meanwhile still schedules its BH, as
- * apple-gfx's do: the device is not hotpluggable, so that is only at QEMU's
- * end.
+ * apple-gfx's do, or writes the irqfd, which stays open for it: the device
+ * is not hotpluggable, so that is only at QEMU's end.
  */
 static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
 {
@@ -475,6 +622,9 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
     if (s->doorbell_made) {
         event_notifier_cleanup(&s->doorbell);
         s->doorbell_made = false;
+    }
+    if (s->irqfd_made) {
+        reims_graphics_pci_irqfd_disable(s);
     }
     if (msix_present(dev)) {
         msix_uninit(dev, &s->bar0, &s->bar0);
@@ -629,6 +779,15 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     }
     /* The one vector is always in use: the guest has only it. */
     msix_vector_use(dev, 0);
+    s->irqfd_virq = -1;
+    if (accel_msi_via_irqfd_enabled()) {
+        if (event_notifier_init(&s->irqfd, false) < 0) {
+            error_setg(errp, "%s: the interrupt's event notifier",
+                       TYPE_REIMS_GRAPHICS_PCI);
+            goto fail;
+        }
+        s->irqfd_made = true;
+    }
     pci_register_bar(dev, RVG_GRAPHICS_PCI_BAR_REGISTERS,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar0);
 
@@ -687,6 +846,10 @@ static void reims_graphics_pci_reset(Object *obj, ResetType type)
 {
     ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(obj);
 
+    /* The reset disables MSI-X without a config write. */
+    if (s->irqfd_made) {
+        reims_graphics_pci_irqfd_disable(s);
+    }
     if (s->device) {
         rvg_graphics_device_reset(s->device);
     }
@@ -714,6 +877,7 @@ static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
     pci->device_id = RVG_GRAPHICS_PCI_DEVICE_ID;
     pci->class_id = RVG_GRAPHICS_PCI_CLASS;
     pci->realize = reims_graphics_pci_realize;
+    pci->config_write = reims_graphics_pci_write_config;
     pci->exit = reims_graphics_pci_exit;
 }
 
