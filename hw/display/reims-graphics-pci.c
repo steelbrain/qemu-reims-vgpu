@@ -22,10 +22,6 @@
  *  - The library's callbacks run on its own threads with none of its locks
  *    held: an interrupt is raised by a BH, and scanout_written takes the BQL
  *    to read and clear the allocations' dirty log.
- *  - Where the guest's RAM is a shared file, the library gets its map and,
- *    under KVM, the dirty source apple-gfx gives, so that its Vulkan runtime
- *    copies again only the pages the guest wrote of the IOSurfaces it keeps
- *    copies of.
  *
  * Under -display none the library opens a window for the display, unless
  * REIMS_VGPU_WINDOW is "0", as apple-gfx does: the window keeps the size the
@@ -42,19 +38,13 @@
 #include "qemu/lockable.h"
 #include "qemu/main-loop.h"
 #include "qemu/queue.h"
-#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
 #include "migration/blocker.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
-#include "exec/target_page.h"
-#include "hw/core/boards.h"
-#include "hw/core/cpu.h"
 #include "system/address-spaces.h"
-#include "system/kvm.h"
 #include "system/memory.h"
-#include "system/physmem.h"
 #include "system/ramblock.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
@@ -147,72 +137,6 @@ static bool reims_graphics_pci_scanout_written_cb(void *ctx, uint64_t offset,
                                                length);
     g_free(snap);
     return written;
-}
-
-/*
- * The dirty source, as apple-gfx's: under KVM the library reads the guest
- * RAM's dirty log on the VM's fd, from its own thread, which never holds the
- * BQL. The RAM logs from the first harvest on (a BH): KVM maps a logged slot
- * 4 KiB at a time. flush_vcpus waits until each vCPU in KVM_RUN has left it
- * once, draining its page-modification log, which KVM_GET_DIRTY_LOG only
- * kicks. QEMU's own DMA marks DIRTY_MEMORY_VGA, which the library takes too.
- */
-static void reims_graphics_dirty_start_bh(void *opaque)
-{
-    memory_region_set_log(current_machine->ram, true, DIRTY_MEMORY_VGA);
-}
-
-static void reims_graphics_dirty_start(void *ctx)
-{
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            reims_graphics_dirty_start_bh, NULL);
-}
-
-static bool reims_graphics_dirty_flush_vcpus(void *ctx, uint64_t timeout_ns)
-{
-    int64_t deadline = get_clock() + timeout_ns;
-    g_autofree uint32_t *seq = g_new(uint32_t, current_machine->smp.max_cpus);
-    bool ok = true;
-    CPUState *cpu;
-
-    rcu_register_thread();
-    WITH_RCU_READ_LOCK_GUARD() {
-        CPU_FOREACH(cpu) {
-            seq[cpu->cpu_index] = qatomic_read(&cpu->kvm_run_seq);
-            if (seq[cpu->cpu_index] & 1) {
-                qemu_cpu_kick(cpu);
-            }
-        }
-        CPU_FOREACH(cpu) {
-            uint32_t was = seq[cpu->cpu_index];
-
-            while (ok && (was & 1) &&
-                   qatomic_load_acquire(&cpu->kvm_run_seq) == was) {
-                g_thread_yield();
-                ok = get_clock() < deadline;
-            }
-        }
-    }
-    rcu_unregister_thread();
-    return ok;
-}
-
-/* rvg_dirty_slot takes QEMU's own writes (reims_graphics_dirty_take). */
-static bool reims_graphics_dirty_for_each_slot(void *ctx, void *slot_ctx)
-{
-    bool ok;
-
-    rcu_register_thread();
-    ok = kvm_dirty_log_for_each_slot(rvg_dirty_slot, slot_ctx) >= 0;
-    rcu_unregister_thread();
-    return ok;
-}
-
-static void reims_graphics_dirty_take(void *ctx, uint64_t host_offset,
-                                      uint64_t length, uint64_t *words)
-{
-    physical_memory_take_dirty(host_offset, length, DIRTY_MEMORY_VGA,
-                               (unsigned long *)words);
 }
 
 /* ------ Input from the display's window ------ */
@@ -643,14 +567,6 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .callbacks = &callbacks,
         .window = reims_graphics_window_wanted() ? &window_config : NULL,
     };
-    RvgDirtySource dirty_source = {
-        .struct_size = sizeof(dirty_source),
-        .kvm_vm_fd = kvm_dirty_log_for_each_slot(NULL, NULL),
-        .start = reims_graphics_dirty_start,
-        .flush_vcpus = reims_graphics_dirty_flush_vcpus,
-        .for_each_slot = reims_graphics_dirty_for_each_slot,
-        .take_host_writes = reims_graphics_dirty_take,
-    };
     g_autoptr(GArray) ranges = g_array_new(false, false,
                                            sizeof(RvgMemoryRange));
     g_autoptr(GArray) files = g_array_new(false, false,
@@ -679,10 +595,7 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
      * without one (not a shared memfd, or huge pages) gets no map, and each
      * surface's GPU view stays a copy of its pages in the region. The library
      * keeps views of the map's pages while the device lives, so they must stay
-     * the guest's RAM: no balloon or hot-unplug may discard them. Under KVM,
-     * with the host's and the guest's pages of 4 KiB, the library also reads
-     * the RAM's dirty log, which nothing else may clear while the device
-     * lives: the migration blocker above keeps migration's off.
+     * the guest's RAM: no balloon or hot-unplug may discard them.
      */
     flatview_for_each_range(address_space_to_flatview(&address_space_memory),
                             reims_graphics_add_memory_range, &walk);
@@ -693,11 +606,6 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         };
         config.memory_map = &memory_map;
         config.memory_files = (const RvgMemoryRangeFile *)walk.files->data;
-        if (dirty_source.kvm_vm_fd >= 0 && current_machine->ram &&
-            qemu_real_host_page_size() == 4096 &&
-            qemu_target_page_size() == 4096) {
-            config.dirty_source = &dirty_source;
-        }
     } else {
         warn_report("%s: guest RAM is not a shared memfd in pages of the "
                     "host's size: IOSurfaces are copied for the GPU",
