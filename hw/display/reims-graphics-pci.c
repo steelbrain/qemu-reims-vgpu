@@ -11,18 +11,23 @@
  *  - BAR 0: the library's 4 KiB of 32-bit registers, with the MSI-X table
  *    and PBA from RVG_GRAPHICS_MSIX_OFFSET, and one vector. A guest write of
  *    RVG_GRAPHICS_DOORBELL_CONTROL to the DOORBELL register is taken by an
- *    ioeventfd, which the library's control thread polls, so ringing never
- *    runs the library on the vCPU.
+ *    ioeventfd, which the library's control thread polls, so ringing the
+ *    control ring never runs the library on the vCPU. A write of a command
+ *    queue's ring goes to the library on the vCPU, which may answer the
+ *    queue's next command buffer there, posting the event that says it is
+ *    submitted, and leave the buffer to the queue's thread
+ *    (rvg_graphics_device_mmio_write_taking).
  *  - BAR 2: the library's region, 64-bit and prefetchable, private anonymous
  *    memory of QEMU's process that the guest maps write-back: the control
  *    rings below RVG_GRAPHICS_ALLOCATIONS_OFFSET, the guest's allocations
  *    from there. It is two RAM regions over the one mapping, so that dirty
  *    logging covers only the allocations, where the guest's scanout lies,
  *    and the rings' constant writes are never logged.
- *  - The library's callbacks run on its own threads, with no lock held that
- *    a call of ours into the library waits for: scanout_written with none of
- *    the library's held, and it takes the BQL to read and clear the
- *    allocations' dirty log. An interrupt is raised by a write of the
+ *  - The library's callbacks run on its own threads, and raise_interrupt
+ *    also on the vCPU inside that write, with no lock held that a call of
+ *    ours into the library waits for: scanout_written with none of the
+ *    library's held, and it takes the BQL to read and clear the allocations'
+ *    dirty log. An interrupt is raised by a write of the
  *    vector's irqfd, where the accelerator injects MSI-X through one (KVM's
  *    in-kernel irqchip) and MSI-X is enabled, and by a BH otherwise; neither
  *    waits for a lock.
@@ -120,10 +125,11 @@ static void reims_graphics_pci_raise_interrupt(void *opaque)
 }
 
 /*
- * On the library's threads, never inside a call of ours, after the library's
- * write of what the interrupt reports: the irqfd's write follows it on the
- * same thread, so the guest takes the interrupt after it sees the write, as
- * it does through the BH.
+ * On the library's threads, or on the vCPU inside a register write
+ * (rvg_graphics_device_mmio_write_taking, which holds no lock of ours), after
+ * the library's write of what the interrupt reports: the irqfd's write
+ * follows it on the same thread, so the guest takes the interrupt after it
+ * sees the write, as it does through the BH. Neither waits for a lock.
  */
 static void reims_graphics_pci_raise_interrupt_cb(void *ctx, uint32_t vector)
 {
@@ -546,7 +552,9 @@ static bool reims_graphics_window_wanted(void)
 /*
  * The vCPU calls the library itself: an access waits at most for the command
  * the control thread is taking, which waits for nothing of QEMU's, so it
- * needs no BQL.
+ * needs no BQL. A DOORBELL write of a command queue's ring may answer the
+ * queue's next command buffer on the vCPU and raise the interrupt there,
+ * waiting for nothing and allocating nothing.
  */
 static uint64_t reims_graphics_pci_read(void *opaque, hwaddr offset,
                                         unsigned size)
@@ -561,7 +569,7 @@ static void reims_graphics_pci_write(void *opaque, hwaddr offset,
 {
     ReimsGraphicsPCIState *s = opaque;
 
-    rvg_graphics_device_mmio_write(s->device, offset, value);
+    rvg_graphics_device_mmio_write_taking(s->device, offset, value);
 }
 
 static const MemoryRegionOps reims_graphics_pci_ops = {
