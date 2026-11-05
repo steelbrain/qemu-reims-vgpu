@@ -35,8 +35,10 @@
  * Under -display none the library opens a window for the display, unless
  * REIMS_VGPU_WINDOW is "0", as apple-gfx does: the window keeps the size the
  * person gives it, and the guest follows it. Its input reaches the guest
- * through the device's console. QEMU's own displays show nothing of the
- * device.
+ * through the device's console. The console shows what the display shows,
+ * read back from the library on a thread of the device's pool at each of
+ * its updates (rvg_graphics_device_read_display): QEMU's own displays and
+ * its screendump read it there.
  *
  * The device has no default option ROM: romfile names one.
  */
@@ -45,6 +47,7 @@
 #include "qemu/error-report.h"
 #include "qemu/event_notifier.h"
 #include "qemu/lockable.h"
+#include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/queue.h"
 #include "qapi/error.h"
@@ -58,6 +61,7 @@
 #include "system/ramblock.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
+#include "block/thread-pool.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include <reims_vgpu.h>
@@ -89,6 +93,7 @@ struct ReimsGraphicsPCIState {
     bool irqfd_made;     /* the notifier is initialised */
     RvgGraphicsDevice *device;
     QemuConsole *con;
+    ThreadPool *pool; /* where the console's reads of the display run */
 
     /* The window's input, queued on its thread and run under the BQL. */
     QemuMutex event_lock;
@@ -97,6 +102,10 @@ struct ReimsGraphicsPCIState {
 
     /* Mutable state (BQL protected) */
     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
+    bool reading;           /* a read of the display is under way */
+    DisplaySurface *surface; /* the console's, which the reads fill */
+    uint8_t *pixels;        /* the last read's buffer, kept for the next */
+    size_t pixels_length;
     int irqfd_virq;         /* the vector's MSI route while MSI-X is enabled */
     bool irqfd_unmasked;    /* the irqfd is the route's */
     /* Atomic, set under the BQL: whether a raise writes the irqfd. */
@@ -588,8 +597,126 @@ static const MemoryRegionOps reims_graphics_pci_ops = {
 
 /* ------ Initialisation and startup ------ */
 
-/* QEMU's displays show nothing of the device: its console only has input. */
-static const GraphicHwOps reims_graphics_pci_console_ops = {};
+/* ------ The console: what the display shows, read back ------ */
+
+typedef struct ReimsGraphicsReadJob {
+    ReimsGraphicsPCIState *s;
+    RvgGraphicsDevice *device;
+    /* length bytes; the read fills height rows of width * 4, x8r8g8b8 */
+    uint8_t *pixels;
+    size_t length;
+    /* The display's mode when the read ran */
+    uint32_t width;
+    uint32_t height;
+    RvgStatus status;
+} ReimsGraphicsReadJob;
+
+static void reims_graphics_pci_read_done_bh(void *opaque);
+
+static int reims_graphics_pci_do_read(void *opaque)
+{
+    ReimsGraphicsReadJob *job = opaque;
+
+    /*
+     * This runs on a pool thread, not under the BQL: the read waits for its
+     * draw on the GPU. The library gives the mode's size whatever it answers,
+     * so a buffer too small for the mode is made its size, and the read runs
+     * once more.
+     */
+    job->status = rvg_graphics_device_read_display(job->device, job->pixels,
+                                                   job->length, &job->width,
+                                                   &job->height);
+    if (job->status == RVG_ERR_INVALID_ARGUMENT &&
+        (size_t)job->width * job->height * 4 > job->length) {
+        job->length = (size_t)job->width * job->height * 4;
+        job->pixels = g_realloc(job->pixels, job->length);
+        job->status = rvg_graphics_device_read_display(job->device,
+                                                       job->pixels,
+                                                       job->length,
+                                                       &job->width,
+                                                       &job->height);
+    }
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            reims_graphics_pci_read_done_bh, job);
+    return 0;
+}
+
+static void reims_graphics_pci_read_done_bh(void *opaque)
+{
+    ReimsGraphicsReadJob *job = opaque;
+    ReimsGraphicsPCIState *s = job->s;
+    DisplaySurface *surface = s->surface;
+    size_t stride = (size_t)job->width * 4;
+    uint32_t y;
+
+    assert(bql_locked());
+    s->reading = false;
+    if (job->status != RVG_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: rvg_graphics_device_read_display: %s\n",
+                      TYPE_REIMS_GRAPHICS_PCI,
+                      rvg_status_message(job->status));
+    } else if (s->con) {
+        if (!surface || surface_width(surface) != job->width ||
+            surface_height(surface) != job->height) {
+            /* The console frees the surface it had. */
+            surface = qemu_create_displaysurface(job->width, job->height);
+            s->surface = surface;
+            qemu_console_set_surface(s->con, surface);
+        }
+        /* The pixels have the surface's size and pixman's x8r8g8b8 layout. */
+        for (y = 0; y < job->height; y++) {
+            memcpy((uint8_t *)surface_data(surface) +
+                   (size_t)y * surface_stride(surface),
+                   job->pixels + y * stride, stride);
+        }
+        qemu_console_update_full(s->con);
+    }
+    g_free(s->pixels);
+    s->pixels = job->pixels;
+    s->pixels_length = job->length;
+    g_free(job);
+    /*
+     * The update gfx_update asked for, if one did, read or not: an update
+     * that waits for it, a screendump's, never waits for another.
+     */
+    qemu_console_hw_update_done(s->con);
+}
+
+/*
+ * QEMU's display system asks for the surface: a display change listener's
+ * refresh, or a screendump. A read of the display starts, unless one is
+ * under way, and signals the update done; it reads what the display shows
+ * when it runs.
+ */
+static bool reims_graphics_pci_gfx_update(void *opaque)
+{
+    ReimsGraphicsPCIState *s = opaque;
+    ReimsGraphicsReadJob *job;
+
+    assert(bql_locked());
+    if (s->reading) {
+        return false;
+    }
+    if (!s->device || !s->pool) {
+        return true;
+    }
+    s->reading = true;
+    job = g_new0(ReimsGraphicsReadJob, 1);
+    job->s = s;
+    job->device = s->device;
+    job->pixels = s->pixels;
+    job->length = s->pixels_length;
+    s->pixels = NULL;
+    s->pixels_length = 0;
+    thread_pool_submit_immediate(s->pool, reims_graphics_pci_do_read, job,
+                                 NULL);
+    return false;
+}
+
+static const GraphicHwOps reims_graphics_pci_console_ops = {
+    .gfx_update = reims_graphics_pci_gfx_update,
+};
 
 static void reims_graphics_pci_init(Object *obj)
 {
@@ -622,7 +749,16 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
     if (s->con) {
         qemu_graphic_console_close(s->con);
         s->con = NULL;
+        s->surface = NULL;
     }
+    /* A read under way ends first: it uses the device. */
+    if (s->pool) {
+        thread_pool_free(s->pool);
+        s->pool = NULL;
+    }
+    g_free(s->pixels);
+    s->pixels = NULL;
+    s->pixels_length = 0;
     if (s->doorbell_added) {
         memory_region_del_eventfd(&s->registers, RVG_GRAPHICS_REG_DOORBELL,
                                   4, true, RVG_GRAPHICS_DOORBELL_CONTROL,
@@ -838,7 +974,11 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                      PCI_BASE_ADDRESS_MEM_TYPE_64 |
                      PCI_BASE_ADDRESS_MEM_PREFETCH, &s->region);
 
-    /* The source of the window's input, and the head QEMU's UI names. */
+    /*
+     * The source of the window's input, the head QEMU's UI names, and what
+     * the display shows, which its reads run in the pool for.
+     */
+    s->pool = thread_pool_new();
     s->con = qemu_graphic_console_create(DEVICE(dev), 0,
                                          &reims_graphics_pci_console_ops, s);
     return;
