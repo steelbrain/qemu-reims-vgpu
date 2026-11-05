@@ -50,6 +50,7 @@
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/queue.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
 #include "migration/blocker.h"
@@ -837,6 +838,38 @@ static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
     return false;
 }
 
+/*
+ * Warns where the machine leaves BAR 2 no address in a macOS guest. macOS
+ * lays every 64-bit prefetchable BAR out below 4 GiB, where the region's
+ * 1 GiB needs the window to start at or below 1 GiB: a PC machine that
+ * keeps more RAM than that below 4 GiB, as q35 does by default, has RAM at
+ * 1 GiB, and the guest's kext then finds no region. The host keeps 1 GiB of
+ * RAM below 4 GiB with -machine max-ram-below-4g=1G (docs/qemu.md). Only a
+ * PC machine has that property; the device is realized either way.
+ */
+static void reims_graphics_pci_check_low_ram(void)
+{
+    MemoryRegionSection section;
+    bool ram;
+
+    if (!object_property_find(qdev_get_machine(), "max-ram-below-4g")) {
+        return;
+    }
+    section = memory_region_find(get_system_memory(), 1 * GiB, 1);
+    if (!section.mr) {
+        return;
+    }
+    ram = memory_region_is_ram(section.mr);
+    memory_region_unref(section.mr);
+    if (ram) {
+        warn_report("%s: the machine has RAM at 1 GiB, so a macOS guest gives "
+                    "BAR 2 (1 GiB, below 4 GiB) no address and its kext finds "
+                    "no region: start QEMU with "
+                    "-machine max-ram-below-4g=1G",
+                    TYPE_REIMS_GRAPHICS_PCI);
+    }
+}
+
 static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
 {
     ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(dev);
@@ -876,6 +909,8 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     RvgStatus status;
     uint8_t *base;
     uint64_t size;
+
+    reims_graphics_pci_check_low_ram();
 
     if (reims_graphics_mig_blocker == NULL) {
         error_setg(&reims_graphics_mig_blocker,
