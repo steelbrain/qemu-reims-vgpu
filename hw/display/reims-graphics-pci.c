@@ -34,21 +34,23 @@
  *    waits for a lock.
  *
  * Under -display none the library opens a window for the display, unless
- * REIMS_VGPU_WINDOW is "0", as apple-gfx does: the window keeps the size the
- * person gives it, and the guest follows it. Its input reaches the guest
- * through the device's console. The console shows what the display shows,
- * read back from the library on a thread of the device's pool at each of
- * its updates (rvg_graphics_device_read_display): QEMU's own displays and
- * its screendump read it there. The console also has the guest's cursor,
- * which the library tells the device on its display thread and a BH gives
- * the console, so QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw it; the
- * image read back has none, and under -display none the console has no
- * display, where the window shows the cursor as the host's pointer.
+ * REIMS_VGPU_WINDOW is "0", as apple-gfx does: it opens at the resolution
+ * property's size, "<width>x<height>" (1920x1080 without it), then keeps the
+ * size the person gives it, and the guest follows it. Its input reaches the
+ * guest through the device's console. The console shows what the display shows,
+ * read back from the library on a thread of the device's pool at each of its
+ * updates (rvg_graphics_device_read_display): QEMU's own displays and its
+ * screendump read it there. The console also has the guest's cursor, which the
+ * library tells the device on its display thread and a BH gives the console, so
+ * QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw it; the image read back has
+ * none, and under -display none the console has no display, where the window
+ * shows the cursor as the host's pointer.
  *
  * The device has no default option ROM: romfile names one.
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/event_notifier.h"
 #include "qemu/lockable.h"
@@ -59,6 +61,7 @@
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
 #include "migration/blocker.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
 #include "system/accel-irq.h"
@@ -105,6 +108,8 @@ struct ReimsGraphicsPCIState {
     QemuMutex event_lock;
     QSIMPLEQ_HEAD(, ReimsGraphicsEvent) events; /* event_lock protected */
     QEMUBH *event_bh;
+
+    char *resolution; /* the property: the window's first size, or NULL */
 
     /* Mutable state (BQL protected) */
     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
@@ -667,6 +672,35 @@ static void reims_graphics_cursor_move_cb(void *ctx)
 }
 
 /*
+ * The window's first size, from the resolution property: NULL is 0x0, which
+ * the library opens at 1920x1080, else "<width>x<height>", each 1 to 65535
+ * pixels.
+ */
+static bool reims_graphics_parse_resolution(const char *str, uint16_t *width,
+                                            uint16_t *height, Error **errp)
+{
+    const char *endptr;
+    int w, h;
+
+    *width = 0;
+    *height = 0;
+    if (str == NULL) {
+        return true;
+    }
+    if (qemu_strtoi(str, &endptr, 10, &w) || w <= 0 || w > UINT16_MAX ||
+        *endptr != 'x' ||
+        qemu_strtoi(endptr + 1, &endptr, 10, &h) || h <= 0 ||
+        h > UINT16_MAX || *endptr != '\0') {
+        error_setg(errp, "%s: resolution must be <width>x<height>, each 1 to "
+                   "65535 pixels, not '%s'", TYPE_REIMS_GRAPHICS_PCI, str);
+        return false;
+    }
+    *width = w;
+    *height = h;
+    return true;
+}
+
+/*
  * Window mode: under -display none, QEMU shows no display of its own, and the
  * library opens a window for the display, unless REIMS_VGPU_WINDOW is "0".
  */
@@ -1015,6 +1049,7 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .close = reims_graphics_window_close_cb,
         .scroll = reims_graphics_window_scroll_cb,
     };
+    /* The library opens the window at the mode, and ignores the flags. */
     RvgWindowConfig window_config = {
         .struct_size = sizeof(window_config),
         .callbacks = &window_callbacks,
@@ -1038,6 +1073,11 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     uint8_t *base;
     uint64_t size;
 
+    if (!reims_graphics_parse_resolution(s->resolution,
+                                         &window_config.mode_width,
+                                         &window_config.mode_height, errp)) {
+        return;
+    }
     reims_graphics_pci_check_low_ram();
 
     if (reims_graphics_mig_blocker == NULL) {
@@ -1175,6 +1215,10 @@ static void reims_graphics_pci_finalize(Object *obj)
     qemu_mutex_destroy(&s->event_lock);
 }
 
+static const Property reims_graphics_pci_properties[] = {
+    DEFINE_PROP_STRING("resolution", ReimsGraphicsPCIState, resolution),
+};
+
 static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1185,6 +1229,7 @@ static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
     dc->desc = "reims-graphics GPU";
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    device_class_set_props(dc, reims_graphics_pci_properties);
 
     pci->vendor_id = RVG_GRAPHICS_PCI_VENDOR_ID;
     pci->device_id = RVG_GRAPHICS_PCI_DEVICE_ID;
