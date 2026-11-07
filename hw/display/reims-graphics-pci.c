@@ -17,8 +17,9 @@
  *    queue's next command buffer there, posting the event that says it is
  *    submitted, and leave the buffer to the queue's thread
  *    (rvg_graphics_device_mmio_write_taking).
- *  - BAR 2: the library's region, 64-bit and prefetchable, private anonymous
- *    memory of QEMU's process that the guest maps write-back: the control
+ *  - BAR 2: the library's region, 64-bit and prefetchable, memory of QEMU's
+ *    process (on Linux a shared mapping of a memfd of the library's, on macOS
+ *    private anonymous memory) that the guest maps write-back: the control
  *    rings below RVG_GRAPHICS_ALLOCATIONS_OFFSET, the guest's allocations
  *    from there. It is two RAM regions over the one mapping, so that dirty
  *    logging covers only the allocations, where the guest's scanout lies,
