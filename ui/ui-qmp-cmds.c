@@ -309,9 +309,13 @@ static bool ppm_save(int fd, pixman_image_t *image, Error **errp)
     linebuf = qemu_pixman_linebuf_create(PIXMAN_BE_r8g8b8, width);
     for (y = 0; y < height; y++) {
         qemu_pixman_linebuf_fill(linebuf, image, width, 0, y);
+        /*
+         * A PPM row is width * 3 bytes.  The line buffer's stride is
+         * rounded up to 4 bytes, and its padding is not part of the row.
+         */
         if (qio_channel_write_all(QIO_CHANNEL(ioc),
                                   (char *)pixman_image_get_data(linebuf),
-                                  pixman_image_get_stride(linebuf), errp) < 0) {
+                                  width * 3, errp) < 0) {
             return false;
         }
     }
