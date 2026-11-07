@@ -38,7 +38,11 @@
  * through the device's console. The console shows what the display shows,
  * read back from the library on a thread of the device's pool at each of
  * its updates (rvg_graphics_device_read_display): QEMU's own displays and
- * its screendump read it there.
+ * its screendump read it there. The console also has the guest's cursor,
+ * which the library tells the device on its display thread and a BH gives
+ * the console, so QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw it; the
+ * image read back has none, and under -display none the console has no
+ * display, where the window shows the cursor as the host's pointer.
  *
  * The device has no default option ROM: romfile names one.
  */
@@ -103,6 +107,8 @@ struct ReimsGraphicsPCIState {
 
     /* Mutable state (BQL protected) */
     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
+    QEMUCursor *cursor;     /* the guest's cursor image, or NULL */
+    bool cursor_show;       /* the library says the cursor shows */
     bool reading;           /* a read of the display is under way */
     DisplaySurface *surface; /* the console's, which the reads fill */
     uint8_t *pixels;        /* the last read's buffer, kept for the next */
@@ -311,6 +317,9 @@ typedef enum ReimsGraphicsEventKind {
     REIMS_GRAPHICS_EVENT_SCROLL,
     REIMS_GRAPHICS_EVENT_KEY,
     REIMS_GRAPHICS_EVENT_CLOSE,
+    REIMS_GRAPHICS_EVENT_CURSOR_GLYPH,
+    REIMS_GRAPHICS_EVENT_CURSOR_SHOW,
+    REIMS_GRAPHICS_EVENT_CURSOR_MOVE,
 } ReimsGraphicsEventKind;
 
 struct ReimsGraphicsEvent {
@@ -329,8 +338,24 @@ struct ReimsGraphicsEvent {
             uint16_t usage;
             bool down;
         } key;
+        /* A copy of the RvgCursorGlyph, which is borrowed for its callback. */
+        struct {
+            uint8_t *rgba; /* height rows of width * 4 bytes, RGBA */
+            uint32_t width;
+            uint32_t height;
+            RvgDisplayCoord hot_spot;
+        } glyph;
+        bool show;
     };
 };
+
+static void reims_graphics_event_free(ReimsGraphicsEvent *event)
+{
+    if (event->kind == REIMS_GRAPHICS_EVENT_CURSOR_GLYPH) {
+        g_free(event->glyph.rgba);
+    }
+    g_free(event);
+}
 
 static void reims_graphics_input_pointer(ReimsGraphicsPCIState *s,
                                          ReimsGraphicsEvent *event)
@@ -435,6 +460,59 @@ static void reims_graphics_input_key(ReimsGraphicsPCIState *s, uint16_t usage,
     }
 }
 
+/* ------ The guest's cursor, on the console ------ */
+
+/*
+ * The console's cursor place and whether it shows. The library gives the
+ * place of the hot spot; QEMU's displays take the image's top-left corner,
+ * as virtio-gpu gives it, and SPICE adds the hot spot back.
+ */
+static void reims_graphics_cursor_update(ReimsGraphicsPCIState *s)
+{
+    RvgDisplayCoord at;
+    int hot_x = 0;
+    int hot_y = 0;
+
+    assert(bql_locked());
+    if (!s->con || !s->device) {
+        return;
+    }
+    at = rvg_graphics_device_cursor_position(s->device);
+    if (s->cursor) {
+        hot_x = s->cursor->hot_x;
+        hot_y = s->cursor->hot_y;
+    }
+    qemu_console_set_mouse(s->con, at.x - hot_x, at.y - hot_y,
+                           s->cursor_show && s->cursor);
+}
+
+static void reims_graphics_cursor_glyph(ReimsGraphicsPCIState *s,
+                                        ReimsGraphicsEvent *event)
+{
+    const uint8_t *px = event->glyph.rgba;
+    size_t count = (size_t)event->glyph.width * event->glyph.height;
+    QEMUCursor *cursor;
+
+    if (!s->con) {
+        return;
+    }
+    cursor = cursor_alloc(event->glyph.width, event->glyph.height);
+    if (!cursor) {
+        return;
+    }
+    cursor->hot_x = event->glyph.hot_spot.x;
+    cursor->hot_y = event->glyph.hot_spot.y;
+    /* QEMUCursor's pixels are 0xAARRGGBB words. */
+    for (size_t i = 0; i < count; i++, px += 4) {
+        cursor->data[i] = ((uint32_t)px[3] << 24) | ((uint32_t)px[0] << 16) |
+                          ((uint32_t)px[1] << 8) | px[2];
+    }
+    cursor_unref(s->cursor);
+    s->cursor = cursor;
+    qemu_console_set_cursor(s->con, cursor);
+    reims_graphics_cursor_update(s);
+}
+
 static void reims_graphics_event_bh(void *opaque)
 {
     ReimsGraphicsPCIState *s = opaque;
@@ -467,18 +545,29 @@ static void reims_graphics_event_bh(void *opaque)
             shutdown_action = SHUTDOWN_ACTION_POWEROFF;
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
             break;
+        case REIMS_GRAPHICS_EVENT_CURSOR_GLYPH:
+            reims_graphics_cursor_glyph(s, event);
+            break;
+        case REIMS_GRAPHICS_EVENT_CURSOR_SHOW:
+            s->cursor_show = event->show;
+            reims_graphics_cursor_update(s);
+            break;
+        case REIMS_GRAPHICS_EVENT_CURSOR_MOVE:
+            reims_graphics_cursor_update(s);
+            break;
         default:
             g_assert_not_reached();
         }
-        g_free(event);
+        reims_graphics_event_free(event);
     }
 }
 
 /*
- * Queues @event behind every earlier one, on the window's thread: on macOS
+ * Queues @event behind every earlier one, on the window's thread (on macOS
  * the process's main thread, which QEMU leaves in its run loop under
- * -display none, and on Linux the library's reims-vgpu.ui thread. Neither
- * holds the BQL, and neither may block, so the BH runs the input.
+ * -display none, and on Linux the library's reims-vgpu.ui thread) or on the
+ * library's display thread, for the cursor. None of them holds the BQL, and
+ * the window's may not block, so the BH runs the input and the cursor.
  */
 static void reims_graphics_event_push(ReimsGraphicsPCIState *s,
                                       ReimsGraphicsEvent *event)
@@ -541,6 +630,39 @@ static void reims_graphics_window_close_cb(void *ctx)
         reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CLOSE);
 
     reims_graphics_event_push(ctx, event);
+}
+
+/* The cursor's callbacks, on the library's display thread. */
+static void reims_graphics_cursor_glyph_cb(void *ctx,
+                                           const RvgCursorGlyph *glyph)
+{
+    ReimsGraphicsEvent *event =
+        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_GLYPH);
+    /* height rows of width * 4 bytes */
+    size_t length = (size_t)glyph->width * 4 * glyph->height;
+
+    event->glyph.width = glyph->width;
+    event->glyph.height = glyph->height;
+    event->glyph.hot_spot = glyph->hot_spot;
+    event->glyph.rgba = g_malloc0(length);
+    memcpy(event->glyph.rgba, glyph->rgba, MIN(glyph->rgba_length, length));
+    reims_graphics_event_push(ctx, event);
+}
+
+/* show is the library's byte: any value but 0 shows the cursor. */
+static void reims_graphics_cursor_show_cb(void *ctx, uint8_t show)
+{
+    ReimsGraphicsEvent *event =
+        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_SHOW);
+
+    event->show = show != 0;
+    reims_graphics_event_push(ctx, event);
+}
+
+static void reims_graphics_cursor_move_cb(void *ctx)
+{
+    reims_graphics_event_push(
+        ctx, reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_MOVE));
 }
 
 /*
@@ -785,9 +907,11 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
     WITH_QEMU_LOCK_GUARD(&s->event_lock) {
         while ((event = QSIMPLEQ_FIRST(&s->events)) != NULL) {
             QSIMPLEQ_REMOVE_HEAD(&s->events, next);
-            g_free(event);
+            reims_graphics_event_free(event);
         }
     }
+    cursor_unref(s->cursor);
+    s->cursor = NULL;
 }
 
 typedef struct ReimsGraphicsMemoryWalk {
@@ -878,6 +1002,9 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .ctx = s,
         .raise_interrupt = reims_graphics_pci_raise_interrupt_cb,
         .scanout_written = reims_graphics_pci_scanout_written_cb,
+        .cursor_glyph = reims_graphics_cursor_glyph_cb,
+        .cursor_show = reims_graphics_cursor_show_cb,
+        .cursor_move = reims_graphics_cursor_move_cb,
     };
     RvgWindowCallbacks window_callbacks = {
         .struct_size = sizeof(window_callbacks),
