@@ -21,17 +21,15 @@
  *    process (on Linux a shared mapping of a memfd of the library's, on macOS
  *    private anonymous memory) that the guest maps write-back: the control
  *    rings below RVG_GRAPHICS_ALLOCATIONS_OFFSET, the guest's allocations
- *    from there. It is two RAM regions over the one mapping, so that dirty
- *    logging covers only the allocations, where the guest's scanout lies,
- *    and the rings' constant writes are never logged.
+ *    from there. It is one RAM region over the mapping, with no dirty log:
+ *    the library's window shows the guest's scanout again at each of the
+ *    display's refreshes while it shows no presented surface.
  *  - The library's callbacks run on its own threads, and raise_interrupt
  *    also on the vCPU inside that write, with no lock held that a call of
- *    ours into the library waits for: scanout_written with none of the
- *    library's held, and it takes the BQL to read and clear the allocations'
- *    dirty log. An interrupt is raised by a write of the
- *    vector's irqfd, where the accelerator injects MSI-X through one (KVM's
- *    in-kernel irqchip) and MSI-X is enabled, and by a BH otherwise; neither
- *    waits for a lock.
+ *    ours into the library waits for. An interrupt is raised by a write of
+ *    the vector's irqfd, where the accelerator injects MSI-X through one
+ *    (KVM's in-kernel irqchip) and MSI-X is enabled, and by a BH otherwise;
+ *    neither waits for a lock.
  *
  * Under -display none the library opens a window for the display, unless
  * REIMS_VGPU_WINDOW is "0": it opens at the resolution
@@ -93,8 +91,6 @@ struct ReimsGraphicsPCIState {
     MemoryRegion bar0;      /* BAR 0: the registers, the MSI-X table, PBA */
     MemoryRegion registers; /* in BAR 0, below the MSI-X table */
     MemoryRegion region;    /* BAR 2 */
-    MemoryRegion rings;     /* in BAR 2: the control rings */
-    MemoryRegion allocations; /* in BAR 2: the guest's, logged */
     EventNotifier doorbell;
     bool doorbell_made;  /* the notifier is initialised */
     bool doorbell_added; /* the notifier is BAR 0's ioeventfd */
@@ -129,7 +125,7 @@ QEMU_BUILD_BUG_ON(RVG_GRAPHICS_MSIX_VECTORS != 1);
 
 static Error *reims_graphics_mig_blocker;
 
-/* ------ Interrupts and the dirty log ------ */
+/* ------ Interrupts ------ */
 
 typedef struct ReimsGraphicsInterruptJob {
     PCIDevice *device;
@@ -292,28 +288,6 @@ static void reims_graphics_pci_write_config(PCIDevice *dev, uint32_t address,
     } else if (was_enabled && !msix_enabled(dev)) {
         reims_graphics_pci_irqfd_disable(s);
     }
-}
-
-/*
- * On the library's refresh thread, once a refresh while the guest has a
- * scanout: whether the guest wrote any of its bytes since the last call. The
- * range lies in the allocations, which alone are logged.
- */
-static bool reims_graphics_pci_scanout_written_cb(void *ctx, uint64_t offset,
-                                                  uint64_t length)
-{
-    ReimsGraphicsPCIState *s = ctx;
-    DirtyBitmapSnapshot *snap;
-    hwaddr start = offset - RVG_GRAPHICS_ALLOCATIONS_OFFSET;
-    bool written;
-
-    BQL_LOCK_GUARD();
-    snap = memory_region_snapshot_and_clear_dirty(&s->allocations, start,
-                                                  length, DIRTY_MEMORY_VGA);
-    written = memory_region_snapshot_get_dirty(&s->allocations, snap, start,
-                                               length);
-    g_free(snap);
-    return written;
 }
 
 /* ------ Input from the display's window ------ */
@@ -1036,7 +1010,6 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .struct_size = sizeof(callbacks),
         .ctx = s,
         .raise_interrupt = reims_graphics_pci_raise_interrupt_cb,
-        .scanout_written = reims_graphics_pci_scanout_written_cb,
         .cursor_glyph = reims_graphics_cursor_glyph_cb,
         .cursor_show = reims_graphics_cursor_show_cb,
         .cursor_move = reims_graphics_cursor_move_cb,
@@ -1159,19 +1132,8 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     s->doorbell_added = true;
 
     base = rvg_graphics_device_region(s->device, &size);
-    memory_region_init(&s->region, OBJECT(dev), "reims-graphics-pci.region",
-                       size);
-    memory_region_init_ram_ptr(&s->rings, OBJECT(dev),
-                               "reims-graphics-pci.rings",
-                               RVG_GRAPHICS_ALLOCATIONS_OFFSET, base);
-    memory_region_init_ram_ptr(&s->allocations, OBJECT(dev),
-                               "reims-graphics-pci.allocations",
-                               size - RVG_GRAPHICS_ALLOCATIONS_OFFSET,
-                               base + RVG_GRAPHICS_ALLOCATIONS_OFFSET);
-    memory_region_add_subregion(&s->region, 0, &s->rings);
-    memory_region_add_subregion(&s->region, RVG_GRAPHICS_ALLOCATIONS_OFFSET,
-                                &s->allocations);
-    memory_region_set_log(&s->allocations, true, DIRTY_MEMORY_VGA);
+    memory_region_init_ram_ptr(&s->region, OBJECT(dev),
+                               "reims-graphics-pci.region", size, base);
     pci_register_bar(dev, RVG_GRAPHICS_PCI_BAR_REGION,
                      PCI_BASE_ADDRESS_SPACE_MEMORY |
                      PCI_BASE_ADDRESS_MEM_TYPE_64 |
