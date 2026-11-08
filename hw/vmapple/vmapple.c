@@ -666,7 +666,9 @@ static GlobalProperty vmapple_compat_defaults[] = {
      * bits. macOS 14 sizes a zone for each thread's SME state from the
      * longest, and panics as it starts because that zone's element is too
      * large. Offer no SME, as an M1 to M3 under HVF gives none. Under HVF
-     * the max CPU has no "sme" property, so the default is optional.
+     * the CPU gets its "sme" property only as its vCPU starts, after this
+     * default would apply, so the default is optional and HVF's CPU keeps
+     * what the host gives.
      */
     { ARM_CPU_TYPE_NAME("max"), "sme", "off", .optional = true },
 };
