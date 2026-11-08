@@ -150,13 +150,6 @@ config XLNX_DISPLAYPORT
 config DM163
     bool
 
-# vmapple's display, apple-gfx-mmio, which this tree no longer has: nothing is
-# built for it, and vmapple, which selects it, depends on MAC_PVG, which
-# nothing sets.
-config MAC_PVG_MMIO
-    bool
-    depends on MAC_PVG && AARCH64
-
 config REIMS_GRAPHICS_PCI
     bool
     depends on REIMS_GRAPHICS && PCI && MSI_NONBROKEN

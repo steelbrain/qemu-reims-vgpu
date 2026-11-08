@@ -95,8 +95,6 @@ enum {
     VMAPPLE_PCIE_ECAM,
     VMAPPLE_GPIO,
     VMAPPLE_PVPANIC,
-    VMAPPLE_APV_GFX,
-    VMAPPLE_APV_IOSFC,
     VMAPPLE_AES_1,
     VMAPPLE_AES_2,
     VMAPPLE_BDOOR,
@@ -116,8 +114,6 @@ static const MemMapEntry memmap[] = {
     [VMAPPLE_GPIO] =               { 0x20060000, 0x00001000 },
     [VMAPPLE_PVPANIC] =            { 0x20070000, 0x00000002 },
     [VMAPPLE_BDOOR] =              { 0x30000000, 0x00200000 },
-    [VMAPPLE_APV_GFX] =            { 0x30200000, 0x00010000 },
-    [VMAPPLE_APV_IOSFC] =          { 0x30210000, 0x00010000 },
     [VMAPPLE_AES_1] =              { 0x30220000, 0x00004000 },
     [VMAPPLE_AES_2] =              { 0x30230000, 0x00004000 },
     [VMAPPLE_PCIE_ECAM] =          { 0x40000000, 0x10000000 },
@@ -131,8 +127,6 @@ static const int irqmap[] = {
     [VMAPPLE_UART] = 1,
     [VMAPPLE_RTC] = 2,
     [VMAPPLE_GPIO] = 0x5,
-    [VMAPPLE_APV_IOSFC] = 0x10,
-    [VMAPPLE_APV_GFX] = 0x11,
     [VMAPPLE_AES_1] = 0x12,
     [VMAPPLE_PCIE] = 0x20,
     [VMAPPLE_GICV2M] = 0x80
@@ -209,20 +203,6 @@ static bool create_cfg(VMAppleMachineState *vms, MemoryRegion *mem,
     }
 
     return true;
-}
-
-static void create_gfx(VMAppleMachineState *vms, MemoryRegion *mem)
-{
-    int irq_gfx = vms->irqmap[VMAPPLE_APV_GFX];
-    int irq_iosfc = vms->irqmap[VMAPPLE_APV_IOSFC];
-    SysBusDevice *gfx;
-
-    gfx = SYS_BUS_DEVICE(qdev_new("apple-gfx-mmio"));
-    sysbus_mmio_map(gfx, 0, vms->memmap[VMAPPLE_APV_GFX].base);
-    sysbus_mmio_map(gfx, 1, vms->memmap[VMAPPLE_APV_IOSFC].base);
-    sysbus_connect_irq(gfx, 0, qdev_get_gpio_in(vms->gic, irq_gfx));
-    sysbus_connect_irq(gfx, 1, qdev_get_gpio_in(vms->gic, irq_iosfc));
-    sysbus_realize_and_unref(gfx, &error_fatal);
 }
 
 static void create_aes(VMAppleMachineState *vms, MemoryRegion *mem)
@@ -687,7 +667,6 @@ static void mach_vmapple_init(MachineState *machine)
     create_bdif(vms, sysmem);
     create_pvpanic(vms, sysmem);
     create_aes(vms, sysmem);
-    create_gfx(vms, sysmem);
     create_uart(vms, VMAPPLE_UART, sysmem, serial_hd(0));
     create_rtc(vms);
     create_pcie(vms);

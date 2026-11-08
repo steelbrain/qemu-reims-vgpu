@@ -62,10 +62,5 @@ config HV_BALLOON_POSSIBLE
 config HAVE_RUST
     bool
 
-# Apple's paravirtualized graphics, which vmapple's display needs. Nothing
-# sets it: this tree has no apple-gfx, so vmapple is not built.
-config MAC_PVG
-    bool
-
 config REIMS_GRAPHICS
     bool
