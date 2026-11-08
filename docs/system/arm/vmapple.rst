@@ -81,6 +81,16 @@ The pointer authentication calls of `Guest firmware`_ reach QEMU under TCG,
 whose PSCI code answers each of them as not supported, as
 Hypervisor.framework does, so a guest needs the same firmware under both.
 
+As it starts, macOS's platform driver asks Virtualization.framework's machine
+for a configuration register by writing the physical address of a request to
+0x004ffff8. The machine leaves the request unanswered, as HVF leaves an
+access to an address with no device, and the driver goes on without the
+register; ``-d unimp`` logs the write. Under TCG any other access to an
+address with no device is an external abort, which the kernel does not
+survive. So the firmware's device tree must not list a device that the
+machine lacks and macOS probes, such as Virtualization.framework's CTRR
+device at 0x30260000.
+
 Guest firmware
 --------------
 

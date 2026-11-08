@@ -36,6 +36,7 @@
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gicv3_common.h"
 #include "hw/misc/pvpanic.h"
+#include "hw/misc/unimp.h"
 #include "hw/pci-host/gpex.h"
 #include "hw/usb/hcd-xhci-pci.h"
 #include "hw/virtio/virtio-pci.h"
@@ -81,6 +82,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VMAppleMachineState, VMAPPLE_MACHINE)
 enum {
     VMAPPLE_FIRMWARE,
     VMAPPLE_CONFIG,
+    VMAPPLE_DMA_CONFIG,
     VMAPPLE_MEM,
     VMAPPLE_GIC_DIST,
     VMAPPLE_GIC_REDIST,
@@ -101,6 +103,7 @@ enum {
 static const MemMapEntry memmap[] = {
     [VMAPPLE_FIRMWARE] =           { 0x00100000, 0x00100000 },
     [VMAPPLE_CONFIG] =             { 0x00400000, 0x00010000 },
+    [VMAPPLE_DMA_CONFIG] =         { 0x004ffff8, 0x00000008 },
 
     [VMAPPLE_GIC_DIST] =           { 0x10000000, 0x00010000 },
     [VMAPPLE_GIC_REDIST] =         { 0x10010000, 0x00400000 },
@@ -166,6 +169,21 @@ static void create_bdif(VMAppleMachineState *vms, MemoryRegion *mem)
     qdev_prop_set_drive(DEVICE(bdif), "root", blk_by_legacy_dinfo(di_root));
 
     sysbus_realize_and_unref(bdif_sb, &error_fatal);
+}
+
+/*
+ * macOS's platform driver reads a register of its configuration by writing
+ * the physical address of a request to 0x004ffff8, an address its code holds
+ * rather than one the device tree gives. Virtualization.framework's machine
+ * answers the request. This machine leaves it unanswered, as an address with
+ * no device is under HVF, and the driver goes on without the register; under
+ * TCG the write would be an external abort.
+ */
+static void create_dma_config(VMAppleMachineState *vms)
+{
+    create_unimplemented_device("vmapple.dma-config",
+                                vms->memmap[VMAPPLE_DMA_CONFIG].base,
+                                vms->memmap[VMAPPLE_DMA_CONFIG].size);
 }
 
 static void create_pvpanic(VMAppleMachineState *vms, MemoryRegion *mem)
@@ -543,6 +561,7 @@ static void mach_vmapple_init(MachineState *machine)
 
     vmapple_firmware_init(vms, sysmem);
     create_cfg(vms, sysmem, &error_fatal);
+    create_dma_config(vms);
 
     /* connect powerdown request */
     vms->powerdown_notifier.notify = vmapple_powerdown_req;
