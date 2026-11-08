@@ -34,7 +34,7 @@
  *    waits for a lock.
  *
  * Under -display none the library opens a window for the display, unless
- * REIMS_VGPU_WINDOW is "0", as apple-gfx does: it opens at the resolution
+ * REIMS_VGPU_WINDOW is "0": it opens at the resolution
  * property's size, "<width>x<height>" (1920x1080 without it), then keeps the
  * size the person gives it, and the guest follows it. Its input reaches the
  * guest through the device's console. The console shows what the display shows,
@@ -895,8 +895,8 @@ static void reims_graphics_pci_init(Object *obj)
  * Undoes what realize did, from its failure or at unrealize, with the BARs
  * unmapped. The library's threads end without being waited for, and its
  * region stays mapped until they and the window's GPU work let it go. A
- * callback they or the window run meanwhile still schedules its BH, as
- * apple-gfx's do, or writes the irqfd, which stays open for it: the device
+ * callback they or the window run meanwhile still schedules its BH, or
+ * writes the irqfd, which stays open for it: the device
  * is not hotpluggable, so that is only at QEMU's end.
  */
 static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)

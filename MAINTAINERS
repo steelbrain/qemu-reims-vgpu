@@ -2991,11 +2991,6 @@ F: hw/display/edid*
 F: include/hw/display/edid.h
 F: qemu-edid.c
 
-macOS PV Graphics (apple-gfx)
-M: Phil Dennis-Jordan <phil@philjordan.eu>
-S: Maintained
-F: hw/display/apple-gfx*
-
 PIIX4 South Bridge (i82371AB)
 M: Hervé Poussineau <hpoussin@reactos.org>
 M: Philippe Mathieu-Daudé <philmd@oss.qualcomm.com>

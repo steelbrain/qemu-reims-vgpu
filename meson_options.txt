@@ -208,10 +208,10 @@ option('lzfse', type : 'feature', value : 'auto',
        description: 'lzfse support for DMG images')
 option('lzo', type : 'feature', value : 'auto',
        description: 'lzo compression support')
-option('pvg', type: 'feature', value: 'auto',
-       description: 'macOS paravirtualized graphics support')
 option('rbd', type : 'feature', value : 'auto',
        description: 'Ceph block device driver')
+option('reims_vgpu', type : 'feature', value : 'auto',
+       description: 'reims-vgpu graphics device (reims-graphics-pci)')
 option('opengl', type : 'feature', value : 'auto',
        description: 'OpenGL support')
 option('rdma', type : 'feature', value : 'auto',
