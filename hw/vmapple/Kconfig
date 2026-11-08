@@ -9,6 +9,9 @@ config VMAPPLE_BDIF
 config VMAPPLE_CFG
     bool
 
+config VMAPPLE_RTC
+    bool
+
 config VMAPPLE_VIRTIO_BLK
     bool
 
@@ -31,4 +34,5 @@ config VMAPPLE
     select VMAPPLE_AES
     select VMAPPLE_BDIF
     select VMAPPLE_CFG
+    select VMAPPLE_RTC
     select VMAPPLE_VIRTIO_BLK

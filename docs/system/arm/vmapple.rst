@@ -128,6 +128,21 @@ panics on its unencrypted data volume ("unencrypted data volume is not
 allowed") unless the device tree's ``/filesystems`` node has a
 ``DoNotUseSEP`` property, so the firmware adds one.
 
+Clock
+-----
+
+Beside its PL031 at 0x20050000, the machine has Virtualization.framework's
+second clock at 0x30240000, which macOS's device tree lists as ``avp-rtc``.
+macOS keeps the offset from it to calendar time in NVRAM, on the aux drive,
+and its timed daemon reads that offset to tell whether the clock was reset.
+macOS's PL031 driver keeps no offset: with the PL031 alone, timed takes the
+clock for reset on every boot, and sets it back to the last write to the
+guest's disk until it reaches a time server. Both clocks count QEMU's RTC
+clock from the Unix epoch, so ``-rtc base=`` and ``-rtc clock=`` apply to
+both. The firmware's device tree gives the guest one of the two. macOS 14
+and later drive ``avp-rtc``; the device trees of earlier releases list only
+the PL031.
+
 Display
 -------
 
