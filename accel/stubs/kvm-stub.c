@@ -134,11 +134,6 @@ uint32_t kvm_dirty_ring_size(void)
     return 0;
 }
 
-int kvm_dirty_log_for_each_slot(KVMDirtySlotFn fn, void *opaque)
-{
-    return -1;
-}
-
 bool kvm_hwpoisoned_mem(void)
 {
     return false;

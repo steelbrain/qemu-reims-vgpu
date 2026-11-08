@@ -3,6 +3,14 @@
 VMApple machine emulation
 ========================================================================================
 
+.. note::
+
+   This tree does not build the vmapple machine. Its display,
+   ``apple-gfx-mmio``, was removed with the rest of apple-gfx, so nothing
+   sets ``CONFIG_MAC_PVG``, which the machine depends on, and
+   ``configs/devices/aarch64-softmmu/default.mak`` leaves it out. The rest of
+   this page describes the machine as it last ran here, on apple-gfx.
+
 VMApple is the device model that the macOS built-in hypervisor called "Virtualization.framework"
 exposes to Apple Silicon macOS guests. The "vmapple" machine model in QEMU implements the same
 device model, but does not use any code from Virtualization.Framework.
