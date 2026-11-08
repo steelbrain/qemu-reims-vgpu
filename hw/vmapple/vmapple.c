@@ -50,6 +50,7 @@
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
+#include "system/tcg.h"
 #include "target/arm/gtimer.h"
 #include "target/arm/cpu.h"
 
@@ -492,13 +493,25 @@ static void mach_vmapple_init(MachineState *machine)
                                 &error_fatal);
 
         /*
+         * macOS's device tree gives every CPU a 24 MHz timebase, the
+         * frequency of Apple silicon's system counter, which HVF passes
+         * through to the guest. Run TCG's counter at that frequency too.
+         */
+        if (tcg_enabled()) {
+            object_property_set_uint(cpu, "cntfrq", 24 * 1000 * 1000,
+                                     &error_fatal);
+        }
+
+        /*
          * macOS asks the hypervisor to program its pointer authentication
          * keys, through the paravirtualized calls SMCCC 0xC1000000 to
          * 0xC1000006. Hypervisor.framework answers them itself, without an
-         * exit to QEMU, and programs no key: the guest runs on the keys
-         * each CPU holds. The boot firmware sets them on the boot CPU
-         * only, so start each CPU the guest powers on with the keys of
-         * the CPU that powers it on, and all CPUs share them.
+         * exit to QEMU, and under TCG QEMU's PSCI code answers them; both
+         * answer that they are not supported, and program no key: the
+         * guest runs on the keys each CPU holds. The boot firmware sets
+         * them on the boot CPU only, so start each CPU the guest powers on
+         * with the keys of the CPU that powers it on, and all CPUs share
+         * them.
          */
         object_property_set_bool(cpu, "cpu-on-copies-pauth-keys", true,
                                  &error_fatal);
@@ -640,7 +653,8 @@ static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
     mc->minimum_page_bits = 12;
     mc->possible_cpu_arch_ids = vmapple_possible_cpu_arch_ids;
     mc->cpu_index_to_instance_props = vmapple_cpu_index_to_props;
-    mc->default_cpu_type = ARM_CPU_TYPE_NAME("host");
+    /* Under HVF, max is the host CPU. */
+    mc->default_cpu_type = ARM_CPU_TYPE_NAME("max");
     mc->get_default_cpu_node_id = vmapple_get_default_cpu_node_id;
     mc->get_vgic_bases = vmapple_get_vgic_bases;
     mc->default_ram_id = "mach-vmapple.ram";

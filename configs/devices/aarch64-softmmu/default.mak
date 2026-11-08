@@ -10,6 +10,6 @@ include ../arm-softmmu/default.mak
 # CONFIG_SBSA_REF=n
 # CONFIG_NPCM8XX=n
 
-# Selected by default when HVF is enabled; uncomment it to keep it out of
-# the build.
+# Selected by default when TCG or HVF is enabled; uncomment it to keep it
+# out of the build.
 # CONFIG_VMAPPLE=n

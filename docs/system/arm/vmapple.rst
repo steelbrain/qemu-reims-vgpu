@@ -12,8 +12,8 @@ Prerequisites
 
 To run the vmapple machine model, you need to
 
- * Run on Apple Silicon
- * Run on macOS 12.0 or above
+ * Run on Apple Silicon, on macOS 12.0 or above, for HVF; or on any host
+   under TCG (see `Under TCG`_)
  * Have an already installed copy of a Virtualization.Framework macOS 12 or
    later virtual machine. I will assume that you installed it using the
    `macosvm <https://github.com/s-u/macosvm>`__ CLI.
@@ -67,6 +67,19 @@ into the target system:
        -device vmapple-virtio-blk-pci,variant=root,drive=root \
        -netdev user,id=net0,ipv6=off,hostfwd=tcp::2222-:22,hostfwd=tcp::5901-:5900 \
        -device virtio-net-pci,netdev=net0
+
+Under TCG
+---------
+
+The machine also runs under TCG, on any host, with ``-accel tcg`` in place of
+``-accel hvf``. Its CPU type defaults to ``max`` under both; under HVF,
+``max`` is the host's CPU. Under TCG, the machine's generic timer counts at
+24 MHz, the timebase frequency macOS's device tree gives every CPU, and the
+frequency of Apple silicon's system counter, which HVF passes through.
+
+The pointer authentication calls of `Guest firmware`_ reach QEMU under TCG,
+whose PSCI code answers each of them as not supported, as
+Hypervisor.framework does, so a guest needs the same firmware under both.
 
 Guest firmware
 --------------
