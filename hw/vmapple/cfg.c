@@ -46,13 +46,13 @@ typedef struct VMAppleCfg {
     uint8_t pad4[2];
     uint8_t reserved[0xa0];   /* 0x060 */
     uint32_t cpu_ids[0x80];   /* 0x100 */
-    uint8_t scratch[0x200];   /* 0x180 */
-    char serial[32];          /* 0x380 */
-    char unk8[32];            /* 0x3a0 */
-    char model[32];           /* 0x3c0 */
-    uint8_t unk9[32];         /* 0x3e0 */
-    uint32_t unk10;           /* 0x400 */
-    char soc_name[32];        /* 0x404 */
+    uint8_t scratch[0x200];   /* 0x300 */
+    char serial[32];          /* 0x500 */
+    char unk8[32];            /* 0x520 */
+    char model[32];           /* 0x540 */
+    uint8_t unk9[32];         /* 0x560 */
+    uint32_t unk10;           /* 0x580 */
+    char soc_name[32];        /* 0x584 */
 } VMAppleCfg;
 
 struct VMAppleCfgState {
