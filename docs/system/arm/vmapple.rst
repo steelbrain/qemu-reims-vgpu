@@ -15,9 +15,11 @@ To run the vmapple machine model, you need to
  * Run on Apple Silicon
  * Run on macOS 12.0 or above
  * Have an already installed copy of a Virtualization.Framework macOS 12 or
-   later virtual machine. macOS 14 and later need a firmware other than
-   AVPBooter (see `Guest versions`_). I will assume that you installed it
-   using the `macosvm <https://github.com/s-u/macosvm>`__ CLI.
+   later virtual machine. I will assume that you installed it using the
+   `macosvm <https://github.com/s-u/macosvm>`__ CLI.
+ * Have a firmware for the machine, such as Ambrosia.
+   Virtualization.framework's own, AVPBooter, does not boot on it (see
+   `Guest firmware`_).
  * Build QEMU with a crypto library (gnutls, nettle or libgcrypt), whose AES
    ciphers the machine's AES engine runs on. Without one, the engine fails to
    realize and QEMU exits at start.
@@ -40,15 +42,15 @@ Now we also need to trim the aux partition. It contains metadata that we can jus
 How to run
 ----------
 
-Then, we can launch QEMU with the Virtualization.Framework pre-boot environment and the readily
-installed target disk images. I recommend to port forward the VM's ssh and vnc ports to the host
-to get better interactive access into the target system:
+Then, we can launch QEMU with the firmware and the readily installed target disk images. I
+recommend to port forward the VM's ssh and vnc ports to the host to get better interactive access
+into the target system:
 
 .. code-block:: bash
   :caption: Example execution command line
 
   $ UUID="$(contrib/vmapple/uuid.sh 'macosvm.json')"
-  $ AVPBOOTER="/System/Library/Frameworks/Virtualization.framework/Resources/AVPBooter.vmapple2.bin"
+  $ FIRMWARE="ambrosia.bin"
   $ AUX="aux.img.trimmed"
   $ DISK="disk.img"
   $ qemu-system-aarch64 \
@@ -56,7 +58,7 @@ to get better interactive access into the target system:
        -m 4G \
        -accel hvf \
        -M vmapple,uuid="$UUID" \
-       -bios "$AVPBOOTER" \
+       -bios "$FIRMWARE" \
        -drive file="$AUX",if=pflash,format=raw \
        -drive file="$DISK",if=pflash,format=raw \
        -drive file="$AUX",if=none,id=aux,format=raw \
@@ -66,35 +68,37 @@ to get better interactive access into the target system:
        -netdev user,id=net0,ipv6=off,hostfwd=tcp::2222-:22,hostfwd=tcp::5901-:5900 \
        -device virtio-net-pci,netdev=net0
 
-Guest versions
+Guest firmware
 --------------
 
-macOS 12 and 13 guests boot. A vmapple guest kernel asks the hypervisor to
-manage its pointer authentication keys through paravirtualized hypercalls:
-``hvc #0`` with SMCCC function IDs 0xC1000000 to 0xC10000FF.
-Hypervisor.framework answers these calls itself, without an exit to QEMU,
-and for a VM created through its public API it answers each of them as not
-supported. The macOS 12 and 13 kernels carry on with the keys the firmware
-set up, which all processes then share.
+The machine's RAM starts at 4 GiB, and below it the PCIe MMIO window runs
+from 0x50000000 up to RAM. macOS places every PCI BAR below 4 GiB, aligned
+to its size, so a device with a 1 GiB BAR needs a free, 1 GiB-aligned
+gigabyte there. Virtualization.framework's machine has its RAM at
+0x70000000, and its firmware, AVPBooter, keeps its stack there, so AVPBooter
+does not boot on this machine. A firmware for it gives macOS this layout in
+the device tree; Ambrosia is one.
 
-From macOS 14 on, the kernel checks the result of every one of these calls
-and loops forever when one fails, with ``hvc #0; cbnz x0, .``.
+The firmware also makes two changes that macOS needs on this machine before
+it enters the kernel. The machine makes no change to the guest itself.
+
+A vmapple guest kernel asks the hypervisor to manage its pointer
+authentication keys through paravirtualized hypercalls: ``hvc #0`` with
+SMCCC function IDs 0xC1000000 to 0xC10000FF. Hypervisor.framework answers
+these calls itself, without an exit to QEMU, and for a VM created through
+its public API it answers each of them as not supported. The macOS 12 and
+13 kernels carry on with the keys the firmware set up, which all processes
+then share. From macOS 14 on, the kernel checks the result of every one of
+these calls and loops forever when one fails, with ``hvc #0; cbnz x0, .``.
 Hypervisor.framework implements the calls only for VMs created with a
 private ISA setting, which needs an entitlement that only Apple-signed
-binaries can hold. QEMU does not use it. On AVPBooter, such a guest stops
-right after iBoot hands over to the kernel: the serial console ends with
-iBoot's ``End of iBootStage2 serial output.`` line, and the boot CPU keeps a
-host core busy without exiting to QEMU.
+binaries can hold. QEMU does not use it. So the firmware replaces each of
+those loops with a ``nop``.
 
 The machine has no Secure Enclave. From macOS 15 on, the guest's APFS then
 panics on its unencrypted data volume ("unencrypted data volume is not
 allowed") unless the device tree's ``/filesystems`` node has a
-``DoNotUseSEP`` property.
-
-So macOS 14 and later boot only with a firmware, given with ``-bios`` in
-place of AVPBooter, that replaces each of those loops with a ``nop`` and
-adds that node before it enters the kernel. Ambrosia is one. The machine
-makes no change to the guest itself.
+``DoNotUseSEP`` property, so the firmware adds one.
 
 Display
 -------

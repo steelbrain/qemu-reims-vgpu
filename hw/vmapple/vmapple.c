@@ -113,10 +113,14 @@ static const MemMapEntry memmap[] = {
     [VMAPPLE_AES_1] =              { 0x30220000, 0x00004000 },
     [VMAPPLE_AES_2] =              { 0x30230000, 0x00004000 },
     [VMAPPLE_PCIE_ECAM] =          { 0x40000000, 0x10000000 },
-    [VMAPPLE_PCIE_MMIO] =          { 0x50000000, 0x1fff0000 },
+    /*
+     * macOS places every BAR below 4 GiB, aligned to its size, so the
+     * window runs up to 4 GiB and RAM starts there.
+     */
+    [VMAPPLE_PCIE_MMIO] =          { 0x50000000, 0xb0000000 },
 
     /* Actual RAM size depends on configuration */
-    [VMAPPLE_MEM] =                { 0x70000000ULL, GiB},
+    [VMAPPLE_MEM] =                { 0x100000000ULL, GiB},
 };
 
 static const int irqmap[] = {
@@ -401,8 +405,8 @@ static void create_pcie(VMAppleMachineState *vms)
                                 &vms->ecam_alias);
 
     /*
-     * Map the MMIO window from [0x50000000-0x7fff0000] in PCI space into
-     * system address space at [0x50000000-0x7fff0000].
+     * Map the MMIO window from [0x50000000-0xffffffff] in PCI space into
+     * system address space at [0x50000000-0xffffffff].
      */
     mmio_alias = g_new0(MemoryRegion, 1);
     mmio_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 1);
