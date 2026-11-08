@@ -68,6 +68,11 @@ into the target system:
        -netdev user,id=net0,ipv6=off,hostfwd=tcp::2222-:22,hostfwd=tcp::5901-:5900 \
        -device virtio-net-pci,netdev=net0
 
+The machine offers virtio-net devices without a control queue: macOS's
+driver can miss the completion of its first control command, and its
+interface then never comes up. Without the queue the device stays
+promiscuous and passes the guest every frame its backend delivers.
+
 Under TCG
 ---------
 

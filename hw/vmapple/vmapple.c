@@ -39,6 +39,7 @@
 #include "hw/misc/unimp.h"
 #include "hw/pci-host/gpex.h"
 #include "hw/usb/hcd-xhci-pci.h"
+#include "hw/virtio/virtio-net.h"
 #include "hw/virtio/virtio-pci.h"
 #include "hw/vmapple/vmapple.h"
 #include "net/net.h"
@@ -637,6 +638,20 @@ static GlobalProperty vmapple_compat_defaults[] = {
      * capabilities are linked from high offsets to low.
      */
     { "virtio-net-pci-base", "x-ascending-capabilities", "on" },
+    /*
+     * macOS's virtio-net driver can miss the completion of its first control
+     * command, which QEMU gives before the driver waits for it, and the
+     * interface then never comes up. Offer no control queue, nor the
+     * features that need one. The device stays promiscuous, as it resets,
+     * and passes the guest every frame its backend delivers.
+     */
+    { TYPE_VIRTIO_NET, "ctrl_vq", "off" },
+    { TYPE_VIRTIO_NET, "ctrl_rx", "off" },
+    { TYPE_VIRTIO_NET, "ctrl_rx_extra", "off" },
+    { TYPE_VIRTIO_NET, "ctrl_vlan", "off" },
+    { TYPE_VIRTIO_NET, "ctrl_mac_addr", "off" },
+    { TYPE_VIRTIO_NET, "ctrl_guest_offloads", "off" },
+    { TYPE_VIRTIO_NET, "guest_announce", "off" },
 };
 
 static char *vmapple_get_tablet(Object *obj, Error **errp)
