@@ -3,14 +3,6 @@
 VMApple machine emulation
 ========================================================================================
 
-.. note::
-
-   This tree does not build the vmapple machine. Its display,
-   ``apple-gfx-mmio``, was removed with the rest of apple-gfx, so nothing
-   sets ``CONFIG_MAC_PVG``, which the machine depends on, and
-   ``configs/devices/aarch64-softmmu/default.mak`` leaves it out. The rest of
-   this page describes the machine as it last ran here, on apple-gfx.
-
 VMApple is the device model that the macOS built-in hypervisor called "Virtualization.framework"
 exposes to Apple Silicon macOS guests. The "vmapple" machine model in QEMU implements the same
 device model, but does not use any code from Virtualization.Framework.
@@ -25,13 +17,9 @@ To run the vmapple machine model, you need to
  * Have an already installed copy of a Virtualization.Framework macOS 12 or
    later virtual machine (see `Guest versions`_). I will assume that you
    installed it using the `macosvm <https://github.com/s-u/macosvm>`__ CLI.
- * Build QEMU with apple-gfx, which the machine's display needs. apple-gfx
-   drives reims-vgpu's C API, a library that pkg-config finds as
-   ``reims-vgpu``: pass ``--enable-pvg`` with ``PKG_CONFIG_PATH`` naming the
-   directory of its ``reims-vgpu.pc``. reims-vgpu's ``cargo xtask
-   dist`` writes one into its ``target/dist/lib/pkgconfig``; its ``make
-   qemu`` builds that and QEMU together. Without pvg the vmapple machine is
-   left out of the build.
+ * Build QEMU with a crypto library (gnutls, nettle or libgcrypt), whose AES
+   ciphers the machine's AES engine runs on. Without one, the engine fails to
+   realize and QEMU exits at start.
 
 First, we need to extract the UUID from the virtual machine that you installed. You can do this
 by running the shell script in contrib/vmapple/uuid.sh on the macosvm.json file.
@@ -121,35 +109,12 @@ kernel. All of RAM is executable from then on.
 Display
 -------
 
-apple-gfx gives the guest one display by default; ``-global
-apple-gfx-mmio.displays=N`` gives it N, up to 8, each with a console of its
-own. Under ``-display none``, reims-vgpu opens a window for each display on
-the host's screen, draws the guest's frames into it, and sends its pointer,
-wheel and keys to the guest's USB tablet and keyboard; closing a window
-powers the VM off. Each display then runs 1920x1080 at 1x, which the window
-scales to its size on the GPU, at the host screen's refresh rate;
-``-global apple-gfx-mmio.resolution=WxH`` picks another mode, and
-``resolution=host`` offers the modes that fill the host's screen at its
-density (HiDPI on a Retina screen). ``resolution=WxH@PPI`` also tells the
-guest the mode's density. A macOS 13.6 guest reads the width in whole
-millimetres, rounded to nearest, then in whole centimetres, rounded up, and
-runs a HiDPI desktop at the mode's pixels where that comes to 146.67 ppi or
-more: ``2560x1600@148`` is told 440.39 mm, which reads as 44 cm, 147.8 ppi,
-and looks like 1280x800, where ``2560x1600@146`` reads as 45 cm, 144.5
-ppi, and runs at 1x. A density that does not tell the guest's scale is
-refused: one just below 146.67 ppi; one below it for a mode wider than 3811
-pixels, which may run HiDPI anyway (5832 pixels wide did at 128.8 ppi); one
-above it for a mode narrower than 1920 pixels or 29 cm, which may stay at
-1x (``1280x800@220`` did); and one so low that the width comes to more than
-65535 mm, which the device's display settings do not hold. Only the chosen
-mode is checked: the smaller modes offered with it are told the same size,
-so a guest switched to one may run a scale the window does not expect. A
-window is sized by the scale the guest runs: on a Retina screen, a HiDPI
-guest's pixel is a screen pixel where half the mode fits on the screen, and
-a borderless window fits the image to its screen. The device's
-``display-modes`` property, where given, sets the modes instead. Set
-``REIMS_VGPU_WINDOW=0`` in QEMU's environment to keep ``-display none``
-headless. Either way, ``screendump`` draws the display's current frame.
+The machine gives the guest no display. Virtualization.framework's
+paravirtualized display, which macOS drives with a driver of its own, is not
+in this tree. A guest has a display only from a PCI display device given with
+``-device`` that the guest has a driver for. Without one, reach the guest
+through the serial console, or through ``ssh`` on host port 2222, which the
+example forwards to the guest's port 22.
 
 Input
 -----
