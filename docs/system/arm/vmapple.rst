@@ -110,7 +110,7 @@ gigabyte there. Virtualization.framework's machine has its RAM at
 does not boot on this machine. A firmware for it gives macOS this layout in
 the device tree; Ambrosia is one.
 
-The firmware also makes two changes that macOS needs on this machine before
+The firmware also makes one change that macOS needs on this machine before
 it enters the kernel. The machine makes no change to the guest itself.
 
 A vmapple guest kernel asks the hypervisor to manage its pointer
@@ -125,11 +125,6 @@ Hypervisor.framework implements the calls only for VMs created with a
 private ISA setting, which needs an entitlement that only Apple-signed
 binaries can hold. QEMU does not use it. So the firmware replaces each of
 those loops with a ``nop``.
-
-The machine has no Secure Enclave. From macOS 15 on, the guest's APFS then
-panics on its unencrypted data volume ("unencrypted data volume is not
-allowed") unless the device tree's ``/filesystems`` node has a
-``DoNotUseSEP`` property, so the firmware adds one.
 
 Clock
 -----
