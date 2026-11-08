@@ -80,7 +80,10 @@ The machine also runs under TCG, on any host, with ``-accel tcg`` in place of
 ``-accel hvf``. Its CPU type defaults to ``max`` under both; under HVF,
 ``max`` is the host's CPU. Under TCG, the machine's generic timer counts at
 24 MHz, the timebase frequency macOS's device tree gives every CPU, and the
-frequency of Apple silicon's system counter, which HVF passes through.
+frequency of Apple silicon's system counter, which HVF passes through. The
+``max`` CPU has no SME by default under TCG: macOS 14 sizes each thread's
+SME state from the longest streaming vector, and with TCG's 2048-bit
+vectors it panics as it starts. ``-cpu max,sme=on`` turns SME back on.
 
 The pointer authentication calls of `Guest firmware`_ reach QEMU under TCG,
 whose PSCI code answers each of them as not supported, as

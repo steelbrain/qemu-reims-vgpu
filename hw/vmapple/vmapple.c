@@ -661,6 +661,14 @@ static GlobalProperty vmapple_compat_defaults[] = {
     { TYPE_VIRTIO_NET, "ctrl_mac_addr", "off" },
     { TYPE_VIRTIO_NET, "ctrl_guest_offloads", "off" },
     { TYPE_VIRTIO_NET, "guest_announce", "off" },
+    /*
+     * Under TCG, the max CPU offers SME with streaming vectors of up to 2048
+     * bits. macOS 14 sizes a zone for each thread's SME state from the
+     * longest, and panics as it starts because that zone's element is too
+     * large. Offer no SME, as an M1 to M3 under HVF gives none. Under HVF
+     * the max CPU has no "sme" property, so the default is optional.
+     */
+    { ARM_CPU_TYPE_NAME("max"), "sme", "off", .optional = true },
 };
 
 static char *vmapple_get_tablet(Object *obj, Error **errp)
