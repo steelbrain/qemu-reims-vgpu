@@ -27,6 +27,7 @@ config VMAPPLE
     select PL061 # GPIO
     select GPIO_PWR
     select PVPANIC_MMIO
+    select UNIMP
     select VMAPPLE_AES
     select VMAPPLE_BDIF
     select VMAPPLE_CFG
