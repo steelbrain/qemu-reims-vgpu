@@ -98,6 +98,7 @@ enum {
     VMAPPLE_AES_1,
     VMAPPLE_AES_2,
     VMAPPLE_BDOOR,
+    VMAPPLE_AVP_RTC,
     VMAPPLE_MEMMAP_LAST,
 };
 
@@ -117,6 +118,7 @@ static const MemMapEntry memmap[] = {
     [VMAPPLE_BDOOR] =              { 0x30000000, 0x00200000 },
     [VMAPPLE_AES_1] =              { 0x30220000, 0x00004000 },
     [VMAPPLE_AES_2] =              { 0x30230000, 0x00004000 },
+    [VMAPPLE_AVP_RTC] =            { 0x30240000, 0x00001000 },
     [VMAPPLE_PCIE_ECAM] =          { 0x40000000, 0x10000000 },
     /*
      * macOS places every BAR below 4 GiB, aligned to its size, so the
@@ -335,6 +337,13 @@ static void create_rtc(const VMAppleMachineState *vms)
     int irq = vms->irqmap[VMAPPLE_RTC];
 
     sysbus_create_simple("pl031", base, qdev_get_gpio_in(vms->gic, irq));
+    /*
+     * macOS keeps its clock's offset to calendar time only with the second
+     * clock, avp-rtc in its device tree, so the guest needs it to keep time
+     * from one boot to the next.
+     */
+    sysbus_create_simple(TYPE_VMAPPLE_RTC, vms->memmap[VMAPPLE_AVP_RTC].base,
+                         NULL);
 }
 
 static DeviceState *gpio_key_dev;

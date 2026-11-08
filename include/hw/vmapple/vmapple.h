@@ -18,6 +18,8 @@
 
 #define TYPE_VMAPPLE_CFG "vmapple-cfg"
 
+#define TYPE_VMAPPLE_RTC "vmapple-rtc"
+
 #define TYPE_VMAPPLE_VIRTIO_BLK_PCI "vmapple-virtio-blk-pci"
 
 #endif /* HW_VMAPPLE_VMAPPLE_H */
