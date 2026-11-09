@@ -929,14 +929,19 @@ typedef struct ReimsGraphicsMemoryWalk {
 } ReimsGraphicsMemoryWalk;
 
 /*
- * One range of the guest's RAM and the file behind it: a shared mapping of a
- * file in pages of the host's size, which the library's views of an
- * IOSurface's pages map again. Only such ranges go into the map; RAM with no
- * file (anonymous, private or huge pages) is left out, so the library cannot
- * view a surface there in place and copies it instead. A machine whose RAM is
- * all file-backed (q35 with -object memory-backend-memfd,share=on) gives every
- * range; one with small unbacked regions (vmapple's 1 MiB firmware and 64 KiB
- * config, which hold no IOSurface) gives only its main RAM.
+ * One range of the guest's RAM and the file behind it: on Linux a shared
+ * mapping of a file in pages of the host's size, which the library's views of
+ * an IOSurface's pages map again. Only such ranges go into the map there; RAM
+ * with no file (anonymous, private or huge pages) is left out, so the library
+ * cannot view a surface there in place and copies it instead. A machine whose
+ * RAM is all file-backed (q35 with -object memory-backend-memfd,share=on)
+ * gives every range; one with small unbacked regions (vmapple's 1 MiB firmware
+ * and 64 KiB config, which hold no IOSurface) gives only its main RAM.
+ *
+ * On macOS the library views the process's own mapping of the RAM again
+ * (mach_vm_remap), with no file: every range of RAM in pages of the host's
+ * size goes into the map, with an fd of -1, whatever backs it. A view so made
+ * shares the pages of RAM that HVF maps into the guest, both ways.
  */
 static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
                                             const MemoryRegion *mr,
@@ -953,11 +958,15 @@ static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
     if (!memory_access_is_direct(mr, true, MEMTXATTRS_UNSPECIFIED)) {
         return false;
     }
-    fd = memory_region_get_fd(mr);
-    if (fd < 0 || !qemu_ram_is_shared(rb) ||
-        qemu_ram_pagesize(rb) != qemu_real_host_page_size()) {
+    if (qemu_ram_pagesize(rb) != qemu_real_host_page_size()) {
         return false;
     }
+    fd = memory_region_get_fd(mr);
+#ifndef CONFIG_DARWIN
+    if (fd < 0 || !qemu_ram_is_shared(rb)) {
+        return false;
+    }
+#endif
     /* q35's RAM above 4 GiB is an alias of the block past the part below. */
     host = (uint8_t *)memory_region_get_ram_ptr(mr) + offset_in_region;
     range = (RvgMemoryRange) {
@@ -965,9 +974,13 @@ static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
         .physical_length = int128_get64(len),
         .host_address = host,
     };
+#ifndef CONFIG_DARWIN
     file.fd = fd;
     file.offset = qemu_ram_block_host_offset(rb, host) +
                   qemu_ram_get_fd_offset(rb);
+#else
+    (void)fd;
+#endif
     g_array_append_val(walk->ranges, range);
     g_array_append_val(walk->files, file);
     return false;
@@ -1064,14 +1077,18 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
 
     /*
      * The guest's RAM, through which the GPU uses an IOSurface's own pages in
-     * place. The library's views of them need the file behind each range, so
-     * only the file-backed ranges go into the map; RAM without a file (not a
-     * shared memfd, or huge pages) is left out, and a surface whose pages fall
-     * there is copied as every surface is without a map. A surface in a mapped
-     * range is used in place, and IOSurfaces live only in the main RAM, which a
-     * shared memfd backs, so in practice every surface maps in place. The
-     * library keeps views of the map's pages while the device lives, so they
-     * must stay the guest's RAM: no balloon or hot-unplug may discard them.
+     * place. On Linux the library's views of them need the file behind each
+     * range, so only the file-backed ranges go into the map; RAM without a
+     * file (not a shared memfd, or huge pages) is left out, and a surface
+     * whose pages fall there is copied as every surface is without a map. A
+     * surface in a mapped range is used in place, and IOSurfaces live only in
+     * the main RAM, which a shared memfd backs, so in practice every surface
+     * maps in place. On macOS every range in pages of the host's size goes
+     * in, with no file (reims_graphics_add_memory_range), and the library
+     * uses a surface in place only where the guest lays its pages out in
+     * whole pages of the host's (16 KiB, an arm64 guest). The library keeps
+     * views of the map's pages while the device lives, so they must stay the
+     * guest's RAM: no balloon or hot-unplug may discard them.
      */
     flatview_for_each_range(address_space_to_flatview(&address_space_memory),
                             reims_graphics_add_memory_range, &walk);
@@ -1083,8 +1100,12 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         config.memory_map = &memory_map;
         config.memory_files = (const RvgMemoryRangeFile *)walk.files->data;
     } else {
-        warn_report("%s: no guest RAM is a shared memfd in pages of the "
-                    "host's size: IOSurfaces are copied for the GPU",
+        warn_report("%s: no guest RAM is "
+#ifndef CONFIG_DARWIN
+                    "a shared memfd "
+#endif
+                    "in pages of the host's size: IOSurfaces are copied "
+                    "for the GPU",
                     TYPE_REIMS_GRAPHICS_PCI);
     }
 
