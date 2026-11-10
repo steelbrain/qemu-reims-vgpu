@@ -833,6 +833,7 @@ coref = []
 foundation = []
 iokit = []
 pvg = not_found
+pvg_graphics_api = false
 emulator_link_args = []
 midl = not_found
 widl = not_found
@@ -882,6 +883,14 @@ endif
 if host_os in ['darwin', 'linux', 'windows']
   pvg = dependency('reims-vgpu', method: 'pkg-config', static: host_os != 'windows',
                    required: get_option('pvg'))
+  # Stable releases expose Apple PVG; the independent reims-graphics API was
+  # added later. Select that device from its actual header contract, not from
+  # the presence of the older library or its unchanged package version.
+  if pvg.found()
+    pvg_graphics_api = cc.has_header_symbol('reims_vgpu.h',
+                                            'RVG_GRAPHICS_PCI_VENDOR_ID',
+                                            dependencies: pvg)
+  endif
   # apple-gfx-pci's default romfile: the EFI option ROM the package's
   # optionrom variable names, installed with QEMU's data files under
   # apple-gfx-pci's name for it. Configure links it into the build tree's
@@ -3431,9 +3440,9 @@ foreach target : target_dirs
     # The reims-graphics device's region is plain host memory the guest maps,
     # whatever its architecture or accelerator, so every target may have it:
     # x86-64 guests under TCG on a Mac among them.
-    # This Windows port implements the stable Apple PVG API. The separate
-    # reims-graphics device needs development-library APIs not provided here.
-    if pvg.found() and host_os != 'windows'
+    # Windows currently implements Apple PVG only. Other hosts may also build
+    # the independent device when their installed header provides its API.
+    if pvg_graphics_api and host_os != 'windows'
       target_kconfig += 'CONFIG_REIMS_GRAPHICS=y'
     endif
 
@@ -5066,6 +5075,7 @@ if host_os == 'freebsd'
 endif
 if host_os in ['darwin', 'linux', 'windows']
   summary_info += {'reims-vgpu support': pvg}
+  summary_info += {'reims-graphics API': pvg_graphics_api}
 endif
 summary_info += {'valgrind':          valgrind}
 summary(summary_info, bool_yn: true, section: 'Dependencies')
