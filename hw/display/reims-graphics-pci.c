@@ -55,6 +55,7 @@
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/queue.h"
+#include "qemu/target-info.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
@@ -1042,10 +1043,17 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .struct_size = sizeof(window_config),
         .callbacks = &window_callbacks,
     };
+    /*
+     * The guest's architecture is this QEMU's target: the device answers an
+     * arm64 guest's Metal as an Apple silicon Mac's GPU answers where the two
+     * kinds of Mac differ (isFramebufferReadSupported).
+     */
     RvgGraphicsDeviceConfig config = {
         .struct_size = sizeof(config),
         .callbacks = &callbacks,
         .window = reims_graphics_window_wanted() ? &window_config : NULL,
+        .guest_arch = target_aarch64() ? RVG_GUEST_ARCH_ARM64
+                                       : RVG_GUEST_ARCH_X86_64,
     };
     g_autoptr(GArray) ranges = g_array_new(false, false,
                                            sizeof(RvgMemoryRange));
