@@ -18,10 +18,13 @@ Windows build
 ~~~~~~~~~~~~~
 
 Use the x86-64 Windows GNU/UCRT build of the Reims Vulkan backend and its
-matching Metal-to-Vulkan runtime. In the Reims source tree, build and test
-the library as described in ``tests/windows-platform/README.md``::
+matching Metal-to-Vulkan runtime. Build the runtime first, then Reims,
+then QEMU. Reims' ``Cargo.toml`` pins and ``Cargo.lock`` must name the same
+reviewed runtime Git revision. In the Reims source tree, build and test
+the library as described in ``tests/windows-platform/README.md``; keep
+the lockfile fixed during the build::
 
-   cargo build -p reims-vgpu-c --no-default-features --features vulkan
+   cargo build --locked -p reims-vgpu-c --no-default-features --features vulkan
 
 Keep the UCRT toolchain's ``bin`` first on ``PATH`` when GCC builds SDL3;
 its runtime DLLs must match GCC's subprocesses. Build the firmware with
