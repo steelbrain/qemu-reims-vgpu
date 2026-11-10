@@ -52,6 +52,11 @@ tests = {
   'test-envlist': [],
 }
 
+if host_os == 'windows'
+  # Real section/descriptor ownership tests; no machine or guest is started.
+  tests += {'test-win32-shared-ram': []}
+endif
+
 if have_system or have_tools
   tests += {
     'test-qmp-event': [testqapi],

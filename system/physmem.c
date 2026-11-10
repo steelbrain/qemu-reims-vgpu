@@ -2565,8 +2565,27 @@ RAMBlock *qemu_ram_alloc_internal(ram_addr_t size, ram_addr_t max_size,
     new_block->page_size = qemu_real_host_page_size();
     new_block->host = host;
     new_block->flags = ram_flags;
+#ifdef CONFIG_WIN32
+    if (!host && (ram_flags & RAM_SHARED)) {
+        if (ram_flags & RAM_NORESERVE) {
+            error_setg(errp, "Windows shared RAM requires reserve=on");
+            g_free(new_block);
+            return NULL;
+        }
+        new_block->host = qemu_win32_shared_ram_alloc(max_size, &new_block->fd, errp);
+        if (!new_block->host) {
+            g_free(new_block);
+            return NULL;
+        }
+    }
+#endif
     ram_block_add(new_block, &local_err);
     if (local_err) {
+#ifdef CONFIG_WIN32
+        if (new_block->fd >= 0) {
+            qemu_win32_shared_ram_free(new_block->host, new_block->fd);
+        }
+#endif
         g_free(new_block);
         error_propagate(errp, local_err);
         return NULL;
@@ -2603,6 +2622,10 @@ static void reclaim_ramblock(RAMBlock *block)
         ;
     } else if (xen_map_cache_enabled()) {
         xen_invalidate_map_cache_entry(block->host);
+#ifdef CONFIG_WIN32
+    } else if (block->fd >= 0) {
+        qemu_win32_shared_ram_free(block->host, block->fd);
+#endif
 #if !defined(_WIN32) && !defined(EMSCRIPTEN)
     } else if (block->fd >= 0) {
         qemu_ram_munmap(block->fd, block->host, block->max_length);

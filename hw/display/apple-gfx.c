@@ -721,15 +721,21 @@ static bool apple_gfx_memory_files(GArray *ranges, GArray *files,
 
     for (i = 0; i < files->len; i++) {
         if (g_array_index(files, RvgMemoryRangeFile, i).fd < 0) {
-#ifdef CONFIG_LINUX
+#if defined(CONFIG_LINUX) || defined(CONFIG_WIN32)
             error_setg(errp, "apple-gfx: guest RAM at 0x%" PRIx64 " is not a "
                        "shared file mapping in pages of the host's size",
                        g_array_index(ranges, RvgMemoryRange,
                                      i).physical_address);
+#ifdef CONFIG_WIN32
+            error_append_hint(errp, "Back RAM with -object memory-backend-ram,"
+                              "share=on,id=ram,size=<size> and "
+                              "-machine memory-backend=ram.\n");
+#else
             error_append_hint(errp, "Back the machine's RAM with -object "
                               "memory-backend-memfd,share=on,id=<id> and "
                               "-machine memory-backend=<id>, without "
                               "hugetlb.\n");
+#endif
             return false;
 #else
             *memory_files = NULL;
