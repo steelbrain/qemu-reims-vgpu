@@ -55,6 +55,8 @@
 #define ER_TRANSFER             32
 #define ER_COMMAND_COMPLETE     33
 #define CC_SUCCESS              1
+#define CC_STALL_ERROR          6
+#define CC_RING_UNDERRUN        14
 
 #define EP_TYPE_ISOCH_OUT       1
 #define EP_TYPE_CONTROL         4
@@ -423,6 +425,57 @@ static void test_xhci_isoch_ep_type_mismatch(void)
     xhci_test_end(&x);
 }
 
+/*
+ * An isoch ring found empty is reported once (Ring Underrun for OUT), not at
+ * each doorbell rung on it: macOS rings the doorbell again on the event, and
+ * the two fed each other until the event ring filled. A TD run makes the next
+ * empty ring a new condition, reported once again.
+ */
+static void test_xhci_isoch_underrun_once(void)
+{
+    uint32_t status, control;
+    uint64_t ring;
+    XHCITest x;
+    int i;
+
+    if (!xhci_test_supported("usb-audio")) {
+        return;
+    }
+
+    xhci_test_start(&x, "-audiodev none,id=snd0 "
+                        "-device usb-audio,audiodev=snd0");
+    ring = xhci_configure_ep(&x, 2, EP_TYPE_ISOCH_OUT, 0, 64);
+
+    for (i = 0; i < 3; i++) {
+        xhci_writel(&x, x.doorbell + 4 * x.slot, 2);
+        qtest_clock_step(x.qts, XHCI_MICROFRAME_NS);
+    }
+    g_assert_true(xhci_next_event(&x, &status, &control));
+    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
+    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_RING_UNDERRUN);
+    g_assert_false(xhci_next_event(&x, NULL, NULL));
+
+    /* usb-audio stalls the TD: its streaming interface is not enabled */
+    xhci_write_trb(&x, ring, xhci_alloc_page(&x), 64,
+                   TRB_TYPE(TR_ISOCH) | TRB_TR_SIA | TRB_TR_IOC | TRB_C);
+    xhci_writel(&x, x.doorbell + 4 * x.slot, 2);
+    qtest_clock_step(x.qts, 8 * XHCI_MICROFRAME_NS);
+    g_assert_true(xhci_next_event(&x, &status, &control));
+    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
+    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_STALL_ERROR);
+    g_assert_true(xhci_next_event(&x, &status, &control));
+    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
+    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_RING_UNDERRUN);
+
+    xhci_writel(&x, x.doorbell + 4 * x.slot, 2);
+    qtest_clock_step(x.qts, XHCI_MICROFRAME_NS);
+    g_assert_false(xhci_next_event(&x, NULL, NULL));
+    g_assert_cmphex(xhci_readl(&x, x.oper + XHCI_USBSTS) &
+                    (USBSTS_HCH | USBSTS_HCE), ==, 0);
+
+    xhci_test_end(&x);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -441,6 +494,8 @@ int main(int argc, char **argv)
                    test_xhci_isoch_mfindex_32bit);
     qtest_add_func("/xhci/pci/isoch/ep-type-mismatch",
                    test_xhci_isoch_ep_type_mismatch);
+    qtest_add_func("/xhci/pci/isoch/underrun-once",
+                   test_xhci_isoch_underrun_once);
 
     qtest_start("-device nec-usb-xhci,id=xhci"
                 " -drive id=drive0,if=none,file=null-co://,"
