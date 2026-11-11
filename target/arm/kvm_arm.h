@@ -239,6 +239,18 @@ int kvm_arm_set_irq(int cpu, int irqtype, int irq, int level);
  */
 bool kvm_arm_forward_psci_cpu_on(Error **errp);
 
+/**
+ * kvm_arm_forward_smccc_range:
+ * @base: first SMCCC function ID
+ * @nr: number of function IDs
+ * @errp: error object
+ *
+ * Has KVM pass the SMCCC calls @base to @base + @nr - 1 to QEMU, which
+ * answers each with NOT_SUPPORTED in x0 and leaves every other register as
+ * the caller left it, as TCG and HVF do. Call it before any vCPU runs.
+ */
+bool kvm_arm_forward_smccc_range(uint32_t base, uint32_t nr, Error **errp);
+
 void kvm_arm_enable_mte(Object *cpuobj, Error **errp);
 
 void arm_cpu_kvm_set_irq(void *arm_cpu, int irq, int level);

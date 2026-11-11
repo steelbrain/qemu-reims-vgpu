@@ -1513,6 +1513,28 @@ static int kvm_arm_handle_dabt_nisv(ARMCPU *cpu, uint64_t esr_iss,
     return -1;
 }
 
+bool kvm_arm_forward_smccc_range(uint32_t base, uint32_t nr, Error **errp)
+{
+    struct kvm_smccc_filter filter = {
+        .base = base,
+        .nr_functions = nr,
+        .action = KVM_SMCCC_FILTER_FWD_TO_USER,
+    };
+    struct kvm_device_attr attr = {
+        .group = KVM_ARM_VM_SMCCC_CTRL,
+        .attr = KVM_ARM_VM_SMCCC_FILTER,
+        .addr = (uintptr_t)&filter,
+    };
+    int ret = kvm_vm_ioctl(kvm_state, KVM_SET_DEVICE_ATTR, &attr);
+
+    if (ret < 0) {
+        error_setg_errno(errp, -ret, "KVM_ARM_VM_SMCCC_FILTER for SMCCC "
+                         "functions 0x%" PRIx32 "+0x%" PRIx32, base, nr);
+        return false;
+    }
+    return true;
+}
+
 bool kvm_arm_forward_psci_cpu_on(Error **errp)
 {
     static const uint32_t fns[] = {
@@ -1606,6 +1628,24 @@ static int kvm_arm_handle_hypercall(ARMCPU *cpu, struct kvm_run *run)
     uint64_t fn = run->hypercall.nr;
     uint64_t mpidr, entry, context_id;
     int32_t ret;
+
+    if (fn != QEMU_PSCI_0_2_FN_CPU_ON && fn != QEMU_PSCI_0_2_FN64_CPU_ON) {
+        /*
+         * A call a board forwarded only to answer it as TCG and HVF do:
+         * NOT_SUPPORTED in x0, every other register as the caller left it.
+         * KVM's own answer also zeroes x1 to x3. Calls such as these can
+         * come on every context switch, so set x0 alone, without the BQL.
+         */
+        uint64_t x0 = (int64_t)QEMU_PSCI_RET_NOT_SUPPORTED;
+
+        if (cs->vcpu_dirty) {
+            env->xregs[0] = x0;
+            return 0;
+        }
+        return kvm_set_one_reg(cs, KVM_REG_ARM64 | KVM_REG_SIZE_U64 |
+                               KVM_REG_ARM_CORE |
+                               KVM_REG_ARM_CORE_REG(regs.regs[0]), &x0);
+    }
 
     bql_lock();
     cpu_synchronize_state(cs);
