@@ -1809,11 +1809,22 @@ static void xhci_calc_iso_kick(XHCIState *xhci, XHCITransfer *xfer,
             xfer->mfindex_kick = asap;
         }
     } else {
+        /*
+         * Frame ID holds the frame's low 11 bits, a window of 2048 frames.
+         * A TD is scheduled at most 895 ms ahead (4.11.2.5), so a frame in
+         * the half of the window behind the current frame is late and runs
+         * now, and one in the half ahead is waited for. A late TD used to
+         * be scheduled 2048 frames ahead once it was more than 32 frames
+         * late, or 1 frame late just after the window wrapped.
+         */
         xfer->mfindex_kick = ((xfer->trbs[0].control >> TRB_TR_FRAMEID_SHIFT)
                               & TRB_TR_FRAMEID_MASK) << 3;
         xfer->mfindex_kick |= mfindex & ~0x3fff;
-        if (xfer->mfindex_kick + 0x100 < mfindex) {
+        if (xfer->mfindex_kick + 0x2000 <= mfindex) {
             xfer->mfindex_kick += 0x4000;
+        } else if (xfer->mfindex_kick >= mfindex + 0x2000 &&
+                   xfer->mfindex_kick >= 0x4000) {
+            xfer->mfindex_kick -= 0x4000;
         }
     }
 }
