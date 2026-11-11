@@ -1486,6 +1486,23 @@ static int kvm_arm_handle_dabt_nisv(ARMCPU *cpu, uint64_t esr_iss,
                                     uint64_t fault_ipa)
 {
     CPUARMState *env = &cpu->env;
+    uint32_t insn;
+    bool done;
+
+    /*
+     * KVM cannot decode an access without an instruction syndrome: pair,
+     * writeback and SIMD&FP loads and stores. Where it reached a device
+     * QEMU emulates, emulate the instruction, as HVF does; where QEMU has
+     * no device at the address, such as KVM's own interrupt controller,
+     * the access fails and the guest takes the external abort as before.
+     */
+    bql_lock();
+    done = arm_emulate_isv0_mmio(CPU(cpu), fault_ipa, true, &insn);
+    bql_unlock();
+    if (done) {
+        return 0;
+    }
+
     /*
      * Request KVM to inject the external data abort into the guest
      */
