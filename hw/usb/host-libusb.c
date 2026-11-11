@@ -739,6 +739,14 @@ static void usb_host_iso_data_in(USBHostDevice *s, USBPacket *p)
 
     /* copy data to guest */
     xfer = hold ? NULL : QTAILQ_FIRST(&ring->copy);
+    if (xfer == NULL && usb_bus_from_device(USB_DEVICE(s))->iso_nak_retry) {
+        /*
+         * The guest has caught up with the device: QEMU ran its packets
+         * late, or ran them before handling transfers that had completed
+         * meanwhile. The device's packet is on its way; wait for it.
+         */
+        hold = true;
+    }
     if (xfer != NULL) {
         if (usb_host_iso_data_copy(xfer, p)) {
             QTAILQ_REMOVE(&ring->copy, xfer, next);
