@@ -505,6 +505,17 @@ static void mach_vmapple_init(MachineState *machine)
     if (kvm_enabled() && smp_cpus > 1) {
         kvm_arm_forward_psci_cpu_on(&error_fatal);
     }
+
+    /*
+     * macOS's pointer authentication calls, SMCCC 0xC1000000 to 0xC10000FF
+     * (see cpu-on-copies-pauth-keys below): HVF and TCG answer them
+     * NOT_SUPPORTED in x0 and change no other register, and macOS takes
+     * x1 to x3 of some of them as they are. KVM's answer zeroes x1 to x3,
+     * so answer them in QEMU as the others do.
+     */
+    if (kvm_enabled()) {
+        kvm_arm_forward_smccc_range(0xc1000000, 0x100, &error_fatal);
+    }
     for (n = 0; n < possible_cpus->len; n++) {
         Object *cpu;
         CPUState *cs;
