@@ -49,12 +49,14 @@
 #include "qobject/qlist.h"
 #include "standard-headers/linux/input.h"
 #include "system/hvf.h"
+#include "system/kvm.h"
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
 #include "system/tcg.h"
 #include "target/arm/gtimer.h"
 #include "target/arm/cpu.h"
+#include "target/arm/kvm_arm.h"
 
 struct VMAppleMachineState {
     MachineState parent;
@@ -493,6 +495,16 @@ static void mach_vmapple_init(MachineState *machine)
 
     possible_cpus = mc->possible_cpu_arch_ids(machine);
     assert(possible_cpus->len == max_cpus);
+
+    /*
+     * Under KVM, PSCI is the host kernel's, and the CPUs it powers on start
+     * on the pointer authentication keys KVM resets them to, not the boot
+     * CPU's, so cpu-on-copies-pauth-keys (below) would never apply. Have
+     * KVM pass CPU_ON to QEMU, which starts CPUs with it.
+     */
+    if (kvm_enabled() && smp_cpus > 1) {
+        kvm_arm_forward_psci_cpu_on(&error_fatal);
+    }
     for (n = 0; n < possible_cpus->len; n++) {
         Object *cpu;
         CPUState *cs;
