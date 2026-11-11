@@ -153,6 +153,8 @@ struct USBHostIsoRing {
     /* IN: transfers completed before the stream gave the guest data */
     unsigned int                     nr_primed;
     bool                             primed;
+    /* OUT: a packet waits for a transfer to complete and free its buffer */
+    bool                             out_waiting;
     QTAILQ_HEAD(, USBHostIsoXfer)    unused;
     QTAILQ_HEAD(, USBHostIsoXfer)    inflight;
     QTAILQ_HEAD(, USBHostIsoXfer)    copy;
@@ -553,6 +555,10 @@ usb_host_req_complete_iso(struct libusb_transfer *transfer)
         usb_wakeup(xfer->ring->ep, 0);
     } else {
         QTAILQ_INSERT_TAIL(&xfer->ring->unused, xfer, next);
+        if (xfer->ring->out_waiting) {
+            xfer->ring->out_waiting = false;
+            usb_wakeup(xfer->ring->ep, 0);
+        }
     }
 }
 
@@ -791,6 +797,17 @@ static void usb_host_iso_data_out(USBHostDevice *s, USBPacket *p)
         xfer = QTAILQ_FIRST(&ring->unused);
         if (xfer == NULL) {
             trace_usb_host_iso_out_of_bufs(s->bus_num, s->addr, p->ep->nr);
+            /*
+             * Every buffer is on its way to the device. A controller that
+             * retries a NAKed packet holds this one until a transfer
+             * completes and wakes the endpoint; other controllers complete
+             * it with nothing sent.
+             */
+            if (usb_bus_from_device(USB_DEVICE(s))->iso_nak_retry &&
+                !QTAILQ_EMPTY(&ring->inflight)) {
+                ring->out_waiting = true;
+                p->status = USB_RET_NAK;
+            }
             return;
         }
         QTAILQ_REMOVE(&ring->unused, xfer, next);
