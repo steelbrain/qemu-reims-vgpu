@@ -303,7 +303,8 @@ typedef struct XHCIEvRingSeg {
 } XHCIEvRingSeg;
 
 static void xhci_kick_ep(XHCIState *xhci, unsigned int slotid,
-                         unsigned int epid, unsigned int streamid);
+                         unsigned int epid, unsigned int streamid,
+                         bool doorbell);
 static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid);
 static TRBCCode xhci_disable_ep(XHCIState *xhci, unsigned int slotid,
                                 unsigned int epid);
@@ -1128,6 +1129,11 @@ static void xhci_ep_kick_timer(void *opaque)
     XHCIEPContext *epctx = opaque;
     MemReentrancyGuard *guard = &epctx->xhci->parent.mem_reentrancy_guard;
 
+    /* a timer armed before a Stop Endpoint restarts nothing (4.6.9) */
+    if (epctx->state != EP_RUNNING) {
+        return;
+    }
+
     assert(!guard->engaged_in_io);
     guard->engaged_in_io = true;
 
@@ -1904,7 +1910,8 @@ static int xhci_fire_transfer(XHCIState *xhci, XHCITransfer *xfer, XHCIEPContext
 }
 
 static void xhci_kick_ep(XHCIState *xhci, unsigned int slotid,
-                         unsigned int epid, unsigned int streamid)
+                         unsigned int epid, unsigned int streamid,
+                         bool doorbell)
 {
     XHCIEPContext *epctx;
 
@@ -1922,6 +1929,15 @@ static void xhci_kick_ep(XHCIState *xhci, unsigned int slotid,
         return;
     }
 
+    /*
+     * 4.6.9: only a doorbell moves a stopped endpoint back to running. A
+     * device that has data for an endpoint the guest stopped leaves it
+     * stopped: the guest reads the endpoint context after Stop Endpoint
+     * completes and expects it stopped until it rings the doorbell.
+     */
+    if (!doorbell && epctx->state != EP_RUNNING) {
+        return;
+    }
     if (epctx->kick_active) {
         return;
     }
@@ -3250,7 +3266,7 @@ static void xhci_doorbell_write(void *ptr, hwaddr reg,
             DPRINTF("xhci: bad doorbell %d write: 0x%x\n",
                     (int)reg, (uint32_t)val);
         } else {
-            xhci_kick_ep(xhci, reg, epid, streamid);
+            xhci_kick_ep(xhci, reg, epid, streamid, true);
         }
     }
 }
@@ -3431,7 +3447,7 @@ static void xhci_wakeup_endpoint(USBBus *bus, USBEndpoint *ep,
         return;
     }
     prev_engaged = xhci_engage_reentrancy_guard(xhci);
-    xhci_kick_ep(xhci, slotid, xhci_find_epid(ep), stream);
+    xhci_kick_ep(xhci, slotid, xhci_find_epid(ep), stream, false);
     xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
