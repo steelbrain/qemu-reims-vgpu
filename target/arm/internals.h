@@ -2087,4 +2087,20 @@ bool arm_cpu_match_cpreg_mig_tolerance(ARMCPU *cpu, uint64_t kvmidx,
  */
 void arm_set_cpu_power_state(ARMCPU *cpu, ARMPSCIState state);
 
+/**
+ * arm_emulate_isv0_mmio:
+ * @cpu: the CPU whose load or store took the data abort
+ * @ipa: the access's intermediate physical address
+ * @strict: refuse, changing no register, when an access fails
+ * @insn_out: set to the instruction read from the guest
+ *
+ * Emulates the load or store at the CPU's PC that took a data abort with
+ * no instruction syndrome (ISV=0), as accelerators report for pair,
+ * writeback and SIMD&FP accesses, against QEMU's address space. Returns
+ * true with the instruction complete, its registers and PC updated in env,
+ * or false for an instruction it does not cover.
+ */
+bool arm_emulate_isv0_mmio(CPUState *cpu, hwaddr ipa, bool strict,
+                           uint32_t *insn_out);
+
 #endif
