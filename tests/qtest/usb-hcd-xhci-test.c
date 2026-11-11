@@ -48,10 +48,12 @@
 #define TRB_GET_CCODE(status)   ((status) >> 24)
 #define TRB_GET_SLOT(control)   ((control) >> 24)
 
+#define TR_NORMAL               1
 #define TR_ISOCH                5
 #define CR_ENABLE_SLOT          9
 #define CR_ADDRESS_DEVICE       11
 #define CR_CONFIGURE_ENDPOINT   12
+#define CR_STOP_ENDPOINT        15
 #define ER_TRANSFER             32
 #define ER_COMMAND_COMPLETE     33
 #define CC_SUCCESS              1
@@ -61,6 +63,10 @@
 #define EP_TYPE_ISOCH_OUT       1
 #define EP_TYPE_CONTROL         4
 #define EP_TYPE_ISOCH_IN        5
+#define EP_TYPE_INTR_IN         7
+
+#define EP_STATE_MASK           0x7
+#define EP_STATE_STOPPED        3
 
 #define XHCI_RING_TRBS          64
 #define XHCI_MICROFRAME_NS      125000
@@ -71,7 +77,7 @@ typedef struct XHCITest {
     QPCIBus *bus;
     struct qhc hc;
     uint32_t oper, runtime, doorbell;
-    uint64_t cmd_ring, event_ring, input_ctx;
+    uint64_t cmd_ring, event_ring, input_ctx, dev_ctx;
     unsigned int cmd_idx, event_idx;
     unsigned int port, slot;
 } XHCITest;
@@ -296,7 +302,8 @@ static void xhci_test_start(XHCITest *x, const char *usb_device)
     }
 
     x->slot = xhci_command(x, 0, TRB_TYPE(CR_ENABLE_SLOT));
-    qtest_writeq(x->qts, dcbaa + 8 * x->slot, xhci_alloc_page(x));
+    x->dev_ctx = xhci_alloc_page(x);
+    qtest_writeq(x->qts, dcbaa + 8 * x->slot, x->dev_ctx);
 
     /* input control context: add slot and ep0 */
     qtest_writel(x->qts, x->input_ctx + 0x04, 0x3);
@@ -476,6 +483,52 @@ static void test_xhci_isoch_underrun_once(void)
     xhci_test_end(&x);
 }
 
+static unsigned int xhci_ep_state(XHCITest *x, unsigned int epid)
+{
+    return qtest_readl(x->qts, x->dev_ctx + 0x20 * epid) & EP_STATE_MASK;
+}
+
+/*
+ * Only a doorbell restarts a stopped endpoint. A key pressed after Stop
+ * Endpoint wakes the interrupt endpoint of usb-kbd, which has to stay
+ * stopped, its TD not run, until the doorbell: macOS reads the endpoint
+ * context once the command completes, and gives up on an endpoint it finds
+ * running again.
+ */
+static void test_xhci_stopped_ep_wakeup(void)
+{
+    uint32_t status, control;
+    uint64_t ring;
+    XHCITest x;
+
+    if (!xhci_test_supported("usb-kbd")) {
+        return;
+    }
+
+    xhci_test_start(&x, "-device usb-kbd");
+    ring = xhci_configure_ep(&x, 3, EP_TYPE_INTR_IN, 3, 8);
+    xhci_writel(&x, x.doorbell + 4 * x.slot, 3);
+    xhci_command(&x, 0, TRB_TYPE(CR_STOP_ENDPOINT) | (3 << 16) |
+                 (x.slot << 24));
+    g_assert_cmpuint(xhci_ep_state(&x, 3), ==, EP_STATE_STOPPED);
+
+    xhci_write_trb(&x, ring, xhci_alloc_page(&x), 8,
+                   TRB_TYPE(TR_NORMAL) | TRB_TR_IOC | TRB_C);
+    qtest_qmp_assert_success(x.qts, "{'execute': 'send-key', 'arguments': "
+                             "{'keys': [{'type': 'qcode', 'data': 'a'}]}}");
+    qtest_clock_step(x.qts, 16 * XHCI_MICROFRAME_NS);
+    g_assert_false(xhci_next_event(&x, NULL, NULL));
+    g_assert_cmpuint(xhci_ep_state(&x, 3), ==, EP_STATE_STOPPED);
+
+    xhci_writel(&x, x.doorbell + 4 * x.slot, 3);
+    qtest_clock_step(x.qts, 16 * XHCI_MICROFRAME_NS);
+    g_assert_true(xhci_next_event(&x, &status, &control));
+    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
+    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_SUCCESS);
+
+    xhci_test_end(&x);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -496,6 +549,8 @@ int main(int argc, char **argv)
                    test_xhci_isoch_ep_type_mismatch);
     qtest_add_func("/xhci/pci/isoch/underrun-once",
                    test_xhci_isoch_underrun_once);
+    qtest_add_func("/xhci/pci/stopped-ep-wakeup",
+                   test_xhci_stopped_ep_wakeup);
 
     qtest_start("-device nec-usb-xhci,id=xhci"
                 " -drive id=drive0,if=none,file=null-co://,"
