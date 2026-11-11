@@ -3389,6 +3389,8 @@ static void usb_xhci_init(XHCIState *xhci)
     xhci->numports = xhci->numports_2 + xhci->numports_3;
 
     usb_bus_new(&xhci->bus, sizeof(xhci->bus), &xhci_bus_ops, xhci->hostOpaque);
+    /* a NAKed isochronous TD waits in epctx->retry for its endpoint's wakeup */
+    xhci->bus.iso_nak_retry = true;
 
     for (i = 0; i < usbports; i++) {
         speedmask = 0;

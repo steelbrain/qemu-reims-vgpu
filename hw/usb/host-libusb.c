@@ -150,6 +150,9 @@ struct USBHostIsoRing {
     USBHostDevice                    *host;
     USBEndpoint                      *ep;
     unsigned int                     nr_xfers;
+    /* IN: transfers completed before the stream gave the guest data */
+    unsigned int                     nr_primed;
+    bool                             primed;
     QTAILQ_HEAD(, USBHostIsoXfer)    unused;
     QTAILQ_HEAD(, USBHostIsoXfer)    inflight;
     QTAILQ_HEAD(, USBHostIsoXfer)    copy;
@@ -544,6 +547,9 @@ usb_host_req_complete_iso(struct libusb_transfer *transfer)
     }
     if (xfer->ring->ep->pid == USB_TOKEN_IN) {
         QTAILQ_INSERT_TAIL(&xfer->ring->copy, xfer, next);
+        if (!xfer->ring->primed) {
+            xfer->ring->nr_primed++;
+        }
         usb_wakeup(xfer->ring->ep, 0);
     } else {
         QTAILQ_INSERT_TAIL(&xfer->ring->unused, xfer, next);
@@ -704,6 +710,7 @@ static void usb_host_iso_data_in(USBHostDevice *s, USBPacket *p)
     USBHostIsoRing *ring;
     USBHostIsoXfer *xfer;
     bool disconnect = false;
+    bool hold = false;
     int rc;
 
     ring = usb_host_iso_find(s, p->ep);
@@ -711,8 +718,21 @@ static void usb_host_iso_data_in(USBHostDevice *s, USBPacket *p)
         ring = usb_host_iso_alloc(s, p->ep);
     }
 
+    /*
+     * A device sends a packet at each of its endpoint's service intervals
+     * from the first, but the host's transfers bring them only as each
+     * completes. Until two have, a controller that retries a NAKed packet
+     * holds the guest's first packet, and the stream starts a transfer of
+     * data ahead of the guest; other controllers get empty packets.
+     */
+    if (!ring->primed) {
+        ring->primed = ring->nr_primed >= MIN(2, ring->nr_xfers) ||
+                       !usb_bus_from_device(USB_DEVICE(s))->iso_nak_retry;
+        hold = !ring->primed;
+    }
+
     /* copy data to guest */
-    xfer = QTAILQ_FIRST(&ring->copy);
+    xfer = hold ? NULL : QTAILQ_FIRST(&ring->copy);
     if (xfer != NULL) {
         if (usb_host_iso_data_copy(xfer, p)) {
             QTAILQ_REMOVE(&ring->copy, xfer, next);
@@ -737,6 +757,11 @@ static void usb_host_iso_data_in(USBHostDevice *s, USBPacket *p)
             trace_usb_host_iso_start(s->bus_num, s->addr, p->ep->nr);
         }
         QTAILQ_INSERT_TAIL(&ring->inflight, xfer, next);
+    }
+
+    if (hold && !QTAILQ_EMPTY(&ring->inflight)) {
+        /* usb_host_req_complete_iso wakes the endpoint */
+        p->status = USB_RET_NAK;
     }
 
     if (disconnect) {

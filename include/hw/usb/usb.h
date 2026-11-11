@@ -481,6 +481,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(USBBus, USB_BUS)
 struct USBBus {
     BusState qbus;
     USBBusOps *ops;
+    /*
+     * The controller holds an isochronous packet its device answers with
+     * USB_RET_NAK and retries it when the device wakes its endpoint, where
+     * other controllers complete the packet empty or with an error.
+     */
+    bool iso_nak_retry;
     int busnr;
     int nfree;
     int nused;
