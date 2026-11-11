@@ -291,6 +291,8 @@ struct XHCIEPContext {
     unsigned int interval;
     int64_t mfindex_last;
     QEMUTimer *kick_timer;
+    /* a Ring Underrun or Overrun event reports this empty ring already */
+    bool iso_empty_reported;
 };
 
 typedef struct XHCIEvRingSeg {
@@ -1141,6 +1143,7 @@ static void xhci_init_epctx(XHCIEPContext *epctx,
     }
 
     epctx->interval = 1u << MIN((ctx[0] >> 16) & 0xffu, 18u);
+    epctx->iso_empty_reported = false;
 }
 
 static TRBCCode xhci_enable_ep(XHCIState *xhci, unsigned int slotid,
@@ -1453,6 +1456,7 @@ static TRBCCode xhci_set_ep_dequeue(XHCIState *xhci, unsigned int slotid,
         xhci_ring_init(xhci, &epctx->ring, dequeue & ~0xF);
         epctx->ring.ccs = dequeue & 1;
     }
+    epctx->iso_empty_reported = false;
 
     xhci_set_ep_state(xhci, epctx, sctx, EP_STOPPED);
 
@@ -1971,8 +1975,14 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
     while (1) {
         length = xhci_ring_chain_length(xhci, ring);
         if (length <= 0) {
-            if (epctx->type == ET_ISO_OUT || epctx->type == ET_ISO_IN) {
-                /* 4.10.3.1 */
+            /*
+             * 4.10.3.1: an isochronous ring found empty is reported once,
+             * when it runs out of TDs, and not again until TDs were queued
+             * and ran out. A doorbell rung on a ring already reported empty
+             * reports nothing: the guest may ring it in answer to the event.
+             */
+            if ((epctx->type == ET_ISO_OUT || epctx->type == ET_ISO_IN) &&
+                !epctx->iso_empty_reported) {
                 XHCIEvent ev = { ER_TRANSFER };
                 ev.ccode  = epctx->type == ET_ISO_IN ?
                     CC_RING_OVERRUN : CC_RING_UNDERRUN;
@@ -1980,6 +1990,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
                 ev.epid   = epctx->epid;
                 ev.ptr    = epctx->ring.dequeue;
                 xhci_event(xhci, &ev, xhci->slots[epctx->slotid-1].intr);
+                epctx->iso_empty_reported = true;
             }
             break;
         }
@@ -1987,6 +1998,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
         if (xfer == NULL) {
             break;
         }
+        epctx->iso_empty_reported = false;
 
         for (i = 0; i < length; i++) {
             TRBType type;
