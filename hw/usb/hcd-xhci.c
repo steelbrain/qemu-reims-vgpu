@@ -645,7 +645,13 @@ static void xhci_write_event(XHCIState *xhci, XHCIEvent *event, int v)
     }
 }
 
-static void xhci_event(XHCIState *xhci, XHCIEvent *event, int v)
+/*
+ * Post an event on interrupter v's ring. A Transfer Event of a TRB with Block
+ * Event Interrupt set (4.17.5) is written without asserting the interrupt
+ * (block_irq): the interrupter's next interrupt brings the guest to it.
+ */
+static void xhci_event_blockable(XHCIState *xhci, XHCIEvent *event, int v,
+                                 bool block_irq)
 {
     XHCIInterrupter *intr;
     dma_addr_t erdp;
@@ -683,9 +689,17 @@ static void xhci_event(XHCIState *xhci, XHCIEvent *event, int v)
         DPRINTF("xhci: ER %d full, drop event\n", v);
     } else {
         xhci_write_event(xhci, event, v);
+        if (block_irq) {
+            return;
+        }
     }
 
     xhci_intr_raise(xhci, v);
+}
+
+static void xhci_event(XHCIState *xhci, XHCIEvent *event, int v)
+{
+    xhci_event_blockable(xhci, event, v, false);
 }
 
 static void xhci_ring_init(XHCIState *xhci, XHCIRing *ring,
@@ -1575,7 +1589,17 @@ static void xhci_xfer_report(XHCITransfer *xfer)
                 DPRINTF("xhci_xfer_data: EDTLA=%d\n", event.length);
                 edtla = 0;
             }
-            xhci_event(xhci, &event, TRB_INTR(*trb));
+            /*
+             * Normal, Isoch and Event Data TRBs have BEI; it blocks the
+             * interrupt of a completion, not of an error.
+             */
+            xhci_event_blockable(xhci, &event, TRB_INTR(*trb),
+                                 (TRB_TYPE(*trb) == TR_NORMAL ||
+                                  TRB_TYPE(*trb) == TR_ISOCH ||
+                                  TRB_TYPE(*trb) == TR_EVDATA) &&
+                                 (trb->control & TRB_TR_BEI) &&
+                                 (event.ccode == CC_SUCCESS ||
+                                  event.ccode == CC_SHORT_PACKET));
             reported = 1;
             if (xfer->status != CC_SUCCESS) {
                 return;
