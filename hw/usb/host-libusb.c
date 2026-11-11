@@ -112,6 +112,9 @@ struct USBHostDevice {
         bool                         claimed;
     } ifs[USB_MAX_INTERFACES];
 
+    /* bInterval of each endpoint of the current settings, [in][number] */
+    uint8_t                          ep_interval[2][USB_MAX_ENDPOINTS + 1];
+
     /* callbacks & friends */
     QEMUBH                           *bh_nodev;
     QEMUBH                           *bh_postld;
@@ -146,6 +149,7 @@ struct USBHostIsoXfer {
 struct USBHostIsoRing {
     USBHostDevice                    *host;
     USBEndpoint                      *ep;
+    unsigned int                     nr_xfers;
     QTAILQ_HEAD(, USBHostIsoXfer)    unused;
     QTAILQ_HEAD(, USBHostIsoXfer)    inflight;
     QTAILQ_HEAD(, USBHostIsoXfer)    copy;
@@ -546,22 +550,45 @@ usb_host_req_complete_iso(struct libusb_transfer *transfer)
     }
 }
 
+/*
+ * Packets in each transfer of an endpoint's ring: one millisecond of the
+ * bus, at most isobsize. A high or super speed endpoint is serviced every
+ * 2^(bInterval-1) microframes, eight to a millisecond, and a full speed one
+ * every 2^(bInterval-1) frames, one to a millisecond; an endpoint serviced
+ * less often than every millisecond gets one packet a transfer.
+ */
+static unsigned int usb_host_iso_xfer_packets(USBHostDevice *s,
+                                              USBEndpoint *ep)
+{
+    USBDevice *udev = USB_DEVICE(s);
+    unsigned int interval, packets = 1;
+
+    if (udev->speed >= USB_SPEED_HIGH) {
+        interval = s->ep_interval[ep->pid == USB_TOKEN_IN][ep->nr];
+        interval = MIN(MAX(interval, 1), 4);
+        packets = 8 >> (interval - 1);
+    }
+    return MAX(MIN(packets, s->iso_urb_frames), 1);
+}
+
 static USBHostIsoRing *usb_host_iso_alloc(USBHostDevice *s, USBEndpoint *ep)
 {
     USBHostIsoRing *ring = g_new0(USBHostIsoRing, 1);
     USBHostIsoXfer *xfer;
-    /* FIXME: check interval (for now assume one xfer per frame) */
-    int packets = s->iso_urb_frames;
-    int i;
+    unsigned int packets = usb_host_iso_xfer_packets(s, ep);
+    unsigned int i;
 
     ring->host = s;
     ring->ep = ep;
+    /* the ring holds isobufs * isobsize packets in all */
+    ring->nr_xfers = MAX(DIV_ROUND_UP(s->iso_urb_count * s->iso_urb_frames,
+                                      packets), 1);
     QTAILQ_INIT(&ring->unused);
     QTAILQ_INIT(&ring->inflight);
     QTAILQ_INIT(&ring->copy);
     QTAILQ_INSERT_TAIL(&s->isorings, ring, next);
 
-    for (i = 0; i < s->iso_urb_count; i++) {
+    for (i = 0; i < ring->nr_xfers; i++) {
         xfer = g_new0(USBHostIsoXfer, 1);
         xfer->ring = ring;
         xfer->xfer = libusb_alloc_transfer(packets);
@@ -750,7 +777,7 @@ static void usb_host_iso_data_out(USBHostDevice *s, USBPacket *p)
     if (QTAILQ_EMPTY(&ring->inflight)) {
         /* wait until half of our buffers are filled
            before kicking the iso out stream */
-        if (filled*2 < s->iso_urb_count) {
+        if (filled * 2 < ring->nr_xfers) {
             return;
         }
     }
@@ -930,6 +957,7 @@ static void usb_host_ep_update(USBHostDevice *s)
             usb_ep_set_max_packet_size(udev, pid, ep,
                                        endp->wMaxPacketSize);
             usb_ep_set_type(udev, pid, ep, type);
+            s->ep_interval[pid == USB_TOKEN_IN][ep] = endp->bInterval;
             usb_ep_set_ifnum(udev, pid, ep, i);
             usb_ep_set_halted(udev, pid, ep, 0);
 #ifdef HAVE_STREAMS
