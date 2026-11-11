@@ -26,6 +26,7 @@
 #define XHCI_CONFIG             0x38
 #define XHCI_PORTSC(n)          (0x400 + 0x10 * (n))
 /* interrupter 0, relative to the runtime registers */
+#define XHCI_IMAN               0x20
 #define XHCI_ERSTSZ             0x28
 #define XHCI_ERSTBA             0x30
 #define XHCI_ERDP               0x38
@@ -39,9 +40,11 @@
 #define PORTSC_PP               (1 << 9)
 #define CRCR_RCS                (1 << 0)
 #define ERDP_EHB                (1 << 3)
+#define IMAN_IP                 (1 << 0)
 
 #define TRB_C                   (1 << 0)
 #define TRB_TR_IOC              (1 << 5)
+#define TRB_TR_BEI              (1 << 9)
 #define TRB_TR_SIA              (1U << 31)
 #define TRB_TYPE(t)             ((t) << 10)
 #define TRB_GET_TYPE(control)   (((control) >> 10) & 0x3f)
@@ -529,6 +532,56 @@ static void test_xhci_stopped_ep_wakeup(void)
     xhci_test_end(&x);
 }
 
+/*
+ * A TD with Block Event Interrupt set completes with its event written and
+ * no interrupt asserted; the next TD without it asserts the interrupt.
+ * usb-kbd completes a TD on its interrupt endpoint when a key goes down and
+ * when it comes up again.
+ */
+static void test_xhci_bei(void)
+{
+    uint32_t status, control;
+    uint64_t ring;
+    XHCITest x;
+
+    if (!xhci_test_supported("usb-kbd")) {
+        return;
+    }
+
+    xhci_test_start(&x, "-device usb-kbd");
+    ring = xhci_configure_ep(&x, 3, EP_TYPE_INTR_IN, 3, 8);
+    xhci_writel(&x, x.runtime + XHCI_IMAN, IMAN_IP);
+    g_assert_cmphex(xhci_readl(&x, x.runtime + XHCI_IMAN) & IMAN_IP, ==, 0);
+
+    xhci_write_trb(&x, ring, xhci_alloc_page(&x), 8,
+                   TRB_TYPE(TR_NORMAL) | TRB_TR_IOC | TRB_TR_BEI | TRB_C);
+    xhci_write_trb(&x, ring + 16, xhci_alloc_page(&x), 8,
+                   TRB_TYPE(TR_NORMAL) | TRB_TR_IOC | TRB_C);
+    xhci_writel(&x, x.doorbell + 4 * x.slot, 3);
+    qtest_clock_step(x.qts, 16 * XHCI_MICROFRAME_NS);
+    g_assert_false(xhci_next_event(&x, NULL, NULL));
+
+    /* the key goes down: the first TD completes */
+    qtest_qmp_assert_success(x.qts, "{'execute': 'send-key', 'arguments': "
+                             "{'keys': [{'type': 'qcode', 'data': 'a'}]}}");
+    qtest_clock_step(x.qts, 16 * XHCI_MICROFRAME_NS);
+    g_assert_cmphex(xhci_readl(&x, x.runtime + XHCI_IMAN) & IMAN_IP, ==, 0);
+    g_assert_true(xhci_next_event(&x, &status, &control));
+    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
+    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_SUCCESS);
+    g_assert_false(xhci_next_event(&x, NULL, NULL));
+
+    /* send-key releases the key 100 ms later: the second TD completes */
+    qtest_clock_step(x.qts, 200 * 1000 * 1000);
+    g_assert_cmphex(xhci_readl(&x, x.runtime + XHCI_IMAN) & IMAN_IP, ==,
+                    IMAN_IP);
+    g_assert_true(xhci_next_event(&x, &status, &control));
+    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
+    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_SUCCESS);
+
+    xhci_test_end(&x);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -551,6 +604,7 @@ int main(int argc, char **argv)
                    test_xhci_isoch_underrun_once);
     qtest_add_func("/xhci/pci/stopped-ep-wakeup",
                    test_xhci_stopped_ep_wakeup);
+    qtest_add_func("/xhci/pci/bei", test_xhci_bei);
 
     qtest_start("-device nec-usb-xhci,id=xhci"
                 " -drive id=drive0,if=none,file=null-co://,"
