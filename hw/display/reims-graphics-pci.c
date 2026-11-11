@@ -44,6 +44,10 @@
  * none, and under -display none the console has no display, where the window
  * shows the cursor as the host's pointer.
  *
+ * At QEMU's quit, once the VM stopped for good, the device is torn down
+ * (reims_graphics_pci_vm_state_change): the library's release of its last
+ * device lets go of the GPU device before the process exits.
+ *
  * The device has no default option ROM: romfile names one.
  */
 
@@ -98,6 +102,7 @@ struct ReimsGraphicsPCIState {
     EventNotifier irqfd; /* the vector's, where the accelerator has irqfds */
     bool irqfd_made;     /* the notifier is initialised */
     RvgGraphicsDevice *device;
+    VMChangeStateEntry *vm_state; /* the teardown at QEMU's quit */
     QemuConsole *con;
     ThreadPool *pool; /* where the console's reads of the display run */
 
@@ -868,18 +873,25 @@ static void reims_graphics_pci_init(Object *obj)
 }
 
 /*
- * Undoes what realize did, from its failure or at unrealize, with the BARs
- * unmapped. The library's threads end without being waited for, and its
- * region stays mapped until they and the window's GPU work let it go. A
- * callback they or the window run meanwhile still schedules its BH, or
- * writes the irqfd, which stays open for it: the device
- * is not hotpluggable, so that is only at QEMU's end.
+ * Undoes what realize did, from its failure, at unrealize, or at QEMU's quit
+ * (reims_graphics_pci_vm_state_change), with BAR 2 out of the guest's address
+ * space; a second call finds nothing left to undo. The release of the
+ * library's last device waits, at most 5 s, for its threads and the window's
+ * GPU work, which no callback of ours holds up, as none takes the BQL; its
+ * region stays mapped until they let it go. A callback they or the window run
+ * meanwhile, or past those 5 s, still schedules its BH, or writes the irqfd,
+ * which stays open for it: the device is not hotpluggable, so that is only at
+ * QEMU's end.
  */
 static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
 {
     PCIDevice *dev = PCI_DEVICE(s);
     ReimsGraphicsEvent *event;
 
+    if (s->vm_state) {
+        qemu_del_vm_change_state_handler(s->vm_state);
+        s->vm_state = NULL;
+    }
     if (s->con) {
         qemu_graphic_console_close(s->con);
         s->con = NULL;
@@ -1018,6 +1030,35 @@ static void reims_graphics_pci_check_low_ram(void)
                     "-machine max-ram-below-4g=1G",
                     TYPE_REIMS_GRAPHICS_PCI);
     }
+}
+
+/*
+ * At QEMU's quit, once the main loop ended and vm_shutdown stopped the VM for
+ * good, its vCPUs paused, with the BQL held: the device is torn down while
+ * QEMU still runs, so that the library's release of its last device lets go
+ * of the GPU device before the process exits. A runtime device kept to the
+ * exit can end it with SIGSEGV inside NVIDIA's driver, whose exit handler
+ * tears its SPIR-V compiler down while a worker thread of the driver's still
+ * runs in it (reims_vgpu.h, rvg_graphics_device_release). BAR 2 leaves the
+ * guest's address space first, since the region goes with the device; QEMU
+ * runs no more of the device's MMIO.
+ *
+ * A shutdown whose action pauses the VM (-action shutdown=pause,
+ * -no-shutdown) keeps the device, which the guest uses again after a reset,
+ * and then so does its quit, as does a quit of a VM stopped before it: no
+ * handler hears it. The device then stays to the exit, as before.
+ */
+static void reims_graphics_pci_vm_state_change(void *opaque, bool running,
+                                               RunState state)
+{
+    ReimsGraphicsPCIState *s = opaque;
+
+    if (running || state != RUN_STATE_SHUTDOWN ||
+        shutdown_action == SHUTDOWN_ACTION_PAUSE) {
+        return;
+    }
+    memory_region_set_enabled(&s->region, false);
+    reims_graphics_pci_teardown(s);
 }
 
 static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
@@ -1180,6 +1221,8 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     s->pool = thread_pool_new();
     s->con = qemu_graphic_console_create(DEVICE(dev), 0,
                                          &reims_graphics_pci_console_ops, s);
+    s->vm_state = qemu_add_vm_change_state_handler(
+        reims_graphics_pci_vm_state_change, s);
     return;
 
 fail:
