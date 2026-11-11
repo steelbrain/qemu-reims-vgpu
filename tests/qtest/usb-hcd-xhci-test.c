@@ -25,6 +25,8 @@
 #define XHCI_DCBAAP             0x30
 #define XHCI_CONFIG             0x38
 #define XHCI_PORTSC(n)          (0x400 + 0x10 * (n))
+/* relative to the runtime registers */
+#define XHCI_MFINDEX            0x00
 /* interrupter 0, relative to the runtime registers */
 #define XHCI_IMAN               0x20
 #define XHCI_ERSTSZ             0x28
@@ -46,6 +48,7 @@
 #define TRB_TR_IOC              (1 << 5)
 #define TRB_TR_BEI              (1 << 9)
 #define TRB_TR_SIA              (1U << 31)
+#define TRB_TR_FRAMEID(f)       ((f) << 20)
 #define TRB_TYPE(t)             ((t) << 10)
 #define TRB_GET_TYPE(control)   (((control) >> 10) & 0x3f)
 #define TRB_GET_CCODE(status)   ((status) >> 24)
@@ -436,6 +439,62 @@ static void test_xhci_isoch_ep_type_mismatch(void)
 }
 
 /*
+ * A TD's Frame ID holds the low 11 bits of its frame. One behind the current
+ * frame is late and runs at once, one ahead waits for its frame, across the
+ * 2048-frame wrap as well. A TD one frame late just after the wrap, or 100
+ * frames late, used to wait 2048 frames.
+ */
+static void test_xhci_isoch_late_frame_id(void)
+{
+    static const struct {
+        unsigned int now, frame, wait;  /* frames */
+    } cases[] = {
+        { 0, 2047, 0 },
+        { 1000, 900, 0 },
+        { 1000, 1100, 100 },
+        { 2000, 50, 98 },
+    };
+    uint32_t status, control, mfindex;
+    uint64_t ring;
+    XHCITest x;
+    int i;
+
+    if (!xhci_test_supported("usb-audio")) {
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(cases); i++) {
+        xhci_test_start(&x, "-audiodev none,id=snd0 "
+                            "-device usb-audio,audiodev=snd0");
+        ring = xhci_configure_ep(&x, 2, EP_TYPE_ISOCH_OUT, 0, 64);
+
+        /* to microframe 1 of frame cases[i].now in the next window */
+        mfindex = xhci_readl(&x, x.runtime + XHCI_MFINDEX) & 0x3fff;
+        qtest_clock_step(x.qts, (0x4000 - mfindex + (cases[i].now << 3) + 1) *
+                         XHCI_MICROFRAME_NS);
+        g_assert_cmpuint(xhci_readl(&x, x.runtime + XHCI_MFINDEX), ==,
+                         (cases[i].now << 3) + 1);
+
+        /* usb-audio stalls the TD: its streaming interface is not enabled */
+        xhci_write_trb(&x, ring, xhci_alloc_page(&x), 64,
+                       TRB_TYPE(TR_ISOCH) | TRB_TR_FRAMEID(cases[i].frame) |
+                       TRB_TR_IOC | TRB_C);
+        xhci_writel(&x, x.doorbell + 4 * x.slot, 2);
+        if (cases[i].wait) {
+            qtest_clock_step(x.qts, ((cases[i].wait << 3) - 2) *
+                             XHCI_MICROFRAME_NS);
+            g_assert_false(xhci_next_event(&x, NULL, NULL));
+        }
+        qtest_clock_step(x.qts, 2 * XHCI_MICROFRAME_NS);
+        g_assert_true(xhci_next_event(&x, &status, &control));
+        g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
+        g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_STALL_ERROR);
+
+        xhci_test_end(&x);
+    }
+}
+
+/*
  * An isoch ring found empty is reported once (Ring Underrun for OUT), not at
  * each doorbell rung on it: macOS rings the doorbell again on the event, and
  * the two fed each other until the event ring filled. A TD run makes the next
@@ -602,6 +661,8 @@ int main(int argc, char **argv)
                    test_xhci_isoch_ep_type_mismatch);
     qtest_add_func("/xhci/pci/isoch/underrun-once",
                    test_xhci_isoch_underrun_once);
+    qtest_add_func("/xhci/pci/isoch/late-frame-id",
+                   test_xhci_isoch_late_frame_id);
     qtest_add_func("/xhci/pci/stopped-ep-wakeup",
                    test_xhci_stopped_ep_wakeup);
     qtest_add_func("/xhci/pci/bei", test_xhci_bei);
