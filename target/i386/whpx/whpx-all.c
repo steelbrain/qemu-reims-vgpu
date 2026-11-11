@@ -1513,6 +1513,16 @@ HRESULT whpx_set_exception_exit_bitmap(UINT64 exceptions)
     prop.ExtendedVmExits.X64MsrExit = 1;
     prop.ExtendedVmExits.X64CpuidExit = 1;
 
+    /*
+     * Windows 10 Hyper-V ignores an edge-triggered INIT with Level=0,
+     * although the level bit is architecturally ignored for edge delivery.
+     * XNU uses precisely that valid sequence. Route INIT/SIPI through the
+     * WHPX API on legacy hosts; newer hosts retain their native fast path.
+     */
+    if (!is_modern_os && whpx_irqchip_in_kernel()) {
+        prop.ExtendedVmExits.X64ApicInitSipiExitTrap = 1;
+    }
+
     if (exceptions != 0 || whpx_get_default_exceptions() != 0) {
         prop.ExtendedVmExits.ExceptionExit = 1;
     }
@@ -2340,6 +2350,66 @@ int whpx_vcpu_run(CPUState *cpu)
              */
             ret = whpx_handle_halt(cpu);
             break;
+
+        case WHvRunVpExitReasonX64ApicInitSipiTrap: {
+            uint64_t icr = vcpu->exit_ctx.ApicInitSipi.ApicIcr;
+            uint32_t mode = (icr & APIC_ICR_DELIV_MOD) >>
+                            APIC_ICR_DELIV_MOD_SHIFT;
+            uint32_t shorthand = (icr & APIC_ICR_DEST_SHORT) >>
+                                 APIC_ICR_DEST_SHORT_SHIFT;
+            WHV_INTERRUPT_CONTROL ipi = {0};
+            WHV_REGISTER_VALUE base;
+            CPUState *target;
+
+            whpx_get_reg(cpu, WHvX64RegisterApicBase, &base);
+            assert(mode == APIC_DM_INIT || mode == APIC_DM_SIPI);
+            /* Level-triggered INIT deassert is not a processor reset. */
+            if (mode == APIC_DM_INIT && (icr & APIC_ICR_TRIGGER_MOD) &&
+                !(icr & (1U << 14))) {
+                break;
+            }
+            ipi.Type = mode == APIC_DM_INIT ? WHvX64InterruptTypeInit :
+                                             WHvX64InterruptTypeSipi;
+            ipi.DestinationMode = (icr & APIC_ICR_DEST_MOD) ?
+                WHvX64InterruptDestinationModeLogical :
+                WHvX64InterruptDestinationModePhysical;
+            ipi.TriggerMode = (icr & APIC_ICR_TRIGGER_MOD) ?
+                WHvX64InterruptTriggerModeLevel : WHvX64InterruptTriggerModeEdge;
+            ipi.Vector = icr & APIC_VECTOR_MASK;
+
+            if (shorthand == 0) {
+                /* x2APIC has a 32-bit destination, unlike xAPIC's high byte. */
+                ipi.Destination = (base.Reg64 & MSR_IA32_APICBASE_EXTD) ?
+                    icr >> 32 : (icr >> 56) & APIC_VECTOR_MASK;
+                hr = whp_dispatch.WHvRequestInterrupt(whpx->partition,
+                                                      &ipi, sizeof(ipi));
+                if (FAILED(hr)) {
+                    error_report("WHPX: Failed to deliver INIT/SIPI, hr=%08lx", hr);
+                    ret = -1;
+                }
+                break;
+            }
+
+            /* Shorthand ignores destination mode and addresses actual APIC IDs. */
+            ipi.DestinationMode = WHvX64InterruptDestinationModePhysical;
+            CPU_FOREACH(target) {
+                if ((shorthand == 1 && target != cpu) ||
+                    (shorthand == 3 && target == cpu)) {
+                    continue;
+                }
+                ipi.Destination = X86_CPU(target)->apic_state->initial_apic_id;
+                hr = whp_dispatch.WHvRequestInterrupt(whpx->partition,
+                                                      &ipi, sizeof(ipi));
+                if (FAILED(hr)) {
+                    error_report("WHPX: Failed to deliver INIT/SIPI to APIC %u, "
+                                 "hr=%08lx", ipi.Destination, hr);
+                    ret = -1;
+                    break;
+                }
+            }
+            /* A trap reports an already-completed write; do not advance RIP. */
+            break;
+        }
 
         case WHvRunVpExitReasonCanceled:
             if (exclusive_step_mode != WHPX_STEP_NONE) {
