@@ -533,6 +533,20 @@ static void mach_vmapple_init(MachineState *machine)
                                 &error_fatal);
 
         /*
+         * Under KVM: vmapple does not initialize KVM's PMU, and KVM will
+         * not run a vCPU that has one uninitialized; and macOS's ApplePSCI
+         * accepts PSCI 1.1, which HVF reports, but not the 1.3 that
+         * current kernels give by default.
+         */
+        if (kvm_enabled()) {
+            if (object_property_find(cpu, "pmu")) {
+                object_property_set_bool(cpu, "pmu", false, &error_fatal);
+            }
+            object_property_set_str(cpu, "kvm-psci-version", "1.1",
+                                    &error_fatal);
+        }
+
+        /*
          * macOS's device tree gives every CPU a 24 MHz timebase, the
          * frequency of Apple silicon's system counter, which HVF passes
          * through to the guest. Run TCG's counter at that frequency too.
