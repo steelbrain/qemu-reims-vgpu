@@ -59,6 +59,7 @@
 #include "system/hvf.h"
 #include "system/hvf_int.h"
 #include <mach/mach_time.h>
+#include <pthread/qos.h>
 
 HVFState *hvf_state;
 
@@ -157,6 +158,17 @@ static void *hvf_cpu_thread_fn(void *arg)
     int r;
 
     assert(hvf_enabled());
+
+    /*
+     * The vCPU runs the guest at the user-initiated QoS, above the default
+     * QoS a build or any other CPU-bound process on the host runs at, and
+     * below the host's own user-interactive work. At the default QoS a vCPU
+     * running the guest's work is one CPU-bound thread among the build's,
+     * and loses its share to them: an arm64 macOS guest's timers then fire
+     * up to 1.9 s late and its display falls to 22 frames a second beside 64
+     * spinning processes on an M3 Max's 16 cores.
+     */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 
     rcu_register_thread();
 
