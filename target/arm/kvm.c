@@ -25,7 +25,9 @@
 #include "system/ramblock.h"
 #include "system/kvm.h"
 #include "system/kvm_int.h"
+#include "system/hw_accel.h"
 #include "kvm_arm.h"
+#include "arm-powerctl.h"
 #include "cpu.h"
 #include "cpu-sysregs.h"
 #include "trace.h"
@@ -1511,6 +1513,127 @@ static int kvm_arm_handle_dabt_nisv(ARMCPU *cpu, uint64_t esr_iss,
     return -1;
 }
 
+bool kvm_arm_forward_psci_cpu_on(Error **errp)
+{
+    static const uint32_t fns[] = {
+        QEMU_PSCI_0_2_FN_CPU_ON,
+        QEMU_PSCI_0_2_FN64_CPU_ON,
+    };
+    struct kvm_device_attr has = {
+        .group = KVM_ARM_VM_SMCCC_CTRL,
+        .attr = KVM_ARM_VM_SMCCC_FILTER,
+    };
+    int i, ret;
+
+    /*
+     * Not kvm_vm_check_attr(): arm64 KVM answers KVM_HAS_DEVICE_ATTR on the
+     * VM without reporting KVM_CAP_VM_ATTRIBUTES, which that asks for.
+     */
+    if (kvm_vm_ioctl(kvm_state, KVM_HAS_DEVICE_ATTR, &has) < 0) {
+        error_setg(errp, "KVM cannot pass PSCI CPU_ON to QEMU: the host "
+                   "kernel has no SMCCC filter (KVM_ARM_VM_SMCCC_FILTER, "
+                   "Linux 6.4)");
+        return false;
+    }
+    for (i = 0; i < ARRAY_SIZE(fns); i++) {
+        struct kvm_smccc_filter filter = {
+            .base = fns[i],
+            .nr_functions = 1,
+            .action = KVM_SMCCC_FILTER_FWD_TO_USER,
+        };
+        struct kvm_device_attr attr = {
+            .group = KVM_ARM_VM_SMCCC_CTRL,
+            .attr = KVM_ARM_VM_SMCCC_FILTER,
+            .addr = (uintptr_t)&filter,
+        };
+
+        ret = kvm_vm_ioctl(kvm_state, KVM_SET_DEVICE_ATTR, &attr);
+        if (ret < 0) {
+            error_setg_errno(errp, -ret, "KVM_ARM_VM_SMCCC_FILTER for SMCCC "
+                             "function 0x%" PRIx32, fns[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Run on the CPU that CPU_ON starts, after arm_set_cpu_on()'s own work:
+ * that work resets the CPU and gives it its entry state in env, which KVM
+ * has not seen, so hand KVM all of it, the power state with it.
+ */
+static void kvm_arm_cpu_on_put_state(CPUState *cs, run_on_cpu_data data)
+{
+    cpu_synchronize_post_reset(cs);
+}
+
+static int32_t kvm_arm_psci_cpu_on(CPUState *cs, uint64_t mpidr,
+                                   uint64_t entry, uint64_t context_id)
+{
+    CPUState *target = arm_get_cpu_by_id(mpidr);
+    int32_t ret;
+
+    if (!target) {
+        return QEMU_PSCI_RET_INVALID_PARAMS;
+    }
+    /*
+     * KVM still serves CPU_OFF, so a CPU that QEMU last saw on may have
+     * turned itself off since: read its power state back from KVM.
+     */
+    if (target != cs && ARM_CPU(target)->power_state != PSCI_OFF) {
+        cpu_synchronize_state(target);
+    }
+    ret = arm_set_cpu_on(mpidr, entry, context_id, arm_current_el(cpu_env(cs)),
+                         true);
+    if (ret == QEMU_ARM_POWERCTL_RET_SUCCESS) {
+        /*
+         * Queued behind arm_set_cpu_on()'s work while the BQL is held, so
+         * the target runs both in this order before it next enters KVM.
+         */
+        async_run_on_cpu(target, kvm_arm_cpu_on_put_state, RUN_ON_CPU_NULL);
+    }
+    return ret;
+}
+
+/*
+ * An SMCCC call that kvm_arm_forward_psci_cpu_on() had KVM pass to QEMU.
+ * KVM has already moved the PC past the HVC or SMC; the result goes in x0.
+ */
+static int kvm_arm_handle_hypercall(ARMCPU *cpu, struct kvm_run *run)
+{
+    CPUState *cs = CPU(cpu);
+    CPUARMState *env = &cpu->env;
+    uint64_t fn = run->hypercall.nr;
+    uint64_t mpidr, entry, context_id;
+    int32_t ret;
+
+    bql_lock();
+    cpu_synchronize_state(cs);
+    mpidr = env->xregs[1];
+    entry = env->xregs[2];
+    context_id = env->xregs[3];
+
+    switch (fn) {
+    case QEMU_PSCI_0_2_FN_CPU_ON:
+        mpidr = (uint32_t)mpidr;
+        entry = (uint32_t)entry;
+        context_id = (uint32_t)context_id;
+        ret = kvm_arm_psci_cpu_on(cs, mpidr, entry, context_id);
+        break;
+    case QEMU_PSCI_0_2_FN64_CPU_ON:
+        ret = kvm_arm_psci_cpu_on(cs, mpidr, entry, context_id);
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "%s: unexpected SMCCC call 0x%" PRIx64
+                      " from KVM\n", __func__, fn);
+        ret = QEMU_PSCI_RET_NOT_SUPPORTED;
+        break;
+    }
+    env->xregs[0] = (int64_t)ret;
+    bql_unlock();
+    return 0;
+}
+
 /**
  * kvm_arm_handle_debug:
  * @cpu: ARMCPU
@@ -1603,6 +1726,9 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
         /* External DABT with no valid iss to decode */
         ret = kvm_arm_handle_dabt_nisv(cpu, run->arm_nisv.esr_iss,
                                        run->arm_nisv.fault_ipa);
+        break;
+    case KVM_EXIT_HYPERCALL:
+        ret = kvm_arm_handle_hypercall(cpu, run);
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "%s: un-handled exit reason %d\n",

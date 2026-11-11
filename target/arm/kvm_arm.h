@@ -225,6 +225,20 @@ void kvm_arm_pvtime_init(ARMCPU *cpu, uint64_t ipa);
 
 int kvm_arm_set_irq(int cpu, int irqtype, int irq, int level);
 
+/**
+ * kvm_arm_forward_psci_cpu_on:
+ * @errp: error object
+ *
+ * Has KVM pass the guest's PSCI CPU_ON calls to QEMU, which starts the
+ * target CPU through arm_set_cpu_on() as it does under TCG and HVF, so that
+ * properties such as cpu-on-copies-pauth-keys apply under KVM too. KVM
+ * keeps serving every other PSCI call. Call it before any vCPU runs.
+ *
+ * Returns: true on success; false, with @errp set, if the host kernel has
+ * no SMCCC filter or refuses it.
+ */
+bool kvm_arm_forward_psci_cpu_on(Error **errp);
+
 void kvm_arm_enable_mte(Object *cpuobj, Error **errp);
 
 void arm_cpu_kvm_set_irq(void *arm_cpu, int irq, int level);

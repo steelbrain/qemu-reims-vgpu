@@ -75,6 +75,11 @@ void kvm_arm_pmu_init(ARMCPU *cpu)
     g_assert_not_reached();
 }
 
+bool kvm_arm_forward_psci_cpu_on(Error **errp)
+{
+    g_assert_not_reached();
+}
+
 void kvm_arm_pvtime_init(ARMCPU *cpu, uint64_t ipa)
 {
     g_assert_not_reached();
