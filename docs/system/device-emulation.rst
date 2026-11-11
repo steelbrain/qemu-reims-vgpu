@@ -84,7 +84,7 @@ Emulated Devices
 
    devices/virtio/index.rst
 
-   devices/apple-gfx.rst
+   devices/reims-graphics.rst
    devices/can.rst
    devices/canokey.rst
    devices/ccid.rst

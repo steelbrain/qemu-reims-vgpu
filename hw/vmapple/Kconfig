@@ -9,15 +9,17 @@ config VMAPPLE_BDIF
 config VMAPPLE_CFG
     bool
 
+config VMAPPLE_RTC
+    bool
+
 config VMAPPLE_VIRTIO_BLK
     bool
 
 config VMAPPLE
     bool
-    depends on ARM
-    depends on HVF
-    depends on MAC_PVG
-    default y if ARM
+    depends on AARCH64
+    depends on TCG || HVF
+    default y
     imply PCI_DEVICES
     select ARM_GICV3
     select PLATFORM_BUS
@@ -28,8 +30,9 @@ config VMAPPLE
     select PL061 # GPIO
     select GPIO_PWR
     select PVPANIC_MMIO
+    select UNIMP
     select VMAPPLE_AES
     select VMAPPLE_BDIF
     select VMAPPLE_CFG
-    select MAC_PVG_MMIO
+    select VMAPPLE_RTC
     select VMAPPLE_VIRTIO_BLK

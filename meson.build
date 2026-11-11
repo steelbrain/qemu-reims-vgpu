@@ -830,10 +830,8 @@ winmm = []
 socket = []
 version_res = []
 coref = []
-foundation = []
 iokit = []
-pvg = not_found
-pvg_graphics_api = false
+reims_vgpu = not_found
 emulator_link_args = []
 midl = not_found
 widl = not_found
@@ -857,7 +855,6 @@ if host_os == 'windows'
   host_dsosuf = '.dll'
 elif host_os == 'darwin'
   coref = dependency('appleframeworks', modules: 'CoreFoundation')
-  foundation = dependency('appleframeworks', modules: 'Foundation')
   iokit = dependency('appleframeworks', modules: 'IOKit', required: false)
   host_dsosuf = '.dylib'
 elif host_os == 'sunos'
@@ -875,36 +872,14 @@ elif host_os == 'openbsd'
   endif
 endif
 
-# apple-gfx drives reims-vgpu's C API (reims_vgpu.h), a library found
-# through pkg-config: reims-vgpu.pc, which reims-vgpu's `cargo
-# xtask dist` writes into its target/dist/lib/pkgconfig. It is linked
-# statically on Unix; Windows uses the DLL's import library. The library
-# runs on macOS/HVF, Linux/KVM, and Windows/WHPX.
+# reims-graphics-pci drives reims-vgpu's C API (reims_vgpu.h), a library
+# found through pkg-config: reims-vgpu.pc, which reims-vgpu's `cargo xtask
+# dist` writes into its target/dist/lib/pkgconfig. Unix links the library
+# statically; Windows links its GNU import library and loads the DLL.
 if host_os in ['darwin', 'linux', 'windows']
-  pvg = dependency('reims-vgpu', method: 'pkg-config', static: host_os != 'windows',
-                   required: get_option('pvg'))
-  # Stable releases expose Apple PVG; the independent reims-graphics API was
-  # added later. Select that device from its actual header contract, not from
-  # the presence of the older library or its unchanged package version.
-  if pvg.found()
-    pvg_graphics_api = cc.has_header_symbol('reims_vgpu.h',
-                                            'RVG_GRAPHICS_PCI_VENDOR_ID',
-                                            dependencies: pvg)
-  endif
-  # apple-gfx-pci's default romfile: the EFI option ROM the package's
-  # optionrom variable names, installed with QEMU's data files under
-  # apple-gfx-pci's name for it. Configure links it into the build tree's
-  # qemu-bundle too, where a QEMU run from the build tree finds it.
-  if pvg.found()
-    pvg_rom = pvg.get_variable(pkgconfig: 'optionrom', default_value: '')
-    if pvg_rom != '' and fs.is_file(pvg_rom)
-      install_data(pvg_rom, rename: 'ReimsVgpu.rom',
-                   install_dir: qemu_datadir, install_mode: 'rw-r--r--')
-    else
-      warning('reims-vgpu names no option ROM that exists (its optionrom ' +
-              'variable): apple-gfx-pci needs romfile= to realize')
-    endif
-  endif
+  reims_vgpu = dependency('reims-vgpu', method: 'pkg-config',
+                          static: host_os != 'windows',
+                          required: get_option('reims_vgpu'))
 endif
 
 ###############################################
@@ -3428,21 +3403,10 @@ foreach target : target_dirs
     target_kconfig += 'CONFIG_' + config_target['TARGET_ARCH'].to_upper() + '=y'
     target_kconfig += 'CONFIG_TARGET_BIG_ENDIAN=' + config_target['TARGET_BIG_ENDIAN']
 
-    # PVG is not cross-architecture: the library sizes the guest's pages
-    # for the host's architecture.  Use accelerator_targets as a proxy to
-    # figure out which target can support PVG on this host: HVF's on macOS,
-    # KVM's on Linux, and WHPX's on Windows.
-    if pvg.found() and (target in accelerator_targets.get('CONFIG_HVF', []) or
-                        target in accelerator_targets.get('CONFIG_KVM', []) or
-                        target in accelerator_targets.get('CONFIG_WHPX', []))
-      target_kconfig += 'CONFIG_MAC_PVG=y'
-    endif
     # The reims-graphics device's region is plain host memory the guest maps,
     # whatever its architecture or accelerator, so every target may have it:
     # x86-64 guests under TCG on a Mac among them.
-    # Windows currently implements Apple PVG only. Other hosts may also build
-    # the independent device when their installed header provides its API.
-    if pvg_graphics_api and host_os != 'windows'
+    if reims_vgpu.found()
       target_kconfig += 'CONFIG_REIMS_GRAPHICS=y'
     endif
 
@@ -5074,8 +5038,7 @@ if host_os == 'freebsd'
   summary_info += {'libinotify-kqueue': inotify}
 endif
 if host_os in ['darwin', 'linux', 'windows']
-  summary_info += {'reims-vgpu support': pvg}
-  summary_info += {'reims-graphics API': pvg_graphics_api}
+  summary_info += {'reims-vgpu support': reims_vgpu}
 endif
 summary_info += {'valgrind':          valgrind}
 summary(summary_info, bool_yn: true, section: 'Dependencies')

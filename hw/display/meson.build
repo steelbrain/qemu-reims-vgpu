@@ -65,30 +65,10 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
 
 system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
 
-# Only macOS naps an application; elsewhere apple-gfx's hold does nothing.
-if host_os == 'darwin'
-  apple_gfx_activity = [files('apple-gfx-activity.m'), foundation]
-else
-  apple_gfx_activity = files('apple-gfx-activity-stub.c')
-endif
-system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],
-              if_true: [files('apple-gfx.c', 'apple-gfx-pci.c'),
-                        apple_gfx_activity])
-# The VideoToolbox device's transport; reims-vgpu's video device is its host
-# side.
-system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_VIDEO_PCI'],
-              if_true: files('apple-videotoolbox-pci.c'))
-# The M2 scaler device's transport; reims-vgpu's scaler device is its host
-# side.
-system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_SCALER_PCI'],
-              if_true: files('apple-m2scaler-pci.c'))
 # The reims-graphics device's transport; reims-vgpu's graphics device is its
 # host side.
-system_ss.add(when: [pvg, 'CONFIG_REIMS_GRAPHICS_PCI'],
+system_ss.add(when: [reims_vgpu, 'CONFIG_REIMS_GRAPHICS_PCI'],
               if_true: files('reims-graphics-pci.c'))
-system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],
-              if_true: [files('apple-gfx.c', 'apple-gfx-mmio.c'),
-                        apple_gfx_activity])
 
 if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   virtio_gpu_ss = ss.source_set()

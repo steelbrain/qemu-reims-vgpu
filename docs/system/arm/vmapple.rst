@@ -12,18 +12,17 @@ Prerequisites
 
 To run the vmapple machine model, you need to
 
- * Run on Apple Silicon
- * Run on macOS 12.0 or above
+ * Run on Apple Silicon, on macOS 12.0 or above, for HVF; or on any host
+   under TCG (see `Under TCG`_)
  * Have an already installed copy of a Virtualization.Framework macOS 12 or
-   later virtual machine (see `Guest versions`_). I will assume that you
-   installed it using the `macosvm <https://github.com/s-u/macosvm>`__ CLI.
- * Build QEMU with apple-gfx, which the machine's display needs. apple-gfx
-   drives reims-vgpu's C API, a library that pkg-config finds as
-   ``reims-vgpu``: pass ``--enable-pvg`` with ``PKG_CONFIG_PATH`` naming the
-   directory of its ``reims-vgpu.pc``. reims-vgpu's ``cargo xtask
-   dist`` writes one into its ``target/dist/lib/pkgconfig``; its ``make
-   qemu`` builds that and QEMU together. Without pvg the vmapple machine is
-   left out of the build.
+   later virtual machine. I will assume that you installed it using the
+   `macosvm <https://github.com/s-u/macosvm>`__ CLI.
+ * Have a firmware for the machine, such as Ambrosia.
+   Virtualization.framework's own, AVPBooter, does not boot on it (see
+   `Guest firmware`_).
+ * Build QEMU with a crypto library (gnutls, nettle or libgcrypt), whose AES
+   ciphers the machine's AES engine runs on. Without one, the engine fails to
+   realize and QEMU exits at start.
 
 First, we need to extract the UUID from the virtual machine that you installed. You can do this
 by running the shell script in contrib/vmapple/uuid.sh on the macosvm.json file.
@@ -43,15 +42,15 @@ Now we also need to trim the aux partition. It contains metadata that we can jus
 How to run
 ----------
 
-Then, we can launch QEMU with the Virtualization.Framework pre-boot environment and the readily
-installed target disk images. I recommend to port forward the VM's ssh and vnc ports to the host
-to get better interactive access into the target system:
+Then, we can launch QEMU with the firmware and the readily installed target disk images. I
+recommend to port forward the VM's ssh and vnc ports to the host to get better interactive access
+into the target system:
 
 .. code-block:: bash
   :caption: Example execution command line
 
   $ UUID="$(contrib/vmapple/uuid.sh 'macosvm.json')"
-  $ AVPBOOTER="/System/Library/Frameworks/Virtualization.framework/Resources/AVPBooter.vmapple2.bin"
+  $ FIRMWARE="ambrosia.bin"
   $ AUX="aux.img.trimmed"
   $ DISK="disk.img"
   $ qemu-system-aarch64 \
@@ -59,7 +58,7 @@ to get better interactive access into the target system:
        -m 4G \
        -accel hvf \
        -M vmapple,uuid="$UUID" \
-       -bios "$AVPBOOTER" \
+       -bios "$FIRMWARE" \
        -drive file="$AUX",if=pflash,format=raw \
        -drive file="$DISK",if=pflash,format=raw \
        -drive file="$AUX",if=none,id=aux,format=raw \
@@ -69,79 +68,88 @@ to get better interactive access into the target system:
        -netdev user,id=net0,ipv6=off,hostfwd=tcp::2222-:22,hostfwd=tcp::5901-:5900 \
        -device virtio-net-pci,netdev=net0
 
-Guest versions
+The machine offers virtio-net devices without a control queue: macOS's
+driver can miss the completion of its first control command, and its
+interface then never comes up. Without the queue the device stays
+promiscuous and passes the guest every frame its backend delivers.
+
+Under TCG
+---------
+
+The machine also runs under TCG, on any host, with ``-accel tcg`` in place of
+``-accel hvf``. Its CPU type defaults to ``max`` under both; under HVF,
+``max`` is the host's CPU. Under TCG, the machine's generic timer counts at
+24 MHz, the timebase frequency macOS's device tree gives every CPU, and the
+frequency of Apple silicon's system counter, which HVF passes through. The
+``max`` CPU has no SME by default under TCG: macOS 14 sizes each thread's
+SME state from the longest streaming vector, and with TCG's 2048-bit
+vectors it panics as it starts. ``-cpu max,sme=on`` turns SME back on.
+
+The pointer authentication calls of `Guest firmware`_ reach QEMU under TCG,
+whose PSCI code answers each of them as not supported, as
+Hypervisor.framework does, so a guest needs the same firmware under both.
+
+As it starts, macOS's platform driver asks Virtualization.framework's machine
+for a configuration register by writing the physical address of a request to
+0x004ffff8. The machine leaves the request unanswered, as HVF leaves an
+access to an address with no device, and the driver goes on without the
+register; ``-d unimp`` logs the write. Under TCG any other access to an
+address with no device is an external abort, which the kernel does not
+survive. So the firmware's device tree must not list a device that the
+machine lacks and macOS probes, such as Virtualization.framework's CTRR
+device at 0x30260000.
+
+Guest firmware
 --------------
 
-macOS 12 and 13 guests boot without changes. macOS 14 and later need the
-two below, which the machine makes when iBoot enters the kernel.
+The machine's RAM starts at 4 GiB, and below it the PCIe MMIO window runs
+from 0x50000000 up to RAM. macOS places every PCI BAR below 4 GiB, aligned
+to its size, so a device with a 1 GiB BAR needs a free, 1 GiB-aligned
+gigabyte there. Virtualization.framework's machine has its RAM at
+0x70000000, and its firmware, AVPBooter, keeps its stack there, so AVPBooter
+does not boot on this machine. A firmware for it gives macOS this layout in
+the device tree; Ambrosia is one.
+
+The firmware also makes one change that macOS needs on this machine before
+it enters the kernel. The machine makes no change to the guest itself.
 
 A vmapple guest kernel asks the hypervisor to manage its pointer
 authentication keys through paravirtualized hypercalls: ``hvc #0`` with
-SMCCC function IDs 0xC1000000 to 0xC10000FF.
-Hypervisor.framework answers these calls itself, without an exit to QEMU,
-and for a VM created through its public API it answers each of them as not
-supported. The macOS 12 and 13 kernels carry on with the keys the firmware
-set up, which all processes then share.
-
-From macOS 14 on, the kernel checks the result of every one of these calls
-and loops forever when one fails, with ``hvc #0; cbnz x0, .``.
+SMCCC function IDs 0xC1000000 to 0xC10000FF. Hypervisor.framework answers
+these calls itself, without an exit to QEMU, and for a VM created through
+its public API it answers each of them as not supported. The macOS 12 and
+13 kernels carry on with the keys the firmware set up, which all processes
+then share. From macOS 14 on, the kernel checks the result of every one of
+these calls and loops forever when one fails, with ``hvc #0; cbnz x0, .``.
 Hypervisor.framework implements the calls only for VMs created with a
 private ISA setting, which needs an entitlement that only Apple-signed
-binaries can hold. QEMU does not use it. Instead, when iBoot enters the
-kernel, the machine replaces each of those loops with a ``nop`` in the memory
-iBoot loaded the kernel into, so the kernel carries on as macOS 13's does.
-This takes the per-process keys away from the guest's pointer
-authentication. Without it, such a guest stops right after iBoot hands over
-to the kernel: the serial console ends with iBoot's ``End of iBootStage2
-serial output.`` line, and the boot CPU keeps a host core busy without
-exiting to QEMU.
+binaries can hold. QEMU does not use it. So the firmware replaces each of
+those loops with a ``nop``.
 
-The machine has no Secure Enclave. From macOS 15 on, the guest's APFS then
-panics on its unencrypted data volume ("unencrypted data volume is not
-allowed") unless the device tree's ``/filesystems`` node has a
-``DoNotUseSEP`` property, and the guest resets and boots again, over and
-over. When iBoot enters the kernel, the machine also adds such a node to the
-device tree iBoot hands the kernel, if the tree has no ``/filesystems``
-node. macOS 13's tree has one, which is left as it is.
+Clock
+-----
 
-To catch iBoot entering the kernel, guest RAM is not executable from reset.
-Each page iBoot runs becomes executable on its first instruction fetch, until
-a fetch lands between the boot arguments' ``physBase`` and
-``topOfKernelData`` with ``x0`` at those boot arguments, as iBoot enters the
-kernel. All of RAM is executable from then on.
+Beside its PL031 at 0x20050000, the machine has Virtualization.framework's
+second clock at 0x30240000, which macOS's device tree lists as ``avp-rtc``.
+macOS keeps the offset from it to calendar time in NVRAM, on the aux drive,
+and its timed daemon reads that offset to tell whether the clock was reset.
+macOS's PL031 driver keeps no offset: with the PL031 alone, timed takes the
+clock for reset on every boot, and sets it back to the last write to the
+guest's disk until it reaches a time server. Both clocks count QEMU's RTC
+clock from the Unix epoch, so ``-rtc base=`` and ``-rtc clock=`` apply to
+both. The firmware's device tree gives the guest one of the two. macOS 14
+and later drive ``avp-rtc``; the device trees of earlier releases list only
+the PL031.
 
 Display
 -------
 
-apple-gfx gives the guest one display by default; ``-global
-apple-gfx-mmio.displays=N`` gives it N, up to 8, each with a console of its
-own. Under ``-display none``, reims-vgpu opens a window for each display on
-the host's screen, draws the guest's frames into it, and sends its pointer,
-wheel and keys to the guest's USB tablet and keyboard; closing a window
-powers the VM off. Each display then runs 1920x1080 at 1x, which the window
-scales to its size on the GPU, at the host screen's refresh rate;
-``-global apple-gfx-mmio.resolution=WxH`` picks another mode, and
-``resolution=host`` offers the modes that fill the host's screen at its
-density (HiDPI on a Retina screen). ``resolution=WxH@PPI`` also tells the
-guest the mode's density. A macOS 13.6 guest reads the width in whole
-millimetres, rounded to nearest, then in whole centimetres, rounded up, and
-runs a HiDPI desktop at the mode's pixels where that comes to 146.67 ppi or
-more: ``2560x1600@148`` is told 440.39 mm, which reads as 44 cm, 147.8 ppi,
-and looks like 1280x800, where ``2560x1600@146`` reads as 45 cm, 144.5
-ppi, and runs at 1x. A density that does not tell the guest's scale is
-refused: one just below 146.67 ppi; one below it for a mode wider than 3811
-pixels, which may run HiDPI anyway (5832 pixels wide did at 128.8 ppi); one
-above it for a mode narrower than 1920 pixels or 29 cm, which may stay at
-1x (``1280x800@220`` did); and one so low that the width comes to more than
-65535 mm, which the device's display settings do not hold. Only the chosen
-mode is checked: the smaller modes offered with it are told the same size,
-so a guest switched to one may run a scale the window does not expect. A
-window is sized by the scale the guest runs: on a Retina screen, a HiDPI
-guest's pixel is a screen pixel where half the mode fits on the screen, and
-a borderless window fits the image to its screen. The device's
-``display-modes`` property, where given, sets the modes instead. Set
-``REIMS_VGPU_WINDOW=0`` in QEMU's environment to keep ``-display none``
-headless. Either way, ``screendump`` draws the display's current frame.
+The machine gives the guest no display. Virtualization.framework's
+paravirtualized display, which macOS drives with a driver of its own, is not
+in this tree. A guest has a display only from a PCI display device given with
+``-device`` that the guest has a driver for. Without one, reach the guest
+through the serial console, or through ``ssh`` on host port 2222, which the
+example forwards to the guest's port 22.
 
 Input
 -----

@@ -332,8 +332,6 @@ typedef struct ARMHostCPUFeatures {
 
 static ARMHostCPUFeatures arm_host_cpu_features;
 
-bool (*hvf_arm_exec_fault)(CPUState *cpu, hwaddr ipa);
-
 struct hvf_reg_match {
     int reg;
     uint64_t offset;
@@ -2804,10 +2802,6 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
 
         trace_hvf_insn_abort(env->pc, set, fnv, ea, s1ptw, ifsc);
 
-        if (hvf_arm_exec_fault &&
-            hvf_arm_exec_fault(cpu, excp->physical_address)) {
-            break;
-        }
         /* fall through */
     }
     default:

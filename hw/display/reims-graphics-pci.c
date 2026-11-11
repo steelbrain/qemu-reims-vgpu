@@ -12,48 +12,58 @@
  *    and PBA from RVG_GRAPHICS_MSIX_OFFSET, and one vector. A guest write of
  *    RVG_GRAPHICS_DOORBELL_CONTROL to the DOORBELL register is taken by an
  *    ioeventfd, which the library's control thread polls, so ringing the
- *    control ring never runs the library on the vCPU. A write of a command
+ *    control ring never runs the library on the vCPU. On Windows the host
+ *    has HANDLE event notifiers instead of pollable Unix descriptors, so
+ *    the control doorbell uses the MMIO write and wakes the same consumer
+ *    through the library. A write of a command
  *    queue's ring goes to the library on the vCPU, which may answer the
  *    queue's next command buffer there, posting the event that says it is
  *    submitted, and leave the buffer to the queue's thread
  *    (rvg_graphics_device_mmio_write_taking).
- *  - BAR 2: the library's region, 64-bit and prefetchable, private anonymous
- *    memory of QEMU's process that the guest maps write-back: the control
+ *  - BAR 2: the library's region, 64-bit and prefetchable, memory of QEMU's
+ *    process (on Linux a shared mapping of a memfd of the library's, on macOS
+ *    private anonymous memory) that the guest maps write-back: the control
  *    rings below RVG_GRAPHICS_ALLOCATIONS_OFFSET, the guest's allocations
- *    from there. It is two RAM regions over the one mapping, so that dirty
- *    logging covers only the allocations, where the guest's scanout lies,
- *    and the rings' constant writes are never logged.
+ *    from there. It is one RAM region over the mapping, with no dirty log:
+ *    the library's window shows the guest's scanout again at each of the
+ *    display's refreshes while it shows no presented surface.
  *  - The library's callbacks run on its own threads, and raise_interrupt
  *    also on the vCPU inside that write, with no lock held that a call of
- *    ours into the library waits for: scanout_written with none of the
- *    library's held, and it takes the BQL to read and clear the allocations'
- *    dirty log. An interrupt is raised by a write of the
- *    vector's irqfd, where the accelerator injects MSI-X through one (KVM's
- *    in-kernel irqchip) and MSI-X is enabled, and by a BH otherwise; neither
- *    waits for a lock.
+ *    ours into the library waits for. An interrupt is raised by a write of
+ *    the vector's irqfd, where the accelerator injects MSI-X through one
+ *    (KVM's in-kernel irqchip) and MSI-X is enabled, and by a BH otherwise;
+ *    neither waits for a lock.
  *
  * Under -display none the library opens a window for the display, unless
- * REIMS_VGPU_WINDOW is "0", as apple-gfx does: the window keeps the size the
- * person gives it, and the guest follows it. Its input reaches the guest
- * through the device's console. The console shows what the display shows,
- * read back from the library on a thread of the device's pool at each of
- * its updates (rvg_graphics_device_read_display): QEMU's own displays and
- * its screendump read it there.
+ * REIMS_VGPU_WINDOW is "0": it opens at the resolution
+ * property's size, "<width>x<height>" (1920x1080 without it), then keeps the
+ * size the person gives it, and the guest follows it. Its input reaches the
+ * guest through the device's console. The console shows what the display shows,
+ * read back from the library on a thread of the device's pool at each of its
+ * updates (rvg_graphics_device_read_display): QEMU's own displays and its
+ * screendump read it there. The console also has the guest's cursor, which the
+ * library tells the device on its display thread and a BH gives the console, so
+ * QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw it; the image read back has
+ * none, and under -display none the console has no display, where the window
+ * shows the cursor as the host's pointer.
  *
  * The device has no default option ROM: romfile names one.
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/event_notifier.h"
 #include "qemu/lockable.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/queue.h"
+#include "qemu/target-info.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
 #include "migration/blocker.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
 #include "system/accel-irq.h"
@@ -85,8 +95,6 @@ struct ReimsGraphicsPCIState {
     MemoryRegion bar0;      /* BAR 0: the registers, the MSI-X table, PBA */
     MemoryRegion registers; /* in BAR 0, below the MSI-X table */
     MemoryRegion region;    /* BAR 2 */
-    MemoryRegion rings;     /* in BAR 2: the control rings */
-    MemoryRegion allocations; /* in BAR 2: the guest's, logged */
     EventNotifier doorbell;
     bool doorbell_made;  /* the notifier is initialised */
     bool doorbell_added; /* the notifier is BAR 0's ioeventfd */
@@ -101,8 +109,12 @@ struct ReimsGraphicsPCIState {
     QSIMPLEQ_HEAD(, ReimsGraphicsEvent) events; /* event_lock protected */
     QEMUBH *event_bh;
 
+    char *resolution; /* the property: the window's first size, or NULL */
+
     /* Mutable state (BQL protected) */
     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
+    QEMUCursor *cursor;     /* the guest's cursor image, or NULL */
+    bool cursor_show;       /* the library says the cursor shows */
     bool reading;           /* a read of the display is under way */
     DisplaySurface *surface; /* the console's, which the reads fill */
     uint8_t *pixels;        /* the last read's buffer, kept for the next */
@@ -117,7 +129,7 @@ QEMU_BUILD_BUG_ON(RVG_GRAPHICS_MSIX_VECTORS != 1);
 
 static Error *reims_graphics_mig_blocker;
 
-/* ------ Interrupts and the dirty log ------ */
+/* ------ Interrupts ------ */
 
 typedef struct ReimsGraphicsInterruptJob {
     PCIDevice *device;
@@ -282,28 +294,6 @@ static void reims_graphics_pci_write_config(PCIDevice *dev, uint32_t address,
     }
 }
 
-/*
- * On the library's refresh thread, once a refresh while the guest has a
- * scanout: whether the guest wrote any of its bytes since the last call. The
- * range lies in the allocations, which alone are logged.
- */
-static bool reims_graphics_pci_scanout_written_cb(void *ctx, uint64_t offset,
-                                                  uint64_t length)
-{
-    ReimsGraphicsPCIState *s = ctx;
-    DirtyBitmapSnapshot *snap;
-    hwaddr start = offset - RVG_GRAPHICS_ALLOCATIONS_OFFSET;
-    bool written;
-
-    BQL_LOCK_GUARD();
-    snap = memory_region_snapshot_and_clear_dirty(&s->allocations, start,
-                                                  length, DIRTY_MEMORY_VGA);
-    written = memory_region_snapshot_get_dirty(&s->allocations, snap, start,
-                                               length);
-    g_free(snap);
-    return written;
-}
-
 /* ------ Input from the display's window ------ */
 
 typedef enum ReimsGraphicsEventKind {
@@ -311,6 +301,9 @@ typedef enum ReimsGraphicsEventKind {
     REIMS_GRAPHICS_EVENT_SCROLL,
     REIMS_GRAPHICS_EVENT_KEY,
     REIMS_GRAPHICS_EVENT_CLOSE,
+    REIMS_GRAPHICS_EVENT_CURSOR_GLYPH,
+    REIMS_GRAPHICS_EVENT_CURSOR_SHOW,
+    REIMS_GRAPHICS_EVENT_CURSOR_MOVE,
 } ReimsGraphicsEventKind;
 
 struct ReimsGraphicsEvent {
@@ -329,8 +322,24 @@ struct ReimsGraphicsEvent {
             uint16_t usage;
             bool down;
         } key;
+        /* A copy of the RvgCursorGlyph, which is borrowed for its callback. */
+        struct {
+            uint8_t *rgba; /* height rows of width * 4 bytes, RGBA */
+            uint32_t width;
+            uint32_t height;
+            RvgDisplayCoord hot_spot;
+        } glyph;
+        bool show;
     };
 };
+
+static void reims_graphics_event_free(ReimsGraphicsEvent *event)
+{
+    if (event->kind == REIMS_GRAPHICS_EVENT_CURSOR_GLYPH) {
+        g_free(event->glyph.rgba);
+    }
+    g_free(event);
+}
 
 static void reims_graphics_input_pointer(ReimsGraphicsPCIState *s,
                                          ReimsGraphicsEvent *event)
@@ -435,6 +444,59 @@ static void reims_graphics_input_key(ReimsGraphicsPCIState *s, uint16_t usage,
     }
 }
 
+/* ------ The guest's cursor, on the console ------ */
+
+/*
+ * The console's cursor place and whether it shows. The library gives the
+ * place of the hot spot; QEMU's displays take the image's top-left corner,
+ * as virtio-gpu gives it, and SPICE adds the hot spot back.
+ */
+static void reims_graphics_cursor_update(ReimsGraphicsPCIState *s)
+{
+    RvgDisplayCoord at;
+    int hot_x = 0;
+    int hot_y = 0;
+
+    assert(bql_locked());
+    if (!s->con || !s->device) {
+        return;
+    }
+    at = rvg_graphics_device_cursor_position(s->device);
+    if (s->cursor) {
+        hot_x = s->cursor->hot_x;
+        hot_y = s->cursor->hot_y;
+    }
+    qemu_console_set_mouse(s->con, at.x - hot_x, at.y - hot_y,
+                           s->cursor_show && s->cursor);
+}
+
+static void reims_graphics_cursor_glyph(ReimsGraphicsPCIState *s,
+                                        ReimsGraphicsEvent *event)
+{
+    const uint8_t *px = event->glyph.rgba;
+    size_t count = (size_t)event->glyph.width * event->glyph.height;
+    QEMUCursor *cursor;
+
+    if (!s->con) {
+        return;
+    }
+    cursor = cursor_alloc(event->glyph.width, event->glyph.height);
+    if (!cursor) {
+        return;
+    }
+    cursor->hot_x = event->glyph.hot_spot.x;
+    cursor->hot_y = event->glyph.hot_spot.y;
+    /* QEMUCursor's pixels are 0xAARRGGBB words. */
+    for (size_t i = 0; i < count; i++, px += 4) {
+        cursor->data[i] = ((uint32_t)px[3] << 24) | ((uint32_t)px[0] << 16) |
+                          ((uint32_t)px[1] << 8) | px[2];
+    }
+    cursor_unref(s->cursor);
+    s->cursor = cursor;
+    qemu_console_set_cursor(s->con, cursor);
+    reims_graphics_cursor_update(s);
+}
+
 static void reims_graphics_event_bh(void *opaque)
 {
     ReimsGraphicsPCIState *s = opaque;
@@ -467,18 +529,29 @@ static void reims_graphics_event_bh(void *opaque)
             shutdown_action = SHUTDOWN_ACTION_POWEROFF;
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
             break;
+        case REIMS_GRAPHICS_EVENT_CURSOR_GLYPH:
+            reims_graphics_cursor_glyph(s, event);
+            break;
+        case REIMS_GRAPHICS_EVENT_CURSOR_SHOW:
+            s->cursor_show = event->show;
+            reims_graphics_cursor_update(s);
+            break;
+        case REIMS_GRAPHICS_EVENT_CURSOR_MOVE:
+            reims_graphics_cursor_update(s);
+            break;
         default:
             g_assert_not_reached();
         }
-        g_free(event);
+        reims_graphics_event_free(event);
     }
 }
 
 /*
- * Queues @event behind every earlier one, on the window's thread: on macOS
+ * Queues @event behind every earlier one, on the window's thread (on macOS
  * the process's main thread, which QEMU leaves in its run loop under
- * -display none, and on Linux the library's reims-vgpu.ui thread. Neither
- * holds the BQL, and neither may block, so the BH runs the input.
+ * -display none, and on Linux the library's reims-vgpu.ui thread) or on the
+ * library's display thread, for the cursor. None of them holds the BQL, and
+ * the window's may not block, so the BH runs the input and the cursor.
  */
 static void reims_graphics_event_push(ReimsGraphicsPCIState *s,
                                       ReimsGraphicsEvent *event)
@@ -541,6 +614,68 @@ static void reims_graphics_window_close_cb(void *ctx)
         reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CLOSE);
 
     reims_graphics_event_push(ctx, event);
+}
+
+/* The cursor's callbacks, on the library's display thread. */
+static void reims_graphics_cursor_glyph_cb(void *ctx,
+                                           const RvgCursorGlyph *glyph)
+{
+    ReimsGraphicsEvent *event =
+        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_GLYPH);
+    /* height rows of width * 4 bytes */
+    size_t length = (size_t)glyph->width * 4 * glyph->height;
+
+    event->glyph.width = glyph->width;
+    event->glyph.height = glyph->height;
+    event->glyph.hot_spot = glyph->hot_spot;
+    event->glyph.rgba = g_malloc0(length);
+    memcpy(event->glyph.rgba, glyph->rgba, MIN(glyph->rgba_length, length));
+    reims_graphics_event_push(ctx, event);
+}
+
+/* show is the library's byte: any value but 0 shows the cursor. */
+static void reims_graphics_cursor_show_cb(void *ctx, uint8_t show)
+{
+    ReimsGraphicsEvent *event =
+        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_SHOW);
+
+    event->show = show != 0;
+    reims_graphics_event_push(ctx, event);
+}
+
+static void reims_graphics_cursor_move_cb(void *ctx)
+{
+    reims_graphics_event_push(
+        ctx, reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_MOVE));
+}
+
+/*
+ * The window's first size, from the resolution property: NULL is 0x0, which
+ * the library opens at 1920x1080, else "<width>x<height>", each 1 to 65535
+ * pixels.
+ */
+static bool reims_graphics_parse_resolution(const char *str, uint16_t *width,
+                                            uint16_t *height, Error **errp)
+{
+    const char *endptr;
+    int w, h;
+
+    *width = 0;
+    *height = 0;
+    if (str == NULL) {
+        return true;
+    }
+    if (qemu_strtoi(str, &endptr, 10, &w) || w <= 0 || w > UINT16_MAX ||
+        *endptr != 'x' ||
+        qemu_strtoi(endptr + 1, &endptr, 10, &h) || h <= 0 ||
+        h > UINT16_MAX || *endptr != '\0') {
+        error_setg(errp, "%s: resolution must be <width>x<height>, each 1 to "
+                   "65535 pixels, not '%s'", TYPE_REIMS_GRAPHICS_PCI, str);
+        return false;
+    }
+    *width = w;
+    *height = h;
+    return true;
 }
 
 /*
@@ -738,8 +873,8 @@ static void reims_graphics_pci_init(Object *obj)
  * Undoes what realize did, from its failure or at unrealize, with the BARs
  * unmapped. The library's threads end without being waited for, and its
  * region stays mapped until they and the window's GPU work let it go. A
- * callback they or the window run meanwhile still schedules its BH, as
- * apple-gfx's do, or writes the irqfd, which stays open for it: the device
+ * callback they or the window run meanwhile still schedules its BH, or
+ * writes the irqfd, which stays open for it: the device
  * is not hotpluggable, so that is only at QEMU's end.
  */
 static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
@@ -785,22 +920,32 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
     WITH_QEMU_LOCK_GUARD(&s->event_lock) {
         while ((event = QSIMPLEQ_FIRST(&s->events)) != NULL) {
             QSIMPLEQ_REMOVE_HEAD(&s->events, next);
-            g_free(event);
+            reims_graphics_event_free(event);
         }
     }
+    cursor_unref(s->cursor);
+    s->cursor = NULL;
 }
 
 typedef struct ReimsGraphicsMemoryWalk {
     GArray *ranges;
     GArray *files;
-    bool every_range_has_a_file;
 } ReimsGraphicsMemoryWalk;
 
 /*
- * One range of the guest's RAM, and the file behind it: a shared mapping of
- * a file in pages of the host's size, which the library's views of an
- * IOSurface's pages map again. Any other RAM (anonymous, private or huge
- * pages) has none.
+ * One range of the guest's RAM and the file behind it: on Linux a shared
+ * mapping of a file in pages of the host's size, which the library's views of
+ * an IOSurface's pages map again. Only such ranges go into the map there; RAM
+ * with no file (anonymous, private or huge pages) is left out, so the library
+ * cannot view a surface there in place and copies it instead. A machine whose
+ * RAM is all file-backed (q35 with -object memory-backend-memfd,share=on)
+ * gives every range; one with small unbacked regions (vmapple's 1 MiB firmware
+ * and 64 KiB config, which hold no IOSurface) gives only its main RAM.
+ *
+ * On macOS the library views the process's own mapping of the RAM again
+ * (mach_vm_remap), with no file: every range of RAM in pages of the host's
+ * size goes into the map, with an fd of -1, whatever backs it. A view so made
+ * shares the pages of RAM that HVF maps into the guest, both ways.
  */
 static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
                                             const MemoryRegion *mr,
@@ -817,6 +962,15 @@ static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
     if (!memory_access_is_direct(mr, true, MEMTXATTRS_UNSPECIFIED)) {
         return false;
     }
+    if (qemu_ram_pagesize(rb) != qemu_real_host_page_size()) {
+        return false;
+    }
+    fd = memory_region_get_fd(mr);
+#ifndef CONFIG_DARWIN
+    if (fd < 0 || !qemu_ram_is_shared(rb)) {
+        return false;
+    }
+#endif
     /* q35's RAM above 4 GiB is an alias of the block past the part below. */
     host = (uint8_t *)memory_region_get_ram_ptr(mr) + offset_in_region;
     range = (RvgMemoryRange) {
@@ -824,15 +978,13 @@ static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
         .physical_length = int128_get64(len),
         .host_address = host,
     };
-    fd = memory_region_get_fd(mr);
-    if (fd >= 0 && qemu_ram_is_shared(rb) &&
-        qemu_ram_pagesize(rb) == qemu_real_host_page_size()) {
-        file.fd = fd;
-        file.offset = qemu_ram_block_host_offset(rb, host) +
-                      qemu_ram_get_fd_offset(rb);
-    } else {
-        walk->every_range_has_a_file = false;
-    }
+#ifndef CONFIG_DARWIN
+    file.fd = fd;
+    file.offset = qemu_ram_block_host_offset(rb, host) +
+                  qemu_ram_get_fd_offset(rb);
+#else
+    (void)fd;
+#endif
     g_array_append_val(walk->ranges, range);
     g_array_append_val(walk->files, file);
     return false;
@@ -877,7 +1029,9 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .struct_size = sizeof(callbacks),
         .ctx = s,
         .raise_interrupt = reims_graphics_pci_raise_interrupt_cb,
-        .scanout_written = reims_graphics_pci_scanout_written_cb,
+        .cursor_glyph = reims_graphics_cursor_glyph_cb,
+        .cursor_show = reims_graphics_cursor_show_cb,
+        .cursor_move = reims_graphics_cursor_move_cb,
     };
     RvgWindowCallbacks window_callbacks = {
         .struct_size = sizeof(window_callbacks),
@@ -887,14 +1041,22 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .close = reims_graphics_window_close_cb,
         .scroll = reims_graphics_window_scroll_cb,
     };
+    /* The library opens the window at the mode, and ignores the flags. */
     RvgWindowConfig window_config = {
         .struct_size = sizeof(window_config),
         .callbacks = &window_callbacks,
     };
+    /*
+     * The guest's architecture is this QEMU's target: the device answers an
+     * arm64 guest's Metal as an Apple silicon Mac's GPU answers where the two
+     * kinds of Mac differ (isFramebufferReadSupported).
+     */
     RvgGraphicsDeviceConfig config = {
         .struct_size = sizeof(config),
         .callbacks = &callbacks,
         .window = reims_graphics_window_wanted() ? &window_config : NULL,
+        .guest_arch = target_aarch64() ? RVG_GUEST_ARCH_ARM64
+                                       : RVG_GUEST_ARCH_X86_64,
     };
     g_autoptr(GArray) ranges = g_array_new(false, false,
                                            sizeof(RvgMemoryRange));
@@ -903,13 +1065,17 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     ReimsGraphicsMemoryWalk walk = {
         .ranges = ranges,
         .files = files,
-        .every_range_has_a_file = true,
     };
     RvgMemoryMap memory_map;
     RvgStatus status;
     uint8_t *base;
     uint64_t size;
 
+    if (!reims_graphics_parse_resolution(s->resolution,
+                                         &window_config.mode_width,
+                                         &window_config.mode_height, errp)) {
+        return;
+    }
     reims_graphics_pci_check_low_ram();
 
     if (reims_graphics_mig_blocker == NULL) {
@@ -922,15 +1088,22 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
 
     /*
      * The guest's RAM, through which the GPU uses an IOSurface's own pages in
-     * place. The library's views of them need the file behind each range; RAM
-     * without one (not a shared memfd, or huge pages) gets no map, and each
-     * surface's GPU view stays a copy of its pages in the region. The library
-     * keeps views of the map's pages while the device lives, so they must stay
-     * the guest's RAM: no balloon or hot-unplug may discard them.
+     * place. On Linux the library's views of them need the file behind each
+     * range, so only the file-backed ranges go into the map; RAM without a
+     * file (not a shared memfd, or huge pages) is left out, and a surface
+     * whose pages fall there is copied as every surface is without a map. A
+     * surface in a mapped range is used in place, and IOSurfaces live only in
+     * the main RAM, which a shared memfd backs, so in practice every surface
+     * maps in place. On macOS every range in pages of the host's size goes
+     * in, with no file (reims_graphics_add_memory_range), and the library
+     * uses a surface in place only where the guest lays its pages out in
+     * whole pages of the host's (16 KiB, an arm64 guest). The library keeps
+     * views of the map's pages while the device lives, so they must stay the
+     * guest's RAM: no balloon or hot-unplug may discard them.
      */
     flatview_for_each_range(address_space_to_flatview(&address_space_memory),
                             reims_graphics_add_memory_range, &walk);
-    if (walk.ranges->len > 0 && walk.every_range_has_a_file) {
+    if (walk.ranges->len > 0) {
         memory_map = (RvgMemoryMap) {
             .ranges = (const RvgMemoryRange *)walk.ranges->data,
             .range_count = walk.ranges->len,
@@ -938,8 +1111,12 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         config.memory_map = &memory_map;
         config.memory_files = (const RvgMemoryRangeFile *)walk.files->data;
     } else {
-        warn_report("%s: guest RAM is not a shared memfd in pages of the "
-                    "host's size: IOSurfaces are copied for the GPU",
+        warn_report("%s: no guest RAM is "
+#ifndef CONFIG_DARWIN
+                    "a shared memfd "
+#endif
+                    "in pages of the host's size: IOSurfaces are copied "
+                    "for the GPU",
                     TYPE_REIMS_GRAPHICS_PCI);
     }
 
@@ -972,6 +1149,13 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, RVG_GRAPHICS_PCI_BAR_REGISTERS,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar0);
 
+#ifdef CONFIG_POSIX
+    /*
+     * The library's external doorbell API takes a pollable Unix descriptor.
+     * Windows EventNotifier holds a HANDLE, and WHPX delivers these writes
+     * through reims_graphics_pci_ops instead. The library's existing MMIO
+     * path performs its control-ring wake and consumer-idle handshake.
+     */
     if (event_notifier_init(&s->doorbell, false) < 0) {
         error_setg(errp, "%s: the doorbell's event notifier",
                    TYPE_REIMS_GRAPHICS_PCI);
@@ -989,21 +1173,11 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                               true, RVG_GRAPHICS_DOORBELL_CONTROL,
                               &s->doorbell);
     s->doorbell_added = true;
+#endif
 
     base = rvg_graphics_device_region(s->device, &size);
-    memory_region_init(&s->region, OBJECT(dev), "reims-graphics-pci.region",
-                       size);
-    memory_region_init_ram_ptr(&s->rings, OBJECT(dev),
-                               "reims-graphics-pci.rings",
-                               RVG_GRAPHICS_ALLOCATIONS_OFFSET, base);
-    memory_region_init_ram_ptr(&s->allocations, OBJECT(dev),
-                               "reims-graphics-pci.allocations",
-                               size - RVG_GRAPHICS_ALLOCATIONS_OFFSET,
-                               base + RVG_GRAPHICS_ALLOCATIONS_OFFSET);
-    memory_region_add_subregion(&s->region, 0, &s->rings);
-    memory_region_add_subregion(&s->region, RVG_GRAPHICS_ALLOCATIONS_OFFSET,
-                                &s->allocations);
-    memory_region_set_log(&s->allocations, true, DIRTY_MEMORY_VGA);
+    memory_region_init_ram_ptr(&s->region, OBJECT(dev),
+                               "reims-graphics-pci.region", size, base);
     pci_register_bar(dev, RVG_GRAPHICS_PCI_BAR_REGION,
                      PCI_BASE_ADDRESS_SPACE_MEMORY |
                      PCI_BASE_ADDRESS_MEM_TYPE_64 |
@@ -1047,6 +1221,10 @@ static void reims_graphics_pci_finalize(Object *obj)
     qemu_mutex_destroy(&s->event_lock);
 }
 
+static const Property reims_graphics_pci_properties[] = {
+    DEFINE_PROP_STRING("resolution", ReimsGraphicsPCIState, resolution),
+};
+
 static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1057,6 +1235,7 @@ static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
     dc->desc = "reims-graphics GPU";
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    device_class_set_props(dc, reims_graphics_pci_properties);
 
     pci->vendor_id = RVG_GRAPHICS_PCI_VENDOR_ID;
     pci->device_id = RVG_GRAPHICS_PCI_DEVICE_ID;

@@ -150,25 +150,6 @@ config XLNX_DISPLAYPORT
 config DM163
     bool
 
-config MAC_PVG_MMIO
-    bool
-    depends on MAC_PVG && AARCH64
-
-config MAC_PVG_PCI
-    bool
-    depends on MAC_PVG && PCI
-    default y if PCI_DEVICES
-
-config MAC_PVG_VIDEO_PCI
-    bool
-    depends on MAC_PVG && PCI && VIRTIO_PCI
-    default y if PCI_DEVICES
-
-config MAC_PVG_SCALER_PCI
-    bool
-    depends on MAC_PVG && PCI && VIRTIO_PCI
-    default y if PCI_DEVICES
-
 config REIMS_GRAPHICS_PCI
     bool
     depends on REIMS_GRAPHICS && PCI && MSI_NONBROKEN

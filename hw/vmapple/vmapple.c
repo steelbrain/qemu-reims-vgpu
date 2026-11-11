@@ -16,8 +16,6 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
-#include "qemu/cacheflush.h"
-#include "qemu/cutils.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
 #include "qemu/guest-random.h"
@@ -38,8 +36,10 @@
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gicv3_common.h"
 #include "hw/misc/pvpanic.h"
+#include "hw/misc/unimp.h"
 #include "hw/pci-host/gpex.h"
 #include "hw/usb/hcd-xhci-pci.h"
+#include "hw/virtio/virtio-net.h"
 #include "hw/virtio/virtio-pci.h"
 #include "hw/vmapple/vmapple.h"
 #include "net/net.h"
@@ -49,13 +49,12 @@
 #include "qobject/qlist.h"
 #include "standard-headers/linux/input.h"
 #include "system/hvf.h"
-#include "system/hvf_int.h"
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
+#include "system/tcg.h"
 #include "target/arm/gtimer.h"
 #include "target/arm/cpu.h"
-#include "target/arm/hvf_arm.h"
 
 struct VMAppleMachineState {
     MachineState parent;
@@ -84,6 +83,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VMAppleMachineState, VMAPPLE_MACHINE)
 enum {
     VMAPPLE_FIRMWARE,
     VMAPPLE_CONFIG,
+    VMAPPLE_DMA_CONFIG,
     VMAPPLE_MEM,
     VMAPPLE_GIC_DIST,
     VMAPPLE_GIC_REDIST,
@@ -95,17 +95,17 @@ enum {
     VMAPPLE_PCIE_ECAM,
     VMAPPLE_GPIO,
     VMAPPLE_PVPANIC,
-    VMAPPLE_APV_GFX,
-    VMAPPLE_APV_IOSFC,
     VMAPPLE_AES_1,
     VMAPPLE_AES_2,
     VMAPPLE_BDOOR,
+    VMAPPLE_AVP_RTC,
     VMAPPLE_MEMMAP_LAST,
 };
 
 static const MemMapEntry memmap[] = {
     [VMAPPLE_FIRMWARE] =           { 0x00100000, 0x00100000 },
     [VMAPPLE_CONFIG] =             { 0x00400000, 0x00010000 },
+    [VMAPPLE_DMA_CONFIG] =         { 0x004ffff8, 0x00000008 },
 
     [VMAPPLE_GIC_DIST] =           { 0x10000000, 0x00010000 },
     [VMAPPLE_GIC_REDIST] =         { 0x10010000, 0x00400000 },
@@ -116,23 +116,24 @@ static const MemMapEntry memmap[] = {
     [VMAPPLE_GPIO] =               { 0x20060000, 0x00001000 },
     [VMAPPLE_PVPANIC] =            { 0x20070000, 0x00000002 },
     [VMAPPLE_BDOOR] =              { 0x30000000, 0x00200000 },
-    [VMAPPLE_APV_GFX] =            { 0x30200000, 0x00010000 },
-    [VMAPPLE_APV_IOSFC] =          { 0x30210000, 0x00010000 },
     [VMAPPLE_AES_1] =              { 0x30220000, 0x00004000 },
     [VMAPPLE_AES_2] =              { 0x30230000, 0x00004000 },
+    [VMAPPLE_AVP_RTC] =            { 0x30240000, 0x00001000 },
     [VMAPPLE_PCIE_ECAM] =          { 0x40000000, 0x10000000 },
-    [VMAPPLE_PCIE_MMIO] =          { 0x50000000, 0x1fff0000 },
+    /*
+     * macOS places every BAR below 4 GiB, aligned to its size, so the
+     * window runs up to 4 GiB and RAM starts there.
+     */
+    [VMAPPLE_PCIE_MMIO] =          { 0x50000000, 0xb0000000 },
 
     /* Actual RAM size depends on configuration */
-    [VMAPPLE_MEM] =                { 0x70000000ULL, GiB},
+    [VMAPPLE_MEM] =                { 0x100000000ULL, GiB},
 };
 
 static const int irqmap[] = {
     [VMAPPLE_UART] = 1,
     [VMAPPLE_RTC] = 2,
     [VMAPPLE_GPIO] = 0x5,
-    [VMAPPLE_APV_IOSFC] = 0x10,
-    [VMAPPLE_APV_GFX] = 0x11,
     [VMAPPLE_AES_1] = 0x12,
     [VMAPPLE_PCIE] = 0x20,
     [VMAPPLE_GICV2M] = 0x80
@@ -173,6 +174,21 @@ static void create_bdif(VMAppleMachineState *vms, MemoryRegion *mem)
     sysbus_realize_and_unref(bdif_sb, &error_fatal);
 }
 
+/*
+ * macOS's platform driver reads a register of its configuration by writing
+ * the physical address of a request to 0x004ffff8, an address its code holds
+ * rather than one the device tree gives. Virtualization.framework's machine
+ * answers the request. This machine leaves it unanswered, as an address with
+ * no device is under HVF, and the driver goes on without the register; under
+ * TCG the write would be an external abort.
+ */
+static void create_dma_config(VMAppleMachineState *vms)
+{
+    create_unimplemented_device("vmapple.dma-config",
+                                vms->memmap[VMAPPLE_DMA_CONFIG].base,
+                                vms->memmap[VMAPPLE_DMA_CONFIG].size);
+}
+
 static void create_pvpanic(VMAppleMachineState *vms, MemoryRegion *mem)
 {
     SysBusDevice *pvpanic;
@@ -209,20 +225,6 @@ static bool create_cfg(VMAppleMachineState *vms, MemoryRegion *mem,
     }
 
     return true;
-}
-
-static void create_gfx(VMAppleMachineState *vms, MemoryRegion *mem)
-{
-    int irq_gfx = vms->irqmap[VMAPPLE_APV_GFX];
-    int irq_iosfc = vms->irqmap[VMAPPLE_APV_IOSFC];
-    SysBusDevice *gfx;
-
-    gfx = SYS_BUS_DEVICE(qdev_new("apple-gfx-mmio"));
-    sysbus_mmio_map(gfx, 0, vms->memmap[VMAPPLE_APV_GFX].base);
-    sysbus_mmio_map(gfx, 1, vms->memmap[VMAPPLE_APV_IOSFC].base);
-    sysbus_connect_irq(gfx, 0, qdev_get_gpio_in(vms->gic, irq_gfx));
-    sysbus_connect_irq(gfx, 1, qdev_get_gpio_in(vms->gic, irq_iosfc));
-    sysbus_realize_and_unref(gfx, &error_fatal);
 }
 
 static void create_aes(VMAppleMachineState *vms, MemoryRegion *mem)
@@ -335,6 +337,13 @@ static void create_rtc(const VMAppleMachineState *vms)
     int irq = vms->irqmap[VMAPPLE_RTC];
 
     sysbus_create_simple("pl031", base, qdev_get_gpio_in(vms->gic, irq));
+    /*
+     * macOS keeps its clock's offset to calendar time only with the second
+     * clock, avp-rtc in its device tree, so the guest needs it to keep time
+     * from one boot to the next.
+     */
+    sysbus_create_simple(TYPE_VMAPPLE_RTC, vms->memmap[VMAPPLE_AVP_RTC].base,
+                         NULL);
 }
 
 static DeviceState *gpio_key_dev;
@@ -425,8 +434,8 @@ static void create_pcie(VMAppleMachineState *vms)
                                 &vms->ecam_alias);
 
     /*
-     * Map the MMIO window from [0x50000000-0x7fff0000] in PCI space into
-     * system address space at [0x50000000-0x7fff0000].
+     * Map the MMIO window from [0x50000000-0xffffffff] in PCI space into
+     * system address space at [0x50000000-0xffffffff].
      */
     mmio_alias = g_new0(MemoryRegion, 1);
     mmio_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 1);
@@ -461,157 +470,12 @@ static void create_pcie(VMAppleMachineState *vms)
     }
 }
 
-/*
- * macOS 14 and later need two changes to the kernel's memory to boot here,
- * made when iBoot enters the kernel. From reset, RAM is not executable: each
- * page iBoot runs becomes executable on its first instruction fetch, until a
- * fetch lands in the kernel's memory with x0 at the boot arguments. Only the
- * boot CPU runs then. The changes leave macOS 13 as it was.
- */
-
-/* A host pointer to [pa, pa + len), if guest RAM holds all of it. */
-static uint8_t *vmapple_ram(VMAppleMachineState *vms, uint64_t pa,
-                            uint64_t len)
-{
-    MachineState *ms = MACHINE(vms);
-    uint64_t off = pa - vms->memmap[VMAPPLE_MEM].base;
-
-    if (pa < vms->memmap[VMAPPLE_MEM].base || off > ms->ram_size ||
-        len > ms->ram_size - off) {
-        return NULL;
-    }
-    return (uint8_t *)memory_region_get_ram_ptr(ms->ram) + off;
-}
-
-/*
- * Hypervisor.framework fails the kernel's pointer authentication hypercalls,
- * and from macOS 14 on the kernel spins on each failure with
- * "hvc #0; cbnz x0, .". Take out the spins: the kernel then runs on the
- * firmware's keys, as macOS 13's does.
- */
-static void vmapple_skip_pac_waits(uint8_t *mem, uint64_t size)
-{
-    for (uint64_t off = 4; off + 4 <= size; off += 4) {
-        if (ldl_le_p(mem + off) == 0xb5000000 &&      /* cbnz x0, . */
-            ldl_le_p(mem + off - 4) == 0xd4000002) {  /* hvc #0 */
-            stl_le_p(mem + off, 0xd503201f);          /* nop */
-            flush_idcache_range((uintptr_t)mem + off, (uintptr_t)mem + off,
-                                4);
-        }
-    }
-}
-
-/*
- * A device tree node: a property count, a child count, its properties, then
- * its children. A property is a 32-byte name, a 32-bit length whose top bit
- * is a flag, and its value, padded to 4 bytes.
- */
-static const struct QEMU_PACKED {
-    uint32_t props, children;
-    struct QEMU_PACKED {
-        char name[32];
-        uint32_t len;
-        char value[12];
-    } name;
-    struct QEMU_PACKED {
-        char name[32];
-        uint32_t len, value;
-    } no_sep;
-} vmapple_filesystems = {
-    const_le32(2), 0,
-    { "name", const_le32(12), "filesystems" },
-    { "DoNotUseSEP", const_le32(4), const_le32(1) },
-};
-
-/*
- * The machine has no Secure Enclave, and from macOS 15 on APFS panics on the
- * unencrypted data volume unless the device tree has /filesystems/DoNotUseSEP.
- * If the tree has no /filesystems, append that node as the root's last child,
- * in the zeroes that pad the tree to its last 16 KiB page, and cover it with
- * the tree's length in the boot arguments.
- */
-static void vmapple_no_sep(VMAppleMachineState *vms, uint8_t *args)
-{
-    /* deviceTreeP - virtBase + physBase, and deviceTreeLength */
-    uint64_t pa = ldq_le_p(args + 0x60) - ldq_le_p(args + 8) +
-                  ldq_le_p(args + 16);
-    uint64_t len = ldl_le_p(args + 0x68), end = 0, nodes, props;
-    uint64_t room = ROUND_UP(pa + len, 16 * KiB) - pa;
-    uint64_t size = sizeof(vmapple_filesystems);
-    uint8_t *dt = vmapple_ram(vms, pa, room);
-
-    if (!dt) {
-        return;
-    }
-    /* The tree's end: its nodes come in order, each before its children */
-    for (nodes = 1; nodes; nodes--) {
-        if (end + 8 > len) {
-            return;
-        }
-        props = ldl_le_p(dt + end);
-        nodes += ldl_le_p(dt + end + 4);
-        for (end += 8; props; props--) {
-            if (end + 36 > len) {
-                return;
-            }
-            end += 36 + ROUND_UP(ldl_le_p(dt + end + 32) & INT32_MAX, 4);
-        }
-    }
-    if (end + size > room || !buffer_is_zero(dt + end, size) ||
-        memmem(dt, end, &vmapple_filesystems.name,
-               sizeof(vmapple_filesystems.name))) {
-        return;
-    }
-    memcpy(dt + end, &vmapple_filesystems, size);
-    stl_le_p(dt + 4, ldl_le_p(dt + 4) + 1);
-    stl_le_p(args + 0x68, MAX(len, end + size));
-}
-
-static bool vmapple_exec_fault(CPUState *cpu, hwaddr ipa)
-{
-    VMAppleMachineState *vms = VMAPPLE_MACHINE(qdev_get_machine());
-    uint64_t x0, base = 0, top = 0;
-    uint8_t *args, *kernel;
-
-    if (!vmapple_ram(vms, ipa, 1)) {
-        return false;
-    }
-    /* XNU's boot_args, version 2: physBase and topOfKernelData */
-    assert_hvf_ok(hv_vcpu_get_reg(cpu->accel->fd, HV_REG_X0, &x0));
-    args = vmapple_ram(vms, x0, 0x70);
-    if (args && lduw_le_p(args + 2) == 2) {
-        base = ldq_le_p(args + 16);
-        top = ldq_le_p(args + 32);
-    }
-    kernel = vmapple_ram(vms, base, top - base);
-    if (ipa < base || ipa >= top || !kernel) {
-        /* Still in iBoot */
-        assert_hvf_ok(hv_vm_protect(ipa & qemu_real_host_page_mask(),
-                                    qemu_real_host_page_size(),
-                                    HV_MEMORY_READ | HV_MEMORY_WRITE |
-                                    HV_MEMORY_EXEC));
-        return true;
-    }
-    vmapple_no_sep(vms, args);
-    vmapple_skip_pac_waits(kernel, top - base);
-    hvf_arm_exec_fault = NULL;
-    assert_hvf_ok(hv_vm_protect(vms->memmap[VMAPPLE_MEM].base,
-                                MACHINE(vms)->ram_size,
-                                HV_MEMORY_READ | HV_MEMORY_WRITE |
-                                HV_MEMORY_EXEC));
-    return true;
-}
-
 static void vmapple_reset(void *opaque)
 {
     VMAppleMachineState *vms = opaque;
     hwaddr base = vms->memmap[VMAPPLE_FIRMWARE].base;
 
     cpu_set_pc(first_cpu, base);
-    hvf_arm_exec_fault = vmapple_exec_fault;
-    assert_hvf_ok(hv_vm_protect(vms->memmap[VMAPPLE_MEM].base,
-                                MACHINE(vms)->ram_size,
-                                HV_MEMORY_READ | HV_MEMORY_WRITE));
 }
 
 static void mach_vmapple_init(MachineState *machine)
@@ -657,13 +521,25 @@ static void mach_vmapple_init(MachineState *machine)
                                 &error_fatal);
 
         /*
+         * macOS's device tree gives every CPU a 24 MHz timebase, the
+         * frequency of Apple silicon's system counter, which HVF passes
+         * through to the guest. Run TCG's counter at that frequency too.
+         */
+        if (tcg_enabled()) {
+            object_property_set_uint(cpu, "cntfrq", 24 * 1000 * 1000,
+                                     &error_fatal);
+        }
+
+        /*
          * macOS asks the hypervisor to program its pointer authentication
          * keys, through the paravirtualized calls SMCCC 0xC1000000 to
          * 0xC1000006. Hypervisor.framework answers them itself, without an
-         * exit to QEMU, and programs no key: the guest runs on the keys
-         * each CPU holds. The boot firmware sets them on the boot CPU
-         * only, so start each CPU the guest powers on with the keys of
-         * the CPU that powers it on, and all CPUs share them.
+         * exit to QEMU, and under TCG QEMU's PSCI code answers them; both
+         * answer that they are not supported, and program no key: the
+         * guest runs on the keys each CPU holds. The boot firmware sets
+         * them on the boot CPU only, so start each CPU the guest powers on
+         * with the keys of the CPU that powers it on, and all CPUs share
+         * them.
          */
         object_property_set_bool(cpu, "cpu-on-copies-pauth-keys", true,
                                  &error_fatal);
@@ -687,7 +563,6 @@ static void mach_vmapple_init(MachineState *machine)
     create_bdif(vms, sysmem);
     create_pvpanic(vms, sysmem);
     create_aes(vms, sysmem);
-    create_gfx(vms, sysmem);
     create_uart(vms, VMAPPLE_UART, sysmem, serial_hd(0));
     create_rtc(vms);
     create_pcie(vms);
@@ -696,6 +571,7 @@ static void mach_vmapple_init(MachineState *machine)
 
     vmapple_firmware_init(vms, sysmem);
     create_cfg(vms, sysmem, &error_fatal);
+    create_dma_config(vms);
 
     /* connect powerdown request */
     vms->powerdown_notifier.notify = vmapple_powerdown_req;
@@ -771,6 +647,30 @@ static GlobalProperty vmapple_compat_defaults[] = {
      * capabilities are linked from high offsets to low.
      */
     { "virtio-net-pci-base", "x-ascending-capabilities", "on" },
+    /*
+     * macOS's virtio-net driver can miss the completion of its first control
+     * command, which QEMU gives before the driver waits for it, and the
+     * interface then never comes up. Offer no control queue, nor the
+     * features that need one. The device stays promiscuous, as it resets,
+     * and passes the guest every frame its backend delivers.
+     */
+    { TYPE_VIRTIO_NET, "ctrl_vq", "off" },
+    { TYPE_VIRTIO_NET, "ctrl_rx", "off" },
+    { TYPE_VIRTIO_NET, "ctrl_rx_extra", "off" },
+    { TYPE_VIRTIO_NET, "ctrl_vlan", "off" },
+    { TYPE_VIRTIO_NET, "ctrl_mac_addr", "off" },
+    { TYPE_VIRTIO_NET, "ctrl_guest_offloads", "off" },
+    { TYPE_VIRTIO_NET, "guest_announce", "off" },
+    /*
+     * Under TCG, the max CPU offers SME with streaming vectors of up to 2048
+     * bits. macOS 14 sizes a zone for each thread's SME state from the
+     * longest, and panics as it starts because that zone's element is too
+     * large. Offer no SME, as an M1 to M3 under HVF gives none. Under HVF
+     * the CPU gets its "sme" property only as its vCPU starts, after this
+     * default would apply, so the default is optional and HVF's CPU keeps
+     * what the host gives.
+     */
+    { ARM_CPU_TYPE_NAME("max"), "sme", "off", .optional = true },
 };
 
 static char *vmapple_get_tablet(Object *obj, Error **errp)
@@ -806,7 +706,8 @@ static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
     mc->minimum_page_bits = 12;
     mc->possible_cpu_arch_ids = vmapple_possible_cpu_arch_ids;
     mc->cpu_index_to_instance_props = vmapple_cpu_index_to_props;
-    mc->default_cpu_type = ARM_CPU_TYPE_NAME("host");
+    /* Under HVF, max is the host CPU. */
+    mc->default_cpu_type = ARM_CPU_TYPE_NAME("max");
     mc->get_default_cpu_node_id = vmapple_get_default_cpu_node_id;
     mc->get_vgic_bases = vmapple_get_vgic_bases;
     mc->default_ram_id = "mach-vmapple.ram";
