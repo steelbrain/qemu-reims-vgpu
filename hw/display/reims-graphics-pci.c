@@ -205,8 +205,9 @@ static void reims_graphics_pci_vector_mask(PCIDevice *dev, unsigned vector)
 
     if (accel_irqchip_remove_irqfd_notifier_gsi(&s->irqfd,
                                                 s->irqfd_virq) < 0) {
-        error_report("%s: remove_irqfd_notifier_gsi failed",
-                     TYPE_REIMS_GRAPHICS_PCI);
+        /* The guest masks the vector at will: said once a process. */
+        error_report_once("%s: remove_irqfd_notifier_gsi failed",
+                          TYPE_REIMS_GRAPHICS_PCI);
         return;
     }
     s->irqfd_unmasked = false;
