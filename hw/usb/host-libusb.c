@@ -52,6 +52,8 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "qemu/thread.h"
+#include "block/thread-pool.h"
 #include "system/runstate.h"
 #include "system/system.h"
 #include "trace.h"
@@ -67,6 +69,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(USBHostDevice, USB_HOST_DEVICE)
 typedef struct USBHostRequest USBHostRequest;
 typedef struct USBHostIsoXfer USBHostIsoXfer;
 typedef struct USBHostIsoRing USBHostIsoRing;
+typedef struct USBHostSetIntf USBHostSetIntf;
 
 typedef struct libusb_config_descriptor libusb_config_descriptor;
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(libusb_config_descriptor,
@@ -128,6 +131,9 @@ struct USBHostDevice {
     /* request queues */
     QTAILQ_HEAD(, USBHostRequest)    requests;
     QTAILQ_HEAD(, USBHostIsoRing)    isorings;
+
+    /* the SET_INTERFACE request a worker thread carries out, if any */
+    USBHostSetIntf                   *setintf;
 };
 
 struct USBHostRequest {
@@ -140,6 +146,24 @@ struct USBHostRequest {
     unsigned int                     clen;
     bool                             usb3ep0quirk;
     QTAILQ_ENTRY(USBHostRequest)     next;
+};
+
+/*
+ * libusb_set_interface_alt_setting() is synchronous: the kernel holds the
+ * device while it kills the interface's transfers, sends SET_INTERFACE and
+ * reconfigures the host controller's endpoints. A worker thread makes the call,
+ * so QEMU's main loop and vCPUs keep running; the guest's control transfer
+ * completes when the call returns.
+ */
+struct USBHostSetIntf {
+    USBHostDevice                    *host;
+    USBPacket                        *p;    /* NULL once the guest canceled it */
+    libusb_device_handle             *dh;
+    int                              iface;
+    int                              alt;
+    int                              rc;
+    bool                             finished;
+    QemuEvent                        done;  /* the worker's call returned */
 };
 
 struct USBHostIsoXfer {
@@ -173,6 +197,7 @@ static void usb_host_release_interfaces(USBHostDevice *s);
 static void usb_host_nodev(USBHostDevice *s);
 static void usb_host_detach_kernel(USBHostDevice *s);
 static void usb_host_attach_kernel(USBHostDevice *s);
+static void usb_host_set_interface_wait(USBHostDevice *s);
 
 /* ------------------------------------------------------------------------ */
 
@@ -1196,6 +1221,7 @@ static int usb_host_close(USBHostDevice *s)
 
     trace_usb_host_close(s->bus_num, s->addr);
 
+    usb_host_set_interface_wait(s);
     usb_host_abort_xfers(s);
     usb_host_iso_free_all(s);
 
@@ -1239,6 +1265,7 @@ static void usb_host_exit_notifier(struct Notifier *n, void *data)
     USBHostDevice *s = container_of(n, USBHostDevice, exit);
 
     if (s->dh) {
+        usb_host_set_interface_wait(s);
         usb_host_abort_xfers(s);
         usb_host_release_interfaces(s);
         libusb_reset_device(s->dh);
@@ -1381,6 +1408,11 @@ static void usb_host_cancel_packet(USBDevice *udev, USBPacket *p)
     }
 
     trace_usb_host_req_canceled(s->bus_num, s->addr, p);
+
+    if (s->setintf && s->setintf->p == p) {
+        s->setintf->p = NULL; /* the call still runs, and its result applies */
+        return;
+    }
 
     r = usb_host_req_find(s, p);
     if (r && r->p) {
@@ -1527,11 +1559,73 @@ static void usb_host_set_config(USBHostDevice *s, int config, USBPacket *p)
     usb_host_ep_update(s);
 }
 
+static int usb_host_set_interface_worker(void *opaque)
+{
+    USBHostSetIntf *job = opaque;
+
+    job->rc = libusb_set_interface_alt_setting(job->dh, job->iface, job->alt);
+    qemu_event_set(&job->done);
+    return 0;
+}
+
+/* Apply what the worker's call did, and complete the guest's request */
+static void usb_host_set_interface_finish(USBHostSetIntf *job)
+{
+    USBHostDevice *s = job->host;
+    USBDevice *udev = USB_DEVICE(s);
+    USBPacket *p = job->p;
+
+    assert(s->setintf == job && !job->finished);
+    s->setintf = NULL;
+    job->finished = true;
+    trace_usb_host_set_interface_done(s->bus_num, s->addr, job->iface,
+                                      job->alt, job->rc);
+
+    if (job->rc == 0) {
+        udev->altsetting[job->iface] = job->alt;
+        usb_host_ep_update(s);
+    } else {
+        usb_host_libusb_error("libusb_set_interface_alt_setting", job->rc);
+    }
+    if (p) {
+        p->status = job->rc == 0 ? USB_RET_SUCCESS : USB_RET_STALL;
+        trace_usb_host_req_emulated(s->bus_num, s->addr, p, p->status);
+        usb_generic_async_ctrl_complete(udev, p);
+    }
+    if (job->rc == LIBUSB_ERROR_NO_DEVICE) {
+        usb_host_nodev(s);
+    }
+}
+
+static void usb_host_set_interface_complete(void *opaque, int ret)
+{
+    USBHostSetIntf *job = opaque;
+
+    if (!job->finished) {
+        usb_host_set_interface_finish(job);
+    }
+    qemu_event_destroy(&job->done);
+    g_free(job);
+}
+
+/*
+ * Wait for the SET_INTERFACE request in flight, if any, and apply it, before
+ * anything else changes the device's state or closes its handle.
+ */
+static void usb_host_set_interface_wait(USBHostDevice *s)
+{
+    USBHostSetIntf *job = s->setintf;
+
+    if (job) {
+        qemu_event_wait(&job->done);
+        usb_host_set_interface_finish(job);
+    }
+}
+
 static void usb_host_set_interface(USBHostDevice *s, int iface, int alt,
                                    USBPacket *p)
 {
-    USBDevice *udev = USB_DEVICE(s);
-    int rc;
+    USBHostSetIntf *job;
 
     trace_usb_host_set_interface(s->bus_num, s->addr, iface, alt);
 
@@ -1539,21 +1633,21 @@ static void usb_host_set_interface(USBHostDevice *s, int iface, int alt,
 
     if (iface >= USB_MAX_INTERFACES) {
         p->status = USB_RET_STALL;
+        trace_usb_host_req_emulated(s->bus_num, s->addr, p, p->status);
         return;
     }
 
-    rc = libusb_set_interface_alt_setting(s->dh, iface, alt);
-    if (rc != 0) {
-        usb_host_libusb_error("libusb_set_interface_alt_setting", rc);
-        p->status = USB_RET_STALL;
-        if (rc == LIBUSB_ERROR_NO_DEVICE) {
-            usb_host_nodev(s);
-        }
-        return;
-    }
-
-    udev->altsetting[iface] = alt;
-    usb_host_ep_update(s);
+    job = g_new0(USBHostSetIntf, 1);
+    job->host = s;
+    job->p = p;
+    job->dh = s->dh;
+    job->iface = iface;
+    job->alt = alt;
+    qemu_event_init(&job->done, false);
+    s->setintf = job;
+    thread_pool_submit_aio(usb_host_set_interface_worker, job,
+                           usb_host_set_interface_complete, job);
+    p->status = USB_RET_ASYNC;
 }
 
 static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
@@ -1572,6 +1666,12 @@ static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
         return;
     }
 
+    /*
+     * Control requests reach the device in the guest's order. One waits here
+     * only when the guest canceled a SET_INTERFACE that still runs.
+     */
+    usb_host_set_interface_wait(s);
+
     switch (request) {
     case DeviceOutRequest | USB_REQ_SET_ADDRESS:
         usb_host_set_address(s, value);
@@ -1585,7 +1685,6 @@ static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
 
     case InterfaceOutRequest | USB_REQ_SET_INTERFACE:
         usb_host_set_interface(s, index, value, p);
-        trace_usb_host_req_emulated(s->bus_num, s->addr, p, p->status);
         return;
 
     case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
@@ -1760,6 +1859,7 @@ static void usb_host_handle_reset(USBDevice *udev)
 
     trace_usb_host_reset(s->bus_num, s->addr);
 
+    usb_host_set_interface_wait(s);
     rc = libusb_reset_device(s->dh);
     if (rc != 0) {
         usb_host_nodev(s);
