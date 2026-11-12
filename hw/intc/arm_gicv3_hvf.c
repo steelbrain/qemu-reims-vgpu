@@ -90,8 +90,13 @@ static void hvf_dist_get_priority(GICv3State *s,
     uint64_t reg;
     uint32_t *field;
     int irq;
-    field = (uint32_t *)(bmp);
 
+    /*
+     * The loop starts at the first SPI: skip the internal IRQs' fields in
+     * bmp and their registers, as for_each_dist_irq_reg() does.
+     */
+    field = (uint32_t *)(bmp + GIC_INTERNAL);
+    offset += (GIC_INTERNAL * 8) / 8;
     for_each_dist_irq_reg(irq, s->num_irq, 8) {
         hv_gic_get_distributor_reg(offset, &reg);
         *field = reg;
@@ -106,8 +111,10 @@ static void hvf_dist_put_priority(GICv3State *s,
 {
     uint32_t reg, *field;
     int irq;
-    field = (uint32_t *)(bmp);
 
+    /* As in hvf_dist_get_priority(): the loop starts at the first SPI. */
+    field = (uint32_t *)(bmp + GIC_INTERNAL);
+    offset += (GIC_INTERNAL * 8) / 8;
     for_each_dist_irq_reg(irq, s->num_irq, 8) {
         reg = *field;
         hv_gic_set_distributor_reg(offset, reg);
@@ -123,6 +130,8 @@ static void hvf_dist_get_edge_trigger(GICv3State *s,
     uint64_t reg;
     int irq;
 
+    /* The loop starts at the first SPI: skip the internal IRQs' registers. */
+    offset += (GIC_INTERNAL * 2) / 8;
     for_each_dist_irq_reg(irq, s->num_irq, 2) {
         hv_gic_get_distributor_reg(offset, &reg);
         reg = half_unshuffle32(reg >> 1);
@@ -141,6 +150,8 @@ static void hvf_dist_put_edge_trigger(GICv3State *s,
     uint32_t reg;
     int irq;
 
+    /* The loop starts at the first SPI: skip the internal IRQs' registers. */
+    offset += (GIC_INTERNAL * 2) / 8;
     for_each_dist_irq_reg(irq, s->num_irq, 2) {
         reg = *gic_bmp_ptr32(bmp, irq);
         if (irq % 32 != 0) {
@@ -161,6 +172,8 @@ static void hvf_dist_getbmp(GICv3State *s, hv_gic_distributor_reg_t offset,
     uint64_t reg;
     int irq;
 
+    /* The loop starts at the first SPI: skip the internal IRQs' register. */
+    offset += (GIC_INTERNAL * 1) / 8;
     for_each_dist_irq_reg(irq, s->num_irq, 1) {
         hv_gic_get_distributor_reg(offset, &reg);
         *gic_bmp_ptr32(bmp, irq) = reg;
@@ -174,6 +187,11 @@ static void hvf_dist_putbmp(GICv3State *s, hv_gic_distributor_reg_t offset,
     uint32_t reg;
     int irq;
 
+    /* The loop starts at the first SPI: skip the internal IRQs' register. */
+    offset += (GIC_INTERNAL * 1) / 8;
+    if (clroffset != 0) {
+        clroffset += (GIC_INTERNAL * 1) / 8;
+    }
     for_each_dist_irq_reg(irq, s->num_irq, 1) {
         /*
          * If this bitmap is a set/clear register pair, first write to the
@@ -181,7 +199,7 @@ static void hvf_dist_putbmp(GICv3State *s, hv_gic_distributor_reg_t offset,
          * the 1 bits.
          */
         if (clroffset != 0) {
-            reg = 0;
+            reg = ~0;
             hv_gic_set_distributor_reg(clroffset, reg);
             clroffset += 4;
         }
