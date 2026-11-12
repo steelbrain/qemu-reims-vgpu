@@ -16,6 +16,7 @@
 /* capability registers */
 #define XHCI_CAPLENGTH          0x00
 #define XHCI_HCSPARAMS1         0x04
+#define XHCI_HCCPARAMS1         0x10
 #define XHCI_DBOFF              0x14
 #define XHCI_RTSOFF             0x18
 /* operational registers */
@@ -43,6 +44,7 @@
 #define CRCR_RCS                (1 << 0)
 #define ERDP_EHB                (1 << 3)
 #define IMAN_IP                 (1 << 0)
+#define HCCP1_LTC               (1 << 6)
 
 #define TRB_C                   (1 << 0)
 #define TRB_TR_IOC              (1 << 5)
@@ -60,9 +62,11 @@
 #define CR_ADDRESS_DEVICE       11
 #define CR_CONFIGURE_ENDPOINT   12
 #define CR_STOP_ENDPOINT        15
+#define CR_SET_LATENCY_TOLERANCE 20
 #define ER_TRANSFER             32
 #define ER_COMMAND_COMPLETE     33
 #define CC_SUCCESS              1
+#define CC_TRB_ERROR            5
 #define CC_STALL_ERROR          6
 #define CC_RING_UNDERRUN        14
 
@@ -258,15 +262,17 @@ static unsigned int xhci_command(XHCITest *x, uint64_t parameter,
  * Start qemu-xhci with one USB device, run the controller and bring the
  * device to the Addressed state.
  */
-static void xhci_test_start(XHCITest *x, const char *usb_device)
+static void xhci_test_start_on(XHCITest *x, const char *machine,
+                               const char *usb_device)
 {
     uint64_t dcbaa, erst, ep0_ring;
     unsigned int maxports;
 
     memset(x, 0, sizeof(*x));
     /* pit=off: a long clock step would run the i8254 timer all the way */
-    x->qts = qtest_initf("-machine pc,pit=off -nodefaults "
-                         "-device qemu-xhci,id=xhci,addr=04.0 %s", usb_device);
+    x->qts = qtest_initf("-machine %s,pit=off -nodefaults "
+                         "-device qemu-xhci,id=xhci,addr=04.0 %s",
+                         machine, usb_device);
     pc_alloc_init(&x->alloc, x->qts, ALLOC_NO_FLAGS);
     x->bus = qpci_new_pc(x->qts, NULL);
     qusb_pci_init_one(x->bus, &x->hc, QPCI_DEVFN(4, 0), 0);
@@ -323,6 +329,11 @@ static void xhci_test_start(XHCITest *x, const char *usb_device)
     qtest_writeq(x->qts, x->input_ctx + 0x48, ep0_ring | 1);
     xhci_command(x, x->input_ctx,
                  TRB_TYPE(CR_ADDRESS_DEVICE) | (x->slot << 24));
+}
+
+static void xhci_test_start(XHCITest *x, const char *usb_device)
+{
+    xhci_test_start_on(x, "pc", usb_device);
 }
 
 /* Returns the address of the transfer ring. */
@@ -641,6 +652,51 @@ static void test_xhci_bei(void)
     xhci_test_end(&x);
 }
 
+/* Queue a command and ring the doorbell, leaving its event on the ring */
+static void xhci_post_command(XHCITest *x, uint32_t control)
+{
+    g_assert_cmpuint(x->cmd_idx, <, XHCI_RING_TRBS);
+    xhci_write_trb(x, x->cmd_ring + 16 * x->cmd_idx++, 0, 0, control | TRB_C);
+    xhci_writel(x, x->doorbell, 0);
+}
+
+/*
+ * Set Latency Tolerance Value (xHCI 4.6.14) completes with Success on an xHC
+ * with LTC set, which qemu-xhci has on PCI Express, and with TRB Error on one
+ * without it, which it is on conventional PCI.
+ */
+static void test_xhci_set_ltv(void)
+{
+    static const struct {
+        const char *machine;
+        bool ltc;
+    } cases[] = {
+        { "q35", true },
+        { "pc", false },
+    };
+    uint32_t status, control;
+    XHCITest x;
+    int i;
+
+    if (!xhci_test_supported("usb-kbd")) {
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(cases); i++) {
+        xhci_test_start_on(&x, cases[i].machine, "-device usb-kbd");
+        g_assert_cmphex(xhci_readl(&x, XHCI_HCCPARAMS1) & HCCP1_LTC, ==,
+                        cases[i].ltc ? HCCP1_LTC : 0);
+        xhci_post_command(&x, TRB_TYPE(CR_SET_LATENCY_TOLERANCE) |
+                          (0x401 << 16));
+        g_assert_true(xhci_next_event(&x, &status, &control));
+        g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_COMMAND_COMPLETE);
+        g_assert_cmpuint(TRB_GET_CCODE(status), ==,
+                         cases[i].ltc ? CC_SUCCESS : CC_TRB_ERROR);
+        g_assert_cmpuint(TRB_GET_SLOT(control), ==, 0);
+        xhci_test_end(&x);
+    }
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -666,6 +722,7 @@ int main(int argc, char **argv)
     qtest_add_func("/xhci/pci/stopped-ep-wakeup",
                    test_xhci_stopped_ep_wakeup);
     qtest_add_func("/xhci/pci/bei", test_xhci_bei);
+    qtest_add_func("/xhci/pci/set-ltv", test_xhci_set_ltv);
 
     qtest_start("-device nec-usb-xhci,id=xhci"
                 " -drive id=drive0,if=none,file=null-co://,"
