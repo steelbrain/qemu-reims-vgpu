@@ -150,8 +150,9 @@ typedef struct XHCIEvent {
 } XHCIEvent;
 
 typedef struct XHCIInterrupter {
+    XHCIState *xhci;
     uint32_t iman;
-    uint32_t imod;
+    uint32_t imod;  /* IMODI; IMODC counts down while imod_timer is pending */
     uint32_t erstsz;
     uint32_t erstba_low;
     uint32_t erstba_high;
@@ -159,6 +160,11 @@ typedef struct XHCIInterrupter {
     uint32_t erdp_high;
 
     bool msix_used, er_pcs;
+
+    /* Interrupt Pending Enable (4.17.5): a non-blocking event awaits */
+    bool ipe;
+    /* expires when IMODC reaches 0 (4.17.2) */
+    QEMUTimer *imod_timer;
 
     dma_addr_t er_start;
     uint32_t er_size;
