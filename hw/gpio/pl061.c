@@ -499,6 +499,12 @@ static void pl061_hold_reset(Object *obj, ResetType type)
         qemu_set_irq(s->out[i], level);
     }
     s->old_out_data = pullups;
+    /*
+     * Lower the interrupt line, as the enter phase cleared what raises it:
+     * a line keeps its level across a reset otherwise, and an in-kernel GIC
+     * (HVF's, KVM's) raises its interrupt again once the GIC is reset.
+     */
+    qemu_set_irq(s->irq, (s->istate & s->im) != 0);
 }
 
 static void pl061_set_irq(void * opaque, int irq, int level)

@@ -708,6 +708,12 @@ static void pl011_reset(DeviceState *dev)
     s->logged_disabled_uart = false;
     pl011_reset_rx_fifo(s);
     pl011_reset_tx_fifo(s);
+    /*
+     * Lower the interrupt lines the cleared state no longer raises: a line
+     * keeps its level across a reset otherwise, and an in-kernel GIC (HVF's,
+     * KVM's) raises its interrupt again once the GIC is reset.
+     */
+    pl011_update(s);
 }
 
 static void pl011_class_init(ObjectClass *oc, const void *data)
