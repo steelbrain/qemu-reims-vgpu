@@ -30,6 +30,7 @@
 #define XHCI_MFINDEX            0x00
 /* interrupter 0, relative to the runtime registers */
 #define XHCI_IMAN               0x20
+#define XHCI_IMOD               0x24
 #define XHCI_ERSTSZ             0x28
 #define XHCI_ERSTBA             0x30
 #define XHCI_ERDP               0x38
@@ -63,6 +64,7 @@
 #define CR_CONFIGURE_ENDPOINT   12
 #define CR_STOP_ENDPOINT        15
 #define CR_SET_LATENCY_TOLERANCE 20
+#define CR_NOOP                 23
 #define ER_TRANSFER             32
 #define ER_COMMAND_COMPLETE     33
 #define CC_SUCCESS              1
@@ -660,6 +662,78 @@ static void xhci_post_command(XHCITest *x, uint32_t control)
     xhci_writel(x, x->doorbell, 0);
 }
 
+static bool xhci_ip(XHCITest *x)
+{
+    return xhci_readl(x, x->runtime + XHCI_IMAN) & IMAN_IP;
+}
+
+static void xhci_clear_ip(XHCITest *x)
+{
+    xhci_writel(x, x->runtime + XHCI_IMAN, IMAN_IP);
+    g_assert_false(xhci_ip(x));
+}
+
+/*
+ * Interrupt moderation (xHCI 4.17.2): IMODI defaults to 4000 (1 ms). Once
+ * the interrupter asserts, IMODC counts IMODI down, and an event posted
+ * meanwhile asserts it only when IMODC reaches 0. An event posted after the
+ * count ran out asserts it at once, as every event does with IMODI at 0.
+ */
+static void test_xhci_imod(void)
+{
+    XHCITest x;
+    uint32_t imod;
+
+    if (!xhci_test_supported("usb-kbd")) {
+        return;
+    }
+
+    xhci_test_start(&x, "-device usb-kbd");
+    g_assert_cmphex(xhci_readl(&x, x.runtime + XHCI_IMOD) & 0xffff, ==, 4000);
+
+    /* 250 us, and IMODC at 0 */
+    xhci_writel(&x, x.runtime + XHCI_IMOD, 1000);
+    xhci_clear_ip(&x);
+    xhci_post_command(&x, TRB_TYPE(CR_NOOP));
+    g_assert_true(xhci_ip(&x));
+    imod = xhci_readl(&x, x.runtime + XHCI_IMOD);
+    g_assert_cmpuint(imod & 0xffff, ==, 1000);
+    g_assert_cmpuint(imod >> 16, ==, 1000);
+    g_assert_true(xhci_next_event(&x, NULL, NULL));
+    xhci_clear_ip(&x);
+
+    /* moderated until IMODC reaches 0 */
+    xhci_post_command(&x, TRB_TYPE(CR_NOOP));
+    g_assert_false(xhci_ip(&x));
+    qtest_clock_step(x.qts, 100 * 1000);
+    g_assert_false(xhci_ip(&x));
+    g_assert_cmpuint(xhci_readl(&x, x.runtime + XHCI_IMOD) >> 16, ==, 600);
+    qtest_clock_step(x.qts, 150 * 1000);
+    g_assert_true(xhci_ip(&x));
+    g_assert_true(xhci_next_event(&x, NULL, NULL));
+    xhci_clear_ip(&x);
+
+    /* the count runs out with no event waiting: the next one asserts at once */
+    qtest_clock_step(x.qts, 1000 * 1000);
+    g_assert_cmpuint(xhci_readl(&x, x.runtime + XHCI_IMOD) >> 16, ==, 0);
+    xhci_post_command(&x, TRB_TYPE(CR_NOOP));
+    g_assert_true(xhci_ip(&x));
+    g_assert_true(xhci_next_event(&x, NULL, NULL));
+    xhci_clear_ip(&x);
+
+    /* IMODI 0: no moderation */
+    xhci_writel(&x, x.runtime + XHCI_IMOD, 0);
+    xhci_post_command(&x, TRB_TYPE(CR_NOOP));
+    g_assert_true(xhci_ip(&x));
+    g_assert_true(xhci_next_event(&x, NULL, NULL));
+    xhci_clear_ip(&x);
+    xhci_post_command(&x, TRB_TYPE(CR_NOOP));
+    g_assert_true(xhci_ip(&x));
+    g_assert_true(xhci_next_event(&x, NULL, NULL));
+
+    xhci_test_end(&x);
+}
+
 /*
  * Set Latency Tolerance Value (xHCI 4.6.14) completes with Success on an xHC
  * with LTC set, which qemu-xhci has on PCI Express, and with TRB Error on one
@@ -722,6 +796,7 @@ int main(int argc, char **argv)
     qtest_add_func("/xhci/pci/stopped-ep-wakeup",
                    test_xhci_stopped_ep_wakeup);
     qtest_add_func("/xhci/pci/bei", test_xhci_bei);
+    qtest_add_func("/xhci/pci/imod", test_xhci_imod);
     qtest_add_func("/xhci/pci/set-ltv", test_xhci_set_ltv);
 
     qtest_start("-device nec-usb-xhci,id=xhci"
