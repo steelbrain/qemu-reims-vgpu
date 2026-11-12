@@ -28,6 +28,7 @@
 #include "migration/vmstate.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
+#include "hw/pci/pcie.h"
 #include "hcd-xhci-pci.h"
 #include "trace.h"
 #include "qapi/error.h"
@@ -120,6 +121,29 @@ static int xhci_pci_vmstate_post_load(void *opaque, int version_id)
    return 0;
 }
 
+/*
+ * An xHC with LTC set supports its interconnect's LTR mechanism (xHCI 4.13.1):
+ * on PCI Express, LTR in Device Capabilities 2, its enable in Device Control 2
+ * and the LTR Extended Capability with its two maximum latencies.
+ */
+#define XHCI_PCI_LTR_OFFSET 0x100
+
+static void xhci_pci_ltr_init(PCIDevice *dev)
+{
+    uint16_t exp_cap = dev->exp.exp_cap;
+
+    pci_long_test_and_set_mask(dev->config + exp_cap + PCI_EXP_DEVCAP2,
+                               PCI_EXP_DEVCAP2_LTR);
+    pci_word_test_and_set_mask(dev->wmask + exp_cap + PCI_EXP_DEVCTL2,
+                               PCI_EXP_DEVCTL2_LTR_EN);
+    pcie_add_capability(dev, PCI_EXT_CAP_ID_LTR, 1, XHCI_PCI_LTR_OFFSET,
+                        PCI_EXT_CAP_LTR_SIZEOF);
+    pci_set_word(dev->wmask + XHCI_PCI_LTR_OFFSET + PCI_LTR_MAX_SNOOP_LAT,
+                 PCI_LTR_VALUE_MASK | PCI_LTR_SCALE_MASK);
+    pci_set_word(dev->wmask + XHCI_PCI_LTR_OFFSET + PCI_LTR_MAX_NOSNOOP_LAT,
+                 PCI_LTR_VALUE_MASK | PCI_LTR_SCALE_MASK);
+}
+
 static void usb_xhci_pci_realize(struct PCIDevice *dev, Error **errp)
 {
     int ret;
@@ -137,6 +161,8 @@ static void usb_xhci_pci_realize(struct PCIDevice *dev, Error **errp)
     if (s->conditional_intr_mapping) {
         s->xhci.intr_mapping_supported = xhci_pci_intr_mapping_conditional;
     }
+    /* PCI Express has an LTR mechanism, so the xHC supports LTM (4.13.1) */
+    s->xhci.ltm = pci_bus_is_express(pci_get_bus(dev));
     if (!qdev_realize(DEVICE(&s->xhci), NULL, errp)) {
         return;
     }
@@ -170,6 +196,7 @@ static void usb_xhci_pci_realize(struct PCIDevice *dev, Error **errp)
     if (pci_bus_is_express(pci_get_bus(dev))) {
         ret = pcie_endpoint_cap_init(dev, 0xa0);
         assert(ret > 0);
+        xhci_pci_ltr_init(dev);
     }
 
     if (s->msix != ON_OFF_AUTO_OFF) {

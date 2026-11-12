@@ -115,6 +115,8 @@
 #define PORTSC_DR           (1<<30)
 #define PORTSC_WPR          (1<<31)
 
+#define HCCP1_LTC       (1<<6)
+
 #define CRCR_RCS        (1<<0)
 #define CRCR_CS         (1<<1)
 #define CRCR_CA         (1<<2)
@@ -2632,6 +2634,21 @@ static void xhci_process_commands(XHCIState *xhci)
                 event.ccode = xhci_reset_slot(xhci, slotid);
             }
             break;
+        case CR_SET_LATENCY_TOLERANCE:
+            /*
+             * 4.6.14: an xHC with LTC set records the host's Best Effort
+             * Latency Tolerance; one without it refuses the command. No LTR
+             * message carries it on: nothing in QEMU receives one.
+             */
+            slotid = 0;
+            if (xhci->ltm) {
+                xhci->belt = (trb.control >> 16) & 0xfff;
+                trace_usb_xhci_set_ltv(xhci->belt);
+                event.ccode = CC_SUCCESS;
+            } else {
+                event.ccode = CC_TRB_ERROR;
+            }
+            break;
         case CR_GET_PORT_BANDWIDTH:
             event.ccode = xhci_get_port_bandwidth(xhci, trb.parameter);
             break;
@@ -2781,6 +2798,7 @@ static void xhci_reset(DeviceState *dev)
     xhci->dcbaap_low = 0;
     xhci->dcbaap_high = 0;
     xhci->config = 0;
+    xhci->belt = 0;
 
     for (i = 0; i < xhci->numslots; i++) {
         xhci_disable_slot(xhci, i+1);
@@ -2833,6 +2851,9 @@ static uint64_t xhci_cap_read(void *ptr, hwaddr reg, unsigned size)
             ret = 0x00080000 | (xhci->max_pstreams_mask << 12);
         } else {
             ret = 0x00080001 | (xhci->max_pstreams_mask << 12);
+        }
+        if (xhci->ltm) {
+            ret |= HCCP1_LTC;
         }
         break;
     case 0x14: /* DBOFF */
@@ -3687,10 +3708,32 @@ static const VMStateDescription vmstate_xhci_intr = {
     }
 };
 
+static bool xhci_belt_needed(void *opaque)
+{
+    XHCIState *xhci = opaque;
+
+    return xhci->belt != 0;
+}
+
+static const VMStateDescription vmstate_xhci_belt = {
+    .name = "xhci-core/belt",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = xhci_belt_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16(belt, XHCIState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_xhci = {
     .name = "xhci-core",
     .version_id = 1,
     .post_load = usb_xhci_post_load,
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_xhci_belt,
+        NULL
+    },
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_VARRAY_UINT32(ports, XHCIState, numports, 1,
                                      vmstate_xhci_port, XHCIPort),
