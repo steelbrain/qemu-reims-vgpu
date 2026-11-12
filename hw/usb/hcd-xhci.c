@@ -2862,6 +2862,9 @@ static uint64_t xhci_cap_read(void *ptr, hwaddr reg, unsigned size)
     case 0x18: /* RTSOFF */
         ret = OFF_RUNTIME;
         break;
+    case 0x1c: /* HCCPARAMS2 from xHCI 1.1 on, reserved before */
+        ret = 0; /* none of its capabilities */
+        break;
 
     /* extended capabilities */
     case 0x20: /* Supported Protocol:00 */
