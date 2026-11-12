@@ -199,6 +199,11 @@ typedef struct XHCIState {
      */
     bool (*intr_mapping_supported)(XHCIState *s);
     DeviceState *hostOpaque;
+    /*
+     * Latency Tolerance Messaging Capability (LTC, 4.13.1), set where the
+     * host interconnect has an LTR mechanism (PCI Express)
+     */
+    bool ltm;
 
     /* Operational Registers */
     uint32_t usbcmd;
@@ -221,6 +226,9 @@ typedef struct XHCIState {
     XHCIInterrupter intr[XHCI_MAXINTRS];
 
     XHCIRing cmd_ring;
+
+    /* the BELT of the last Set LTV Command, 0 while none set one */
+    uint16_t belt;
 
     bool nec_quirks;
 } XHCIState;
