@@ -600,18 +600,45 @@ static void xhci_intr_update(XHCIState *xhci, int v)
     }
 }
 
+/* IMODI and IMODC count in 250 ns steps */
+#define IMOD_TICK_NS 250
+
+static uint32_t xhci_imodc(XHCIInterrupter *intr)
+{
+    int64_t left;
+
+    if (!timer_pending(intr->imod_timer)) {
+        return 0;
+    }
+    left = timer_expire_time_ns(intr->imod_timer) -
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return left <= 0 ? 0 : MIN(DIV_ROUND_UP(left, IMOD_TICK_NS), 0xffff);
+}
+
+/*
+ * Assert interrupter v's interrupt when a non-blocking event awaits (IPE),
+ * the moderation counter is at 0 and the event handler is not busy (4.17.2):
+ * set IP and EHB, signal the interrupt, and load IMODC with IMODI.
+ */
 static void xhci_intr_raise(XHCIState *xhci, int v)
 {
-    bool pending = (xhci->intr[v].erdp_low & ERDP_EHB);
+    XHCIInterrupter *intr = &xhci->intr[v];
+    uint32_t imodi = intr->imod & 0xffff;
 
-    xhci->intr[v].erdp_low |= ERDP_EHB;
-    xhci->intr[v].iman |= IMAN_IP;
-    xhci->usbsts |= USBSTS_EINT;
-
-    if (pending) {
+    if (!intr->ipe || (intr->erdp_low & ERDP_EHB) ||
+        timer_pending(intr->imod_timer)) {
         return;
     }
-    if (!(xhci->intr[v].iman & IMAN_IE)) {
+
+    intr->erdp_low |= ERDP_EHB;
+    intr->iman |= IMAN_IP;
+    xhci->usbsts |= USBSTS_EINT;
+    if (imodi) {
+        timer_mod(intr->imod_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)imodi * IMOD_TICK_NS);
+    }
+
+    if (!(intr->iman & IMAN_IE)) {
         return;
     }
 
@@ -620,9 +647,22 @@ static void xhci_intr_raise(XHCIState *xhci, int v)
     }
     if (xhci->intr_raise) {
         if (xhci->intr_raise(xhci, v, true)) {
-            xhci->intr[v].iman &= ~IMAN_IP;
+            intr->iman &= ~IMAN_IP;
         }
     }
+}
+
+/* IMODC reached 0 */
+static void xhci_imod_timer(void *opaque)
+{
+    XHCIInterrupter *intr = opaque;
+    XHCIState *xhci = intr->xhci;
+    MemReentrancyGuard *guard = &xhci->parent.mem_reentrancy_guard;
+
+    assert(!guard->engaged_in_io);
+    guard->engaged_in_io = true;
+    xhci_intr_raise(xhci, intr - xhci->intr);
+    guard->engaged_in_io = false;
 }
 
 static inline int xhci_running(XHCIState *xhci)
@@ -714,6 +754,7 @@ static void xhci_event_blockable(XHCIState *xhci, XHCIEvent *event, int v,
         }
     }
 
+    intr->ipe = true;
     xhci_intr_raise(xhci, v);
 }
 
@@ -879,6 +920,7 @@ static void xhci_er_reset(XHCIState *xhci, int v)
 
     intr->er_ep_idx = 0;
     intr->er_pcs = 1;
+    intr->ipe = false;
 
     DPRINTF("xhci: event ring[%d]:" DMA_ADDR_FMT " [%d]\n",
             v, intr->er_start, intr->er_size);
@@ -2826,7 +2868,9 @@ static void xhci_reset(DeviceState *dev)
 
     for (i = 0; i < xhci->numintrs; i++) {
         xhci->intr[i].iman = 0;
-        xhci->intr[i].imod = 0;
+        xhci->intr[i].imod = 4000; /* IMODI's default, 1 ms (5.5.2.2) */
+        xhci->intr[i].ipe = false;
+        timer_del(xhci->intr[i].imod_timer);
         xhci->intr[i].erstsz = 0;
         xhci->intr[i].erstba_low = 0;
         xhci->intr[i].erstba_high = 0;
@@ -3165,7 +3209,7 @@ static uint64_t xhci_runtime_read(void *ptr, hwaddr reg,
             ret = intr->iman;
             break;
         case 0x04: /* IMOD */
-            ret = intr->imod;
+            ret = (xhci_imodc(intr) << 16) | intr->imod;
             break;
         case 0x08: /* ERSTSZ */
             ret = intr->erstsz;
@@ -3221,8 +3265,16 @@ static void xhci_runtime_write(void *ptr, hwaddr reg,
         intr->iman |= val & IMAN_IE;
         xhci_intr_update(xhci, v);
         break;
-    case 0x04: /* IMOD */
-        intr->imod = val;
+    case 0x04: /* IMOD: IMODI, and IMODC, which software may set */
+        intr->imod = val & 0xffff;
+        trace_usb_xhci_imod(v, intr->imod, val >> 16);
+        if (val >> 16) {
+            timer_mod(intr->imod_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      (int64_t)(val >> 16) * IMOD_TICK_NS);
+        } else {
+            timer_del(intr->imod_timer);
+            xhci_intr_raise(xhci, v);
+        }
         break;
     case 0x08: /* ERSTSZ */
         intr->erstsz = val & 0xffff;
@@ -3244,14 +3296,18 @@ static void xhci_runtime_write(void *ptr, hwaddr reg,
             intr->erdp_low &= ~ERDP_EHB;
         }
         intr->erdp_low = (val & ~ERDP_EHB) | (intr->erdp_low & ERDP_EHB);
-        if (val & ERDP_EHB) {
+        {
             dma_addr_t erdp = xhci_addr64(intr->erdp_low, intr->erdp_high);
             unsigned int dp_idx = (erdp - intr->er_start) / TRB_SIZE;
+            /* the ring is empty: no event awaits (4.17.5) */
             if (erdp >= intr->er_start &&
                 erdp < (intr->er_start + TRB_SIZE * intr->er_size) &&
-                dp_idx != intr->er_ep_idx) {
-                xhci_intr_raise(xhci, v);
+                dp_idx == intr->er_ep_idx) {
+                intr->ipe = false;
             }
+        }
+        if (val & ERDP_EHB) {
+            xhci_intr_raise(xhci, v);
         }
         break;
     case 0x1c: /* ERDP high */
@@ -3567,6 +3623,12 @@ static void usb_xhci_realize(DeviceState *dev, Error **errp)
 
     usb_xhci_init(xhci);
     xhci->mfwrap_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xhci_mfwrap_timer, xhci);
+    for (i = 0; i < xhci->numintrs; i++) {
+        xhci->intr[i].xhci = xhci;
+        xhci->intr[i].imod_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                                xhci_imod_timer,
+                                                &xhci->intr[i]);
+    }
 
     memory_region_init(&xhci->mem, OBJECT(dev), "xhci", XHCI_LEN_REGS);
     memory_region_init_io(&xhci->mem_cap, OBJECT(dev), &xhci_cap_ops, xhci,
@@ -3607,6 +3669,9 @@ static void usb_xhci_unrealize(DeviceState *dev)
     if (xhci->mfwrap_timer) {
         timer_free(xhci->mfwrap_timer);
         xhci->mfwrap_timer = NULL;
+    }
+    for (i = 0; i < xhci->numintrs; i++) {
+        g_clear_pointer(&xhci->intr[i].imod_timer, timer_free);
     }
 
     memory_region_del_subregion(&xhci->mem, &xhci->mem_cap);
@@ -3719,9 +3784,32 @@ static bool xhci_er_full(void *opaque, int version_id)
     return false;
 }
 
+static bool xhci_intr_moderation_needed(void *opaque)
+{
+    XHCIInterrupter *intr = opaque;
+
+    return intr->ipe || timer_pending(intr->imod_timer);
+}
+
+static const VMStateDescription vmstate_xhci_intr_moderation = {
+    .name = "xhci-intr/moderation",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = xhci_intr_moderation_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(ipe, XHCIInterrupter),
+        VMSTATE_TIMER_PTR(imod_timer, XHCIInterrupter),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_xhci_intr = {
     .name = "xhci-intr",
     .version_id = 1,
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_xhci_intr_moderation,
+        NULL
+    },
     .fields = (const VMStateField[]) {
         /* registers */
         VMSTATE_UINT32(iman,          XHCIInterrupter),
