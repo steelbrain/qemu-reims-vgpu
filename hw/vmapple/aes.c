@@ -537,6 +537,16 @@ static const MemoryRegionOps aes2_ops = {
     },
 };
 
+/*
+ * A guest reboot resets the engine as it was at power-on, with its FIFO,
+ * keys, IVs and mode, and lowers its interrupt. A guest that panics in the
+ * middle of a command leaves words of it in the FIFO: kept, they become the
+ * head of the next boot's first command, which the engine then fails as
+ * invalid (REG_IRQ_STATUS_INVALID_CMD), and macOS panics on that
+ * ("AES Error: IntStatus 0x4"). The interrupt line keeps its level across
+ * a reset unless the device lowers it, and an in-kernel GIC (HVF's, KVM's)
+ * then raises the line's interrupt in the next boot.
+ */
 static void aes_reset(Object *obj, ResetType type)
 {
     AESState *s = APPLE_AES(obj);
@@ -546,6 +556,14 @@ static void aes_reset(Object *obj, ResetType type)
     s->irq_status = 0;
     s->irq_enable = 0;
     s->watermark = 0;
+    s->flag_info = 0;
+    memset(s->fifo, 0, sizeof(s->fifo));
+    s->fifo_idx = 0;
+    memset(s->key, 0, sizeof(s->key));
+    memset(s->iv, 0, sizeof(s->iv));
+    s->is_encrypt = false;
+    s->block_mode = QCRYPTO_CIPHER_MODE_ECB;
+    aes_update_irq(s);
 }
 
 static void aes_init(Object *obj)
