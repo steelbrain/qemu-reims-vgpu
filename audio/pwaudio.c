@@ -67,6 +67,11 @@ typedef struct PWVoice {
      * stream is gone.
      */
     uint64_t overruns, overrun_bytes;
+    /*
+     * The bytes qpw_read skipped in a full ring to read its newest audio.
+     * Written by the reader, read once the stream is gone.
+     */
+    uint64_t skipped_bytes;
 } PWVoice;
 
 typedef struct PWVoiceOut {
@@ -270,6 +275,22 @@ qpw_read(HWVoiceIn *hw, void *data, size_t len)
     if (avail <= 0) {
         l = 0;
         goto done_unlock;
+    }
+
+    if ((uint32_t)avail >= RINGBUFFER_SIZE && (size_t)avail > len) {
+        /*
+         * A full ring holds its oldest audio: capture_on_process drops what
+         * does not fit. Read from its start, it would give the reader as
+         * much stale audio as it holds (about 24 s of 16-bit stereo at
+         * 44.1 kHz), and that delay for the rest of the stream. Skip to the
+         * newest len bytes, in whole frames, and count what is skipped. A
+         * reader that keeps up never finds the ring full.
+         */
+        uint32_t skip = ((uint32_t)avail - len) / v->frame_size * v->frame_size;
+
+        index += skip;
+        avail -= skip;
+        v->skipped_bytes += skip;
     }
 
     if ((size_t)avail < len) {
@@ -664,6 +685,11 @@ qpw_voice_fini(AudioPw *c, PWVoice *v)
         info_report("pipewire: capture stream %s: %" PRIu64 " bytes of "
                     "captured audio dropped in %" PRIu64 " cycles that found "
                     "its buffer full", name, v->overrun_bytes, v->overruns);
+    }
+    if (v->skipped_bytes) {
+        info_report("pipewire: capture stream %s: %" PRIu64 " bytes of its "
+                    "oldest audio skipped to read the newest", name,
+                    v->skipped_bytes);
     }
 }
 
