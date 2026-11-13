@@ -722,7 +722,23 @@ qpw_enable_out(HWVoiceOut *hw, bool enable)
 static void
 qpw_enable_in(HWVoiceIn *hw, bool enable)
 {
-    qpw_voice_set_enabled(AUDIO_PW(hw->s), &PW_VOICE_IN(hw)->v, enable);
+    AudioPw *c = AUDIO_PW(hw->s);
+    PWVoice *v = &PW_VOICE_IN(hw)->v;
+
+    if (enable) {
+        uint32_t index;
+
+        /*
+         * What the stream captured before it stopped is stale: a capture
+         * that starts again gives the reader what the source captures from
+         * then on, as ALSA's snd_pcm_drop and snd_pcm_start do for alsa.
+         */
+        pw_thread_loop_lock(c->thread_loop);
+        spa_ringbuffer_get_write_index(&v->ring, &index);
+        spa_ringbuffer_read_update(&v->ring, index);
+        pw_thread_loop_unlock(c->thread_loop);
+    }
+    qpw_voice_set_enabled(c, v, enable);
 }
 
 static void
