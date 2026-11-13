@@ -534,7 +534,6 @@ static void virtio_snd_get_qemu_audsettings(audsettings *as,
 static void virtio_snd_pcm_open(VirtIOSoundPCMStream *stream)
 {
     virtio_snd_get_qemu_audsettings(&stream->as, &stream->params);
-    stream->info.channels_max = stream->as.nchannels;
 
     if (stream->info.direction == VIRTIO_SND_D_OUTPUT) {
         stream->voice.out = audio_be_open_out(stream->s->audio_be,
