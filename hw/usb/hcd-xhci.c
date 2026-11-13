@@ -2604,9 +2604,8 @@ static void xhci_process_commands(XHCIState *xhci)
 {
     XHCITRB trb;
     TRBType type;
-    XHCIEvent event = {ER_COMMAND_COMPLETE, CC_SUCCESS};
     dma_addr_t addr;
-    unsigned int i, slotid = 0, count = 0;
+    unsigned int i, slotid, count = 0;
 
     DPRINTF("xhci_process_commands()\n");
     if (!xhci_running(xhci)) {
@@ -2617,7 +2616,17 @@ static void xhci_process_commands(XHCIState *xhci)
     xhci->crcr_low |= CRCR_CRR;
 
     while ((type = xhci_ring_fetch(xhci, &xhci->cmd_ring, &trb, &addr))) {
-        event.ptr = addr;
+        /*
+         * Each command completes with a Command Completion Event of its own
+         * (6.4.2.2): nothing of the previous command's carries over. Its Slot
+         * ID is 0 for No Op, Set LTV, Get Port Bandwidth, Force Event and a
+         * command the xHC does not support, and for an Enable Slot that finds
+         * no free slot.
+         */
+        XHCIEvent event = { .type = ER_COMMAND_COMPLETE, .ccode = CC_SUCCESS,
+                            .ptr = addr };
+
+        slotid = 0;
         switch (type) {
         case CR_ENABLE_SLOT:
             for (i = 0; i < xhci->numslots; i++) {
@@ -2698,7 +2707,6 @@ static void xhci_process_commands(XHCIState *xhci)
              * Latency Tolerance; one without it refuses the command. No LTR
              * message carries it on: nothing in QEMU receives one.
              */
-            slotid = 0;
             if (xhci->ltm) {
                 xhci->belt = (trb.control >> 16) & 0xfff;
                 trace_usb_xhci_set_ltv(xhci->belt);
