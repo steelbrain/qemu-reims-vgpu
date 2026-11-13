@@ -2523,10 +2523,16 @@ static TRBCCode xhci_reset_slot(XHCIState *xhci, unsigned int slotid)
     return CC_SUCCESS;
 }
 
+/*
+ * The slot a command names, or 0 where it names none that is enabled. Its
+ * completion holds the command's Slot ID either way (6.4.2.2, and 4.6.4 to
+ * 4.6.10 set it before checking the slot).
+ */
 static unsigned int xhci_get_slot(XHCIState *xhci, XHCIEvent *event, XHCITRB *trb)
 {
     unsigned int slotid;
     slotid = (trb->control >> TRB_CR_SLOTID_SHIFT) & TRB_CR_SLOTID_MASK;
+    event->slotid = slotid;
     if (slotid < 1 || slotid > xhci->numslots) {
         DPRINTF("xhci: bad slot id %d\n", slotid);
         event->ccode = CC_TRB_ERROR;
@@ -2619,14 +2625,14 @@ static void xhci_process_commands(XHCIState *xhci)
         /*
          * Each command completes with a Command Completion Event of its own
          * (6.4.2.2): nothing of the previous command's carries over. Its Slot
-         * ID is 0 for No Op, Set LTV, Get Port Bandwidth, Force Event and a
-         * command the xHC does not support, and for an Enable Slot that finds
-         * no free slot.
+         * ID is the slot the command names, the slot an Enable Slot enabled,
+         * and 0 for No Op, Set LTV, Get Port Bandwidth, Force Event, a
+         * command the xHC does not support and an Enable Slot that finds no
+         * free slot.
          */
         XHCIEvent event = { .type = ER_COMMAND_COMPLETE, .ccode = CC_SUCCESS,
                             .ptr = addr };
 
-        slotid = 0;
         switch (type) {
         case CR_ENABLE_SLOT:
             for (i = 0; i < xhci->numslots; i++) {
@@ -2640,6 +2646,7 @@ static void xhci_process_commands(XHCIState *xhci)
             } else {
                 slotid = i+1;
                 event.ccode = xhci_enable_slot(xhci, slotid);
+                event.slotid = slotid;
             }
             break;
         case CR_DISABLE_SLOT:
@@ -2736,7 +2743,7 @@ static void xhci_process_commands(XHCIState *xhci)
                 uint32_t val = xhci_nec_challenge(chi, clo);
                 event.length = val & 0xFFFF;
                 event.epid = val >> 16;
-                slotid = val >> 24;
+                event.slotid = val >> 24;
                 event.type = 48; /* NEC reply */
             } else {
                 event.ccode = CC_TRB_ERROR;
@@ -2747,7 +2754,6 @@ static void xhci_process_commands(XHCIState *xhci)
             event.ccode = CC_TRB_ERROR;
             break;
         }
-        event.slotid = slotid;
         xhci_event(xhci, &event, 0);
 
         if (count++ > COMMAND_LIMIT) {

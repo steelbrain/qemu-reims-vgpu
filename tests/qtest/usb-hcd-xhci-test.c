@@ -1003,7 +1003,7 @@ static void test_xhci_command_completion_fields(void)
             { 0, TRB_TYPE(CR_NOOP), ER_COMMAND_COMPLETE, CC_SUCCESS },
             /* slot 5 is not enabled */
             { 0, TRB_TYPE(CR_STOP_ENDPOINT) | TRB_CR_SLOT(5) | TRB_CR_EPID(1),
-              ER_COMMAND_COMPLETE, CC_SLOT_NOT_ENABLED },
+              ER_COMMAND_COMPLETE, CC_SLOT_NOT_ENABLED, 0, 0, 5 },
             { 0, TRB_TYPE(CR_NEC_FIRMWARE_REVISION),
               ER_NEC_REPLY, CC_SUCCESS, 0x3034 },
             /* its reply's Slot ID and VF ID fields are not 0 */
