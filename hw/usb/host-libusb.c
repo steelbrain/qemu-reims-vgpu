@@ -70,6 +70,7 @@ typedef struct USBHostRequest USBHostRequest;
 typedef struct USBHostIsoXfer USBHostIsoXfer;
 typedef struct USBHostIsoRing USBHostIsoRing;
 typedef struct USBHostSetIntf USBHostSetIntf;
+typedef struct USBHostDeferred USBHostDeferred;
 
 typedef struct libusb_config_descriptor libusb_config_descriptor;
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(libusb_config_descriptor,
@@ -134,6 +135,12 @@ struct USBHostDevice {
 
     /* the SET_INTERFACE request a worker thread carries out, if any */
     USBHostSetIntf                   *setintf;
+    /*
+     * Set from the start of that request until the submits and cancels that
+     * waited for it have been made, in their order, from deferred.
+     */
+    bool                             deferring;
+    QSIMPLEQ_HEAD(, USBHostDeferred) deferred;
 };
 
 struct USBHostRequest {
@@ -154,6 +161,13 @@ struct USBHostRequest {
  * reconfigures the host controller's endpoints. A worker thread makes the call,
  * so QEMU's main loop and vCPUs keep running; the guest's control transfer
  * completes when the call returns.
+ *
+ * Linux's usbfs takes the same lock of the device for each of its ioctls,
+ * so the main loop makes none on the device until the call returns: it
+ * handles no libusb events, where libusb reaps the completed URBs of every
+ * device it has any for (usb_host_events_pause), and the device's submits and
+ * cancels wait in its deferred queue (usb_host_submit, usb_host_cancel),
+ * which runs in order as the call returns.
  */
 struct USBHostSetIntf {
     USBHostDevice                    *host;
@@ -164,6 +178,13 @@ struct USBHostSetIntf {
     int                              rc;
     bool                             finished;
     QemuEvent                        done;  /* the worker's call returned */
+};
+
+/* A submit, or a cancel, of a transfer that waits for a SET_INTERFACE call */
+struct USBHostDeferred {
+    struct libusb_transfer           *xfer;
+    bool                             cancel;
+    QSIMPLEQ_ENTRY(USBHostDeferred)  next;
 };
 
 struct USBHostIsoXfer {
@@ -273,6 +294,13 @@ static const char *err_names[] = {
 static libusb_context *ctx;
 static uint32_t loglevel;
 
+/*
+ * The SET_INTERFACE calls in flight. While there is one, the main loop
+ * handles no libusb events: the other devices' completions wait for the
+ * call, as the whole main loop did while it made the call itself.
+ */
+static unsigned int events_paused;
+
 #ifndef CONFIG_WIN32
 
 static void usb_host_handle_fd(void *opaque)
@@ -283,6 +311,9 @@ static void usb_host_handle_fd(void *opaque)
 
 static void usb_host_add_fd(int fd, short events, void *user_data)
 {
+    if (events_paused) {
+        return; /* usb_host_events_resume adds it */
+    }
     qemu_set_fd_handler(fd,
                         (events & POLLIN)  ? usb_host_handle_fd : NULL,
                         (events & POLLOUT) ? usb_host_handle_fd : NULL,
@@ -292,6 +323,22 @@ static void usb_host_add_fd(int fd, short events, void *user_data)
 static void usb_host_del_fd(int fd, void *user_data)
 {
     qemu_set_fd_handler(fd, NULL, NULL, NULL);
+}
+
+/* Take libusb's fds out of the main loop, or put them back */
+static void usb_host_watch_fds(bool watch)
+{
+    const struct libusb_pollfd **poll = libusb_get_pollfds(ctx);
+    int i;
+
+    for (i = 0; poll && poll[i] != NULL; i++) {
+        if (watch) {
+            usb_host_add_fd(poll[i]->fd, poll[i]->events, ctx);
+        } else {
+            usb_host_del_fd(poll[i]->fd, ctx);
+        }
+    }
+    free(poll);
 }
 
 #else
@@ -313,11 +360,32 @@ static void usb_host_timer(void *opaque)
 {
     struct timeval tv = { 0, 0 };
 
-    libusb_handle_events_timeout(ctx, &tv);
+    if (!events_paused) {
+        libusb_handle_events_timeout(ctx, &tv);
+    }
     usb_host_timer_kick();
 }
 
 #endif /* !CONFIG_WIN32 */
+
+static void usb_host_events_pause(void)
+{
+    if (events_paused++ == 0) {
+#ifndef CONFIG_WIN32
+        usb_host_watch_fds(false);
+#endif
+    }
+}
+
+static void usb_host_events_resume(void)
+{
+    assert(events_paused > 0);
+    if (--events_paused == 0) {
+#ifndef CONFIG_WIN32
+        usb_host_watch_fds(true);
+#endif
+    }
+}
 
 static int usb_host_init(void)
 {
@@ -396,6 +464,126 @@ static void usb_host_libusb_error(const char *func, int rc)
 
 /* ------------------------------------------------------------------------ */
 
+static void usb_host_defer(USBHostDevice *s, struct libusb_transfer *xfer,
+                           bool cancel)
+{
+    USBHostDeferred *d = g_new0(USBHostDeferred, 1);
+
+    d->xfer = xfer;
+    d->cancel = cancel;
+    QSIMPLEQ_INSERT_TAIL(&s->deferred, d, next);
+}
+
+/* Drop what waits in the deferred queue for a transfer that is done */
+static void usb_host_undefer(USBHostDevice *s, struct libusb_transfer *xfer)
+{
+    USBHostDeferred *d, *dn;
+
+    QSIMPLEQ_FOREACH_SAFE(d, &s->deferred, next, dn) {
+        if (d->xfer == xfer) {
+            QSIMPLEQ_REMOVE(&s->deferred, d, USBHostDeferred, next);
+            g_free(d);
+        }
+    }
+}
+
+/*
+ * Complete a transfer that never reached the kernel through its callback, as
+ * libusb completes one: with status, and nothing transferred.
+ */
+static void usb_host_xfer_unsent(struct libusb_transfer *xfer,
+                                 enum libusb_transfer_status status)
+{
+    int i;
+
+    xfer->status = status;
+    xfer->actual_length = 0;
+    for (i = 0; i < xfer->num_iso_packets; i++) {
+        xfer->iso_packet_desc[i].status = status;
+        xfer->iso_packet_desc[i].actual_length = 0;
+    }
+    xfer->callback(xfer);
+}
+
+/* libusb_submit_transfer, or its place in the deferred queue */
+static int usb_host_submit(USBHostDevice *s, struct libusb_transfer *xfer)
+{
+    if (s->deferring) {
+        usb_host_defer(s, xfer, false);
+        return 0;
+    }
+    return libusb_submit_transfer(xfer);
+}
+
+/*
+ * libusb_cancel_transfer, or its place in the deferred queue. A transfer
+ * whose submit still waits there never reaches the kernel: it leaves the
+ * queue and completes as canceled.
+ */
+static void usb_host_cancel(USBHostDevice *s, struct libusb_transfer *xfer)
+{
+    USBHostDeferred *d;
+
+    if (!s->deferring) {
+        libusb_cancel_transfer(xfer);
+        return;
+    }
+    QSIMPLEQ_FOREACH(d, &s->deferred, next) {
+        if (d->xfer == xfer && !d->cancel) {
+            QSIMPLEQ_REMOVE(&s->deferred, d, USBHostDeferred, next);
+            g_free(d);
+            usb_host_xfer_unsent(xfer, LIBUSB_TRANSFER_CANCELLED);
+            return;
+        }
+    }
+    usb_host_defer(s, xfer, true);
+}
+
+/*
+ * Make the submits and cancels that waited for a SET_INTERFACE call, in their
+ * order, with whatever a completion here queues behind them. libusb's events
+ * stay paused meanwhile, so no transfer completes, and none is freed, under a
+ * cancel that waits. A submit that fails completes its transfer with the
+ * error, as one that failed in the kernel would, and a cancel of it that
+ * waits is dropped. A SET_INTERFACE started meanwhile (the guest canceled
+ * this one) keeps what is left for its own call.
+ */
+static void usb_host_run_deferred(USBHostDevice *s)
+{
+    USBHostDeferred *d;
+    struct libusb_transfer *xfer;
+    bool cancel;
+    int rc;
+
+    while (!s->setintf && (d = QSIMPLEQ_FIRST(&s->deferred)) != NULL) {
+        QSIMPLEQ_REMOVE_HEAD(&s->deferred, next);
+        xfer = d->xfer;
+        cancel = d->cancel;
+        g_free(d);
+        if (cancel) {
+            libusb_cancel_transfer(xfer);
+            continue;
+        }
+        rc = libusb_submit_transfer(xfer);
+        if (rc == 0) {
+            continue;
+        }
+        usb_host_libusb_error("libusb_submit_transfer [deferred]", rc);
+        usb_host_undefer(s, xfer);
+        usb_host_xfer_unsent(xfer, rc == LIBUSB_ERROR_NO_DEVICE ?
+                             LIBUSB_TRANSFER_NO_DEVICE :
+                             LIBUSB_TRANSFER_ERROR);
+        if (rc == LIBUSB_ERROR_NO_DEVICE) {
+            usb_host_nodev(s);
+        }
+    }
+    if (!s->setintf) {
+        s->deferring = false;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+
 static bool usb_host_use_combining(USBEndpoint *ep)
 {
     int type;
@@ -441,6 +629,11 @@ static void usb_host_req_free(USBHostRequest *r)
     request_count--;
 #endif
     QTAILQ_REMOVE(&r->host->requests, r, next);
+    /*
+     * A cancel can wait for a transfer that completed: one that libusb had
+     * reaped in the same pass as a SET_INTERFACE request started.
+     */
+    usb_host_undefer(r->host, r->xfer);
     libusb_free_transfer(r->xfer);
     g_free(r->buffer);
     g_free(r);
@@ -553,7 +746,7 @@ static void usb_host_req_abort(USBHostRequest *r)
         }
         r->p = NULL;
 
-        libusb_cancel_transfer(r->xfer);
+        usb_host_cancel(s, r->xfer);
     }
 }
 
@@ -787,7 +980,7 @@ static void usb_host_iso_data_in(USBHostDevice *s, USBPacket *p)
     while ((xfer = QTAILQ_FIRST(&ring->unused)) != NULL) {
         QTAILQ_REMOVE(&ring->unused, xfer, next);
         usb_host_iso_reset_xfer(xfer);
-        rc = libusb_submit_transfer(xfer->xfer);
+        rc = usb_host_submit(s, xfer->xfer);
         if (rc != 0) {
             usb_host_libusb_error("libusb_submit_transfer [iso]", rc);
             QTAILQ_INSERT_TAIL(&ring->unused, xfer, next);
@@ -865,7 +1058,7 @@ static void usb_host_iso_data_out(USBHostDevice *s, USBPacket *p)
     while ((xfer = QTAILQ_FIRST(&ring->copy)) != NULL &&
            xfer->copy_complete) {
         QTAILQ_REMOVE(&ring->copy, xfer, next);
-        rc = libusb_submit_transfer(xfer->xfer);
+        rc = usb_host_submit(s, xfer->xfer);
         if (rc != 0) {
             usb_host_libusb_error("libusb_submit_transfer [iso]", rc);
             QTAILQ_INSERT_TAIL(&ring->unused, xfer, next);
@@ -1183,11 +1376,22 @@ fail:
 
 static void usb_host_abort_xfers(USBHostDevice *s)
 {
+    USBHostDevice *other;
     USBHostRequest *r, *rtmp;
     int limit = 100;
 
     QTAILQ_FOREACH_SAFE(r, &s->requests, next, rtmp) {
         usb_host_req_abort(r);
+    }
+
+    if (QTAILQ_FIRST(&s->requests) != NULL) {
+        /*
+         * libusb reaps every device's completed URBs below: no other
+         * device's SET_INTERFACE call may still run, or anything wait for it.
+         */
+        QTAILQ_FOREACH(other, &hostdevs, next) {
+            usb_host_set_interface_wait(other);
+        }
     }
 
     while (QTAILQ_FIRST(&s->requests) != NULL) {
@@ -1320,6 +1524,7 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
     udev->auto_attach = 0;
     QTAILQ_INIT(&s->requests);
     QTAILQ_INIT(&s->isorings);
+    QSIMPLEQ_INIT(&s->deferred);
     s->hostfd = -1;
 
 #if LIBUSB_API_VERSION >= 0x01000107 && !defined(CONFIG_WIN32)
@@ -1417,7 +1622,7 @@ static void usb_host_cancel_packet(USBDevice *udev, USBPacket *p)
     r = usb_host_req_find(s, p);
     if (r && r->p) {
         r->p = NULL; /* mark as dead */
-        libusb_cancel_transfer(r->xfer);
+        usb_host_cancel(s, r->xfer);
     }
 }
 
@@ -1587,6 +1792,9 @@ static void usb_host_set_interface_finish(USBHostSetIntf *job)
     } else {
         usb_host_libusb_error("libusb_set_interface_alt_setting", job->rc);
     }
+    /* what waited for the call, then libusb's events, whatever rc is */
+    usb_host_run_deferred(s);
+    usb_host_events_resume();
     if (p) {
         p->status = job->rc == 0 ? USB_RET_SUCCESS : USB_RET_STALL;
         trace_usb_host_req_emulated(s->bus_num, s->addr, p, p->status);
@@ -1609,8 +1817,9 @@ static void usb_host_set_interface_complete(void *opaque, int ret)
 }
 
 /*
- * Wait for the SET_INTERFACE request in flight, if any, and apply it, before
- * anything else changes the device's state or closes its handle.
+ * Wait for the SET_INTERFACE request in flight, if any, and apply it, and make
+ * the submits and cancels that waited for it, before anything else changes
+ * the device's state or closes its handle.
  */
 static void usb_host_set_interface_wait(USBHostDevice *s)
 {
@@ -1619,6 +1828,8 @@ static void usb_host_set_interface_wait(USBHostDevice *s)
     if (job) {
         qemu_event_wait(&job->done);
         usb_host_set_interface_finish(job);
+    } else if (s->deferring) {
+        usb_host_run_deferred(s); /* from a completion that run made */
     }
 }
 
@@ -1645,6 +1856,8 @@ static void usb_host_set_interface(USBHostDevice *s, int iface, int alt,
     job->alt = alt;
     qemu_event_init(&job->done, false);
     s->setintf = job;
+    s->deferring = true;
+    usb_host_events_pause();
     thread_pool_submit_aio(usb_host_set_interface_worker, job,
                            usb_host_set_interface_complete, job);
     p->status = USB_RET_ASYNC;
@@ -1716,7 +1929,7 @@ static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
     libusb_fill_control_transfer(r->xfer, s->dh, r->buffer,
                                  usb_host_req_complete_ctrl, r,
                                  CONTROL_TIMEOUT);
-    rc = libusb_submit_transfer(r->xfer);
+    rc = usb_host_submit(s, r->xfer);
     if (rc != 0) {
         /*
          * Free the request to avoid a dangling r->p pointer.
@@ -1817,7 +2030,7 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
         return;
     }
 
-    rc = libusb_submit_transfer(r->xfer);
+    rc = usb_host_submit(s, r->xfer);
     if (rc != 0) {
         /*
          * Free the request to avoid a dangling r->p pointer.
@@ -1874,6 +2087,7 @@ static int usb_host_alloc_streams(USBDevice *udev, USBEndpoint **eps,
     unsigned char endpoints[30];
     int i, rc;
 
+    usb_host_set_interface_wait(s);
     for (i = 0; i < nr_eps; i++) {
         endpoints[i] = eps[i]->nr;
         if (eps[i]->pid == USB_TOKEN_IN) {
@@ -1903,6 +2117,7 @@ static void usb_host_free_streams(USBDevice *udev, USBEndpoint **eps,
     unsigned char endpoints[30];
     int i;
 
+    usb_host_set_interface_wait(s);
     for (i = 0; i < nr_eps; i++) {
         endpoints[i] = eps[i]->nr;
         if (eps[i]->pid == USB_TOKEN_IN) {
