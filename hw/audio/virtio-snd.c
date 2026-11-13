@@ -1344,15 +1344,23 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
 }
 
 /*
- * Flush all buffer data from this input stream's queue into the driver's
- * virtual queue.
+ * Complete an input stream's I/O message: the frames recorded into it, from
+ * the start of its buffer, then the status part, which follows the buffer
+ * (5.14.6.8) wherever the frames end, as a buffer completes partly filled
+ * at the stream's end. The used length is the status' size plus that of the
+ * frames recorded.
  *
  * @stream: VirtIOSoundPCMStream *stream
+ * @buffer: the I/O message's buffer
  */
 static inline void return_rx_buffer(VirtIOSoundPCMStream *stream,
                                     VirtIOSoundPCMBuffer *buffer)
 {
     virtio_snd_pcm_status resp = { 0 };
+    /* virtio_snd_handle_rx_xfer took no message shorter than the status. */
+    size_t status_offset = iov_size(buffer->elem->in_sg, buffer->elem->in_num)
+                           - sizeof(virtio_snd_pcm_status);
+
     resp.status = cpu_to_le32(VIRTIO_SND_S_OK);
     resp.latency_bytes = 0;
     /* Copy data -if any- to guest */
@@ -1363,7 +1371,7 @@ static inline void return_rx_buffer(VirtIOSoundPCMStream *stream,
                  buffer->size);
     iov_from_buf(buffer->elem->in_sg,
                  buffer->elem->in_num,
-                 buffer->size,
+                 status_offset,
                  &resp,
                  sizeof(virtio_snd_pcm_status));
     virtqueue_push(buffer->vq,
