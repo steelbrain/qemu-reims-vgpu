@@ -31,6 +31,8 @@
 #define VIRTIO_SOUND_STREAM_DEFAULT 2
 #define VIRTIO_SOUND_CHMAP_DEFAULT 0
 #define VIRTIO_SOUND_HDA_FN_NID 0
+/* input-streams unset: the second half of the streams take input. */
+#define VIRTIO_SOUND_INPUT_STREAMS_HALF UINT32_MAX
 
 typedef enum virtio_snd_pcm_state {
     VIRTIO_SND_PCM_STATE_UNINIT = 0,
@@ -144,6 +146,8 @@ static const Property virtio_snd_properties[] = {
                        VIRTIO_SOUND_STREAM_DEFAULT),
     DEFINE_PROP_UINT32("chmaps", VirtIOSound, snd_conf.chmaps,
                        VIRTIO_SOUND_CHMAP_DEFAULT),
+    DEFINE_PROP_UINT32("input-streams", VirtIOSound, input_streams,
+                       VIRTIO_SOUND_INPUT_STREAMS_HALF),
 };
 
 static void
@@ -1237,6 +1241,16 @@ static void virtio_snd_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    if (vsnd->input_streams == VIRTIO_SOUND_INPUT_STREAMS_HALF) {
+        vsnd->input_streams = vsnd->snd_conf.streams / 2;
+    }
+    if (vsnd->input_streams > vsnd->snd_conf.streams) {
+        error_setg(errp,
+                   "Invalid number of input streams: %"PRIu32" of %"PRIu32,
+                   vsnd->input_streams, vsnd->snd_conf.streams);
+        return;
+    }
+
     if (vsnd->snd_conf.chmaps > VIRTIO_SND_CHMAP_MAX_SIZE) {
         error_setg(errp,
                    "Invalid number of channel maps: %"PRIu32,
@@ -1264,7 +1278,7 @@ static void virtio_snd_realize(DeviceState *dev, Error **errp)
         stream->info.formats = supported_formats;
         stream->info.rates = supported_rates;
         stream->info.direction =
-            i < vsnd->snd_conf.streams / 2 + (vsnd->snd_conf.streams & 1)
+            i < vsnd->snd_conf.streams - vsnd->input_streams
             ? VIRTIO_SND_D_OUTPUT : VIRTIO_SND_D_INPUT;
         stream->info.channels_min = 1;
         stream->info.channels_max = 2;

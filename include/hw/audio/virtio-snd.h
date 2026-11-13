@@ -200,6 +200,11 @@ struct VirtIOSound {
     AudioBackend *audio_be;
     VMChangeStateEntry *vmstate;
     virtio_snd_config snd_conf;
+    /*
+     * How many of the streams take input: the last ones. The others,
+     * first, give output.
+     */
+    uint32_t input_streams;
     QTAILQ_HEAD(, virtio_snd_ctrl_command) cmdq;
     /*
      * Convenience queue to keep track of invalid tx/rx queue messages inside
