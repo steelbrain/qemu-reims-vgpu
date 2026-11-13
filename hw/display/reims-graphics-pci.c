@@ -12,7 +12,10 @@
  *    and PBA from RVG_GRAPHICS_MSIX_OFFSET, and one vector. A guest write of
  *    RVG_GRAPHICS_DOORBELL_CONTROL to the DOORBELL register is taken by an
  *    ioeventfd, which the library's control thread polls, so ringing the
- *    control ring never runs the library on the vCPU. A write of a command
+ *    control ring never runs the library on the vCPU. On Windows the host
+ *    has HANDLE event notifiers instead of pollable Unix descriptors, so
+ *    the control doorbell uses the MMIO write and wakes the same consumer
+ *    through the library. A write of a command
  *    queue's ring goes to the library on the vCPU, which may answer the
  *    queue's next command buffer there, posting the event that says it is
  *    submitted, and leave the buffer to the queue's thread
@@ -1188,6 +1191,13 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, RVG_GRAPHICS_PCI_BAR_REGISTERS,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar0);
 
+#ifdef CONFIG_POSIX
+    /*
+     * The library's external doorbell API takes a pollable Unix descriptor.
+     * Windows EventNotifier holds a HANDLE, and WHPX delivers these writes
+     * through reims_graphics_pci_ops instead. The library's existing MMIO
+     * path performs its control-ring wake and consumer-idle handshake.
+     */
     if (event_notifier_init(&s->doorbell, false) < 0) {
         error_setg(errp, "%s: the doorbell's event notifier",
                    TYPE_REIMS_GRAPHICS_PCI);
@@ -1205,6 +1215,7 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                               true, RVG_GRAPHICS_DOORBELL_CONTROL,
                               &s->doorbell);
     s->doorbell_added = true;
+#endif
 
     base = rvg_graphics_device_region(s->device, &size);
     memory_region_init_ram_ptr(&s->region, OBJECT(dev),

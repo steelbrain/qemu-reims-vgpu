@@ -35,6 +35,9 @@
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include <malloc.h>
+#include <winioctl.h>
+#include <io.h>
+#include <fcntl.h>
 
 static int get_allocation_granularity(void)
 {
@@ -931,4 +934,86 @@ int qemu_ftruncate64(int fd, int64_t length)
     /* back to old position */
     SetFilePointer(h, li.LowPart, &li.HighPart, FILE_BEGIN);
     return res ? 0 : -1;
+}
+
+/*
+ * File-backed RAM for memory-backend-ram,share=on on Windows. The GPU's
+ * independently mapped 4 KiB aliases must refer to the same file pages as
+ * WHPX, not to a later copy of VirtualAlloc memory. The sparse temporary file
+ * is removed by the OS after the last descriptor and view closes.
+ */
+void *qemu_win32_shared_ram_alloc(size_t size, int *fd, Error **errp)
+{
+    wchar_t directory[MAX_PATH], path[MAX_PATH];
+    HANDLE file, section;
+    LARGE_INTEGER extent;
+    DWORD returned, directory_length;
+    void *memory;
+
+    directory_length = GetTempPathW(ARRAY_SIZE(directory), directory);
+    if (!directory_length) {
+        error_setg_win32(errp, GetLastError(), "locating shared RAM directory");
+        return NULL;
+    }
+    /* GetTempPath reports the required size without a valid string on overflow. */
+    if (directory_length >= ARRAY_SIZE(directory)) {
+        error_setg_win32(errp, ERROR_BUFFER_OVERFLOW,
+                         "shared RAM directory exceeds MAX_PATH");
+        return NULL;
+    }
+    if (!GetTempFileNameW(directory, L"rvg", 0, path)) {
+        error_setg_win32(errp, GetLastError(), "creating shared RAM file name");
+        return NULL;
+    }
+    file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        DeleteFileW(path);
+        error_setg_win32(errp, error, "opening shared RAM file");
+        return NULL;
+    }
+    if (!DeviceIoControl(file, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &returned, NULL)) {
+        error_setg_win32(errp, GetLastError(), "marking shared RAM file sparse");
+        CloseHandle(file);
+        return NULL;
+    }
+    extent.QuadPart = size;
+    if (!SetFilePointerEx(file, extent, NULL, FILE_BEGIN) || !SetEndOfFile(file)) {
+        error_setg_win32(errp, GetLastError(), "sizing shared RAM file");
+        CloseHandle(file);
+        return NULL;
+    }
+    section = CreateFileMappingW(file, NULL, PAGE_READWRITE, 0, 0, NULL);
+    if (!section) {
+        error_setg_win32(errp, GetLastError(), "creating shared RAM section");
+        CloseHandle(file);
+        return NULL;
+    }
+    memory = MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size);
+    if (!memory) {
+        error_setg_win32(errp, GetLastError(), "mapping shared RAM section");
+        CloseHandle(section);
+        CloseHandle(file);
+        return NULL;
+    }
+    /* The view retains its section. The CRT descriptor takes ownership of file. */
+    CloseHandle(section);
+    *fd = _open_osfhandle((intptr_t)file, _O_RDWR | _O_BINARY);
+    if (*fd < 0) {
+        error_setg_errno(errp, errno, "retaining shared RAM file descriptor");
+        UnmapViewOfFile(memory);
+        CloseHandle(file);
+        return NULL;
+    }
+    return memory;
+}
+
+void qemu_win32_shared_ram_free(void *memory, int fd)
+{
+    bool unmapped = UnmapViewOfFile(memory);
+    assert(unmapped);
+    close(fd);
 }

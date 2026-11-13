@@ -276,4 +276,8 @@ void qemu_win32_map_free(void *ptr, HANDLE h, Error **errp);
 }
 #endif
 
+/* Shared guest RAM retains a CRT descriptor for independent GPU aliases. */
+void *qemu_win32_shared_ram_alloc(size_t size, int *fd, Error **errp);
+void qemu_win32_shared_ram_free(void *memory, int fd);
+
 #endif
