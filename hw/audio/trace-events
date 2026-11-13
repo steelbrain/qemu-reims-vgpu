@@ -61,3 +61,7 @@ virtio_snd_handle_event(void) "event queue callback called"
 virtio_snd_pcm_stream_flush(uint32_t stream) "flushing stream %"PRIu32
 virtio_snd_handle_tx_xfer(void) "tx queue callback called"
 virtio_snd_handle_rx_xfer(void) "rx queue callback called"
+virtio_snd_pcm_params(uint32_t stream, uint32_t buffer_bytes, uint32_t period_bytes, uint8_t channels, uint8_t format, uint8_t rate) "stream %"PRIu32": buffer_bytes=%"PRIu32" period_bytes=%"PRIu32" channels=%u format=%u rate=%u"
+virtio_snd_pcm_queued(uint32_t stream, size_t size, size_t pending) "stream %"PRIu32": I/O message of %zu bytes queued, %zu pending"
+virtio_snd_pcm_completed(uint32_t stream, size_t size, uint32_t latency, size_t pending) "stream %"PRIu32": I/O message completed with %zu bytes, latency_bytes=%"PRIu32", %zu pending"
+virtio_snd_pcm_state(uint32_t stream, const char *command, size_t pending) "stream %"PRIu32": %s with %zu I/O messages pending"
