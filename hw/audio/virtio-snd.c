@@ -710,7 +710,14 @@ static uint32_t virtio_snd_pcm_start_stop(VirtIOSound *s,
         stream->state = VIRTIO_SND_PCM_STATE_STOPPED;
     }
 
-    virtio_snd_pcm_set_active(stream, start);
+    /*
+     * A started input stream captures only while the driver has buffers
+     * posted for it: virtio_snd_handle_rx_xfer starts its voice, and
+     * virtio_snd_pcm_in_cb stops it.
+     */
+    virtio_snd_pcm_set_active(stream, start &&
+                              (stream->info.direction == VIRTIO_SND_D_OUTPUT ||
+                               !QSIMPLEQ_EMPTY(&stream->queue)));
 
     return cpu_to_le32(VIRTIO_SND_S_OK);
 }
@@ -1162,6 +1169,9 @@ static void virtio_snd_handle_rx_xfer(VirtIODevice *vdev, VirtQueue *vq)
         buffer->size = 0;
         buffer->offset = 0;
         QSIMPLEQ_INSERT_TAIL(&stream->queue, buffer, entry);
+        if (stream->state == VIRTIO_SND_PCM_STATE_STARTED) {
+            virtio_snd_pcm_set_active(stream, true);
+        }
 
         continue;
 
@@ -1413,6 +1423,18 @@ static void virtio_snd_pcm_in_cb(void *data, int available)
     VirtIOSoundPCMStream *stream = data;
     VirtIOSoundPCMBuffer *buffer;
     size_t size, max_size, to_read;
+
+    if (QSIMPLEQ_EMPTY(&stream->queue)) {
+        /*
+         * Audio came, and the driver has no buffer posted to take it: stop
+         * the voice until it posts one (virtio_snd_handle_rx_xfer). A driver
+         * that keeps its input stream started and posts no buffers for it
+         * (macOS's AppleVirtIOSound starts its input with each output) then
+         * runs no capture on the host.
+         */
+        virtio_snd_pcm_set_active(stream, false);
+        return;
+    }
 
     while (!QSIMPLEQ_EMPTY(&stream->queue)) {
         buffer = QSIMPLEQ_FIRST(&stream->queue);
