@@ -774,6 +774,12 @@ static void reims_graphics_route_free(ReimsGraphicsPCIState *s,
     g_free(r);
 }
 
+#ifdef CONFIG_EVENTFD
+/*
+ * The routes need eventfds (KVM's ioeventfds take one per route): the library
+ * offers routed doorbells only to a Linux host that gives route_doorbell, so a
+ * build without them (macOS: HVF or TCG) gives none.
+ */
 static gboolean reims_graphics_route_holds_ring(gpointer key, gpointer value,
                                                 gpointer opaque)
 {
@@ -859,6 +865,8 @@ static bool reims_graphics_route_doorbell_cb(void *ctx, uint64_t route,
     }
     return taken;
 }
+
+#endif /* CONFIG_EVENTFD */
 
 /* The teardown's, under the BQL: every route goes, and none is taken after. */
 static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
@@ -1268,7 +1276,9 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .cursor_glyph = reims_graphics_cursor_glyph_cb,
         .cursor_show = reims_graphics_cursor_show_cb,
         .cursor_move = reims_graphics_cursor_move_cb,
+#ifdef CONFIG_EVENTFD
         .route_doorbell = reims_graphics_route_doorbell_cb,
+#endif
     };
     RvgWindowCallbacks window_callbacks = {
         .struct_size = sizeof(window_callbacks),
