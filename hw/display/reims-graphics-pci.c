@@ -41,11 +41,14 @@
  * guest through the device's console. The console shows what the display shows,
  * read back from the library on a thread of the device's pool at each of its
  * updates (rvg_graphics_device_read_display): QEMU's own displays and its
- * screendump read it there. The console also has the guest's cursor, which the
- * library tells the device on its display thread and a BH gives the console, so
- * QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw it; the image read back has
- * none, and under -display none the console has no display, where the window
- * shows the cursor as the host's pointer.
+ * screendump read it there. A read waits for its draw on the GPU; one still
+ * waiting 3 s after it started is late, and a screendump is answered then with
+ * what the console shows, so that the QMP monitors, which wait for the
+ * screendump's command, go on. The console also has the guest's cursor, which
+ * the library tells the device on its display thread and a BH gives the
+ * console, so QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw it; the image
+ * read back has none, and under -display none the console has no display,
+ * where the window shows the cursor as the host's pointer.
  *
  * At QEMU's quit, once the VM stopped for good, the device is torn down
  * (reims_graphics_pci_vm_state_change): the library's release of its last
@@ -65,6 +68,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/queue.h"
 #include "qemu/target-info.h"
+#include "qemu/timer.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
@@ -98,6 +102,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsGraphicsPCIState, REIMS_GRAPHICS_PCI)
  * threads.
  */
 #define REIMS_GRAPHICS_PCI_READ_END_MS 5000
+
+/*
+ * How long after its start a read of the display under way is late: an update
+ * (a screendump) that waits for it is answered then with what the console
+ * shows. A read on a GPU that answers takes milliseconds; the bound leaves a
+ * QMP client that waits 5 s for an answer (reims-ctl's viewer) 2 s of margin.
+ */
+#define REIMS_GRAPHICS_PCI_READ_LATE_MS 3000
 
 typedef struct ReimsGraphicsEvent ReimsGraphicsEvent;
 
@@ -143,6 +155,8 @@ struct ReimsGraphicsPCIState {
     QEMUCursor *cursor;     /* the guest's cursor image, or NULL */
     bool cursor_show;       /* the library says the cursor shows */
     bool reading;           /* a read of the display is under way */
+    bool read_late;         /* it ran past REIMS_GRAPHICS_PCI_READ_LATE_MS */
+    QEMUTimer *read_bound;  /* fires that long after a read starts */
     DisplaySurface *surface; /* the console's, which the reads fill */
     uint8_t *pixels;        /* the last read's buffer, kept for the next */
     size_t pixels_length;
@@ -944,6 +958,10 @@ static void reims_graphics_pci_read_done_bh(void *opaque)
 
     assert(bql_locked());
     s->reading = false;
+    s->read_late = false;
+    if (s->read_bound) {
+        timer_del(s->read_bound);
+    }
     if (job->status != RVG_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: rvg_graphics_device_read_display: %s\n",
@@ -977,10 +995,38 @@ static void reims_graphics_pci_read_done_bh(void *opaque)
 }
 
 /*
+ * A read of the display REIMS_GRAPHICS_PCI_READ_LATE_MS after its start,
+ * still waiting for its draw on the GPU, which a GPU that stopped answering
+ * never finishes: the read is late. An update waiting for it, a screendump's,
+ * is answered now with what the console shows: the frame of the last read
+ * that ended, or QEMU's placeholder where none has. So is every update until
+ * the read ends, which starts no other read meanwhile: QMP runs one command at
+ * a time, and a screendump's holds every monitor until it is answered. The
+ * read's end updates the console as any read's does.
+ */
+static void reims_graphics_pci_read_bound(void *opaque)
+{
+    ReimsGraphicsPCIState *s = opaque;
+
+    assert(bql_locked());
+    if (!s->reading) {
+        return;
+    }
+    s->read_late = true;
+    warn_report("%s: a read of the display still waits for its draw on the "
+                "GPU after %d ms: the console shows the last frame read until "
+                "it ends", TYPE_REIMS_GRAPHICS_PCI,
+                REIMS_GRAPHICS_PCI_READ_LATE_MS);
+    qemu_console_hw_update_done(s->con);
+}
+
+/*
  * QEMU's display system asks for the surface: a display change listener's
  * refresh, or a screendump. A read of the display starts, unless one is
  * under way, and signals the update done; it reads what the display shows
- * when it runs.
+ * when it runs. An update while a read is under way waits for it, but for
+ * REIMS_GRAPHICS_PCI_READ_LATE_MS from its start at most: once it is late,
+ * an update is done at once (reims_graphics_pci_read_bound).
  */
 static bool reims_graphics_pci_gfx_update(void *opaque)
 {
@@ -989,12 +1035,14 @@ static bool reims_graphics_pci_gfx_update(void *opaque)
 
     assert(bql_locked());
     if (s->reading) {
-        return false;
+        return s->read_late;
     }
     if (!s->device || !s->pool) {
         return true;
     }
     s->reading = true;
+    timer_mod(s->read_bound, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                             REIMS_GRAPHICS_PCI_READ_LATE_MS);
     job = g_new0(ReimsGraphicsReadJob, 1);
     job->s = s;
     job->device = s->device;
@@ -1092,6 +1140,9 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
         s->con = NULL;
         s->surface = NULL;
     }
+    /* The bound serves the console's updates, which have ended. */
+    timer_free(s->read_bound);
+    s->read_bound = NULL;
     /* A read under way ends first: it uses the device. */
     if (s->pool) {
         if (!reims_graphics_pci_read_ended(s)) {
@@ -1427,6 +1478,8 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
      * the display shows, which its reads run in the pool for.
      */
     s->pool = thread_pool_new();
+    s->read_bound = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                 reims_graphics_pci_read_bound, s);
     s->con = qemu_graphic_console_create(DEVICE(dev), 0,
                                          &reims_graphics_pci_console_ops, s);
     s->vm_state = qemu_add_vm_change_state_handler(
