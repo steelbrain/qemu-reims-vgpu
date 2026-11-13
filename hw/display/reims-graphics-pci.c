@@ -557,6 +557,14 @@ static void reims_graphics_event_bh(void *opaque)
         if (event == NULL) {
             break;
         }
+        /*
+         * The teardown closed the console: an event a callback queued past it
+         * (reims_graphics_pci_teardown) goes nowhere.
+         */
+        if (!s->con) {
+            reims_graphics_event_free(event);
+            continue;
+        }
         switch (event->kind) {
         case REIMS_GRAPHICS_EVENT_POINTER:
             reims_graphics_input_pointer(s, event);
@@ -1124,10 +1132,15 @@ static void reims_graphics_pci_init(Object *obj)
  * held, as none takes it, and no BH of ours runs inside the release, which
  * runs on the main loop's thread. Elsewhere no route_doorbell can wait: a
  * realize that fails ran no guest, and the device is not hotpluggable, so no
- * unrealize comes while its guest runs. A callback the device's threads or
- * the window run past the release still schedules its BH, or writes the
- * irqfd, which stays open for it: the device is not hotpluggable, so that is
- * only at QEMU's end.
+ * unrealize comes while its guest runs. A callback can still run past the
+ * release: a window's pointer, scroll, key or close already running on the
+ * window's thread as the release closes the window, which waits for nothing,
+ * and a cursor callback or raise_interrupt of a device thread the release's
+ * 5 s left running. Such a callback still queues its event and schedules
+ * event_bh, which stays to the exit for it and drops what it finds once the
+ * console is closed, or writes the irqfd, which stays open for it, or
+ * schedules a BH of its own: the device is not hotpluggable, so that is only
+ * at QEMU's end.
  */
 static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s, bool quit)
 {
@@ -1194,10 +1207,6 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s, bool quit)
         bql_lock();
     } else {
         rvg_graphics_device_release(device);
-    }
-    if (s->event_bh) {
-        qemu_bh_delete(s->event_bh);
-        s->event_bh = NULL;
     }
     WITH_QEMU_LOCK_GUARD(&s->event_lock) {
         while ((event = QSIMPLEQ_FIRST(&s->events)) != NULL) {
@@ -1530,7 +1539,16 @@ static void reims_graphics_pci_reset(Object *obj, ResetType type)
 static void reims_graphics_pci_finalize(Object *obj)
 {
     ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(obj);
+    ReimsGraphicsEvent *event;
 
+    /* The teardown keeps event_bh for callbacks past it: it goes with s. */
+    if (s->event_bh) {
+        qemu_bh_delete(s->event_bh);
+    }
+    while ((event = QSIMPLEQ_FIRST(&s->events)) != NULL) {
+        QSIMPLEQ_REMOVE_HEAD(&s->events, next);
+        reims_graphics_event_free(event);
+    }
     qemu_mutex_destroy(&s->event_lock);
     g_hash_table_destroy(s->routes);
     qemu_mutex_destroy(&s->read_lock);
