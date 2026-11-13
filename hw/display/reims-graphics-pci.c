@@ -32,7 +32,8 @@
  *    the vector's irqfd, where the accelerator injects MSI-X through one
  *    (KVM's in-kernel irqchip) and MSI-X is enabled, and by a BH otherwise;
  *    neither waits for a lock. route_doorbell applies its change under the
- *    BQL before it returns.
+ *    BQL before it returns, and the BQL's holders wait for none of the
+ *    library's threads: the release at QEMU's quit runs with it let go.
  *
  * Under -display none the library opens a window for the display, unless
  * REIMS_VGPU_WINDOW is "0": it opens at the resolution
@@ -841,11 +842,13 @@ static bool reims_graphics_route_add(ReimsGraphicsPCIState *s, uint64_t route,
  * change before it returns, under the BQL, which it takes where its thread
  * does not hold it: once a route is dropped no write reaches its file, so a
  * queue made again over the same ring gets every write of its own. The BQL's
- * holders wait for none of the library's threads but the teardown's release,
- * for at most 5 s (reims_vgpu.h), and the vCPU holds no lock of ours around
- * the register write, the registers being lockless. Under the BQL the address spaces' flat views it reads are the
- * current ones, held by reference, so a thread of the library's needs no RCU
- * registration for it.
+ * holders wait for none of the library's threads: the teardown at QEMU's quit
+ * releases the device with the BQL let go, so a call waiting for it then takes
+ * it, finds the routes closed (reims_graphics_routes_close) and returns, and
+ * the vCPU holds no lock of ours around the register write, the registers
+ * being lockless. Under the BQL the address spaces' flat views it reads are
+ * the current ones, held by reference, so a thread of the library's needs no
+ * RCU registration for it.
  */
 static bool reims_graphics_route_doorbell_cb(void *ctx, uint64_t route,
                                              uint32_t ring_id, int32_t bell)
@@ -1113,15 +1116,23 @@ static void reims_graphics_pci_init(Object *obj)
  * process's exit, as a VM whose shutdown pauses it does, and the teardown says
  * so and returns; a second call waits for the read again. The release
  * of the library's last device waits, at most 5 s, for its threads and the
- * window's GPU work, which no callback of ours holds up, as none takes the
- * BQL; its region stays mapped until they let it go. A callback they or the
- * window run meanwhile, or past those 5 s, still schedules its BH, or writes
- * the irqfd, which stays open for it: the device is not hotpluggable, so that
- * is only at QEMU's end.
+ * window's GPU work; its region stays mapped until they let it go. Of our
+ * callbacks only route_doorbell takes the BQL, so at QEMU's quit (@quit) the
+ * release, and nothing else, runs with the BQL let go: a route_doorbell
+ * waiting for it takes it, finds the routes closed and returns, holding the
+ * release up no more. Every other callback runs as it would with the BQL
+ * held, as none takes it, and no BH of ours runs inside the release, which
+ * runs on the main loop's thread. Elsewhere no route_doorbell can wait: a
+ * realize that fails ran no guest, and the device is not hotpluggable, so no
+ * unrealize comes while its guest runs. A callback the device's threads or
+ * the window run past the release still schedules its BH, or writes the
+ * irqfd, which stays open for it: the device is not hotpluggable, so that is
+ * only at QEMU's end.
  */
-static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
+static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s, bool quit)
 {
     PCIDevice *dev = PCI_DEVICE(s);
+    RvgGraphicsDevice *device;
     ReimsGraphicsEvent *event;
 
     if (s->vm_state) {
@@ -1175,8 +1186,15 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
     if (msix_present(dev)) {
         msix_uninit(dev, &s->bar0, &s->bar0);
     }
-    rvg_graphics_device_release(s->device);
+    device = s->device;
     s->device = NULL;
+    if (quit) {
+        bql_unlock();
+        rvg_graphics_device_release(device);
+        bql_lock();
+    } else {
+        rvg_graphics_device_release(device);
+    }
     if (s->event_bh) {
         qemu_bh_delete(s->event_bh);
         s->event_bh = NULL;
@@ -1289,8 +1307,9 @@ static void reims_graphics_pci_check_low_ram(void)
 /*
  * At QEMU's quit, once the main loop ended and vm_shutdown stopped the VM for
  * good, its vCPUs paused, with the BQL held: the device is torn down while
- * QEMU still runs, so that the library's release of its last device lets go
- * of the GPU device before the process exits. A runtime device kept to the
+ * QEMU still runs, so that the library's release of its last device, which
+ * runs with the BQL let go (reims_graphics_pci_teardown), lets go of the GPU
+ * device before the process exits. A runtime device kept to the
  * exit can end it with SIGSEGV inside NVIDIA's driver, whose exit handler
  * tears its SPIR-V compiler down while a worker thread of the driver's still
  * runs in it (reims_vgpu.h, rvg_graphics_device_release). BAR 2 leaves the
@@ -1314,7 +1333,7 @@ static void reims_graphics_pci_vm_state_change(void *opaque, bool running,
         return;
     }
     memory_region_set_enabled(&s->region, false);
-    reims_graphics_pci_teardown(s);
+    reims_graphics_pci_teardown(s, true);
 }
 
 static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
@@ -1487,12 +1506,12 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     return;
 
 fail:
-    reims_graphics_pci_teardown(s);
+    reims_graphics_pci_teardown(s, false);
 }
 
 static void reims_graphics_pci_exit(PCIDevice *dev)
 {
-    reims_graphics_pci_teardown(REIMS_GRAPHICS_PCI(dev));
+    reims_graphics_pci_teardown(REIMS_GRAPHICS_PCI(dev), false);
 }
 
 static void reims_graphics_pci_reset(Object *obj, ResetType type)
