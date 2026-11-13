@@ -56,6 +56,11 @@
 #define TRB_GET_TYPE(control)   (((control) >> 10) & 0x3f)
 #define TRB_GET_CCODE(status)   ((status) >> 24)
 #define TRB_GET_SLOT(control)   ((control) >> 24)
+#define TRB_GET_VF(control)     (((control) >> 16) & 0xff)
+#define TRB_GET_PARAM(status)   ((status) & 0xffffff)
+#define TRB_CR_SLOT(s)          ((uint32_t)(s) << 24)
+#define TRB_CR_EPID(e)          ((e) << 16)
+#define TRB_CR_DEV_SPEED(s)     ((s) << 16)
 
 #define TR_NORMAL               1
 #define TR_ISOCH                5
@@ -63,14 +68,23 @@
 #define CR_ADDRESS_DEVICE       11
 #define CR_CONFIGURE_ENDPOINT   12
 #define CR_STOP_ENDPOINT        15
+#define CR_SET_TR_DEQUEUE       16
 #define CR_SET_LATENCY_TOLERANCE 20
+#define CR_GET_PORT_BANDWIDTH   21
+#define CR_FORCE_HEADER         22
 #define CR_NOOP                 23
 #define ER_TRANSFER             32
 #define ER_COMMAND_COMPLETE     33
+#define ER_NEC_REPLY            48
+#define CR_NEC_FIRMWARE_REVISION 49
+#define CR_NEC_CHALLENGE_RESPONSE 50
 #define CC_SUCCESS              1
 #define CC_TRB_ERROR            5
 #define CC_STALL_ERROR          6
+#define CC_SLOT_NOT_ENABLED     11
 #define CC_RING_UNDERRUN        14
+
+#define SPEED_ID_HIGH           3
 
 #define EP_TYPE_ISOCH_OUT       1
 #define EP_TYPE_CONTROL         4
@@ -261,11 +275,11 @@ static unsigned int xhci_command(XHCITest *x, uint64_t parameter,
 }
 
 /*
- * Start qemu-xhci with one USB device, run the controller and bring the
- * device to the Addressed state.
+ * Start xHC hc with one USB device, run the controller and bring the device
+ * to the Addressed state.
  */
-static void xhci_test_start_on(XHCITest *x, const char *machine,
-                               const char *usb_device)
+static void xhci_test_start_hc(XHCITest *x, const char *machine,
+                               const char *hc, const char *usb_device)
 {
     uint64_t dcbaa, erst, ep0_ring;
     unsigned int maxports;
@@ -273,8 +287,8 @@ static void xhci_test_start_on(XHCITest *x, const char *machine,
     memset(x, 0, sizeof(*x));
     /* pit=off: a long clock step would run the i8254 timer all the way */
     x->qts = qtest_initf("-machine %s,pit=off -nodefaults "
-                         "-device qemu-xhci,id=xhci,addr=04.0 %s",
-                         machine, usb_device);
+                         "-device %s,id=xhci,addr=04.0 %s",
+                         machine, hc, usb_device);
     pc_alloc_init(&x->alloc, x->qts, ALLOC_NO_FLAGS);
     x->bus = qpci_new_pc(x->qts, NULL);
     qusb_pci_init_one(x->bus, &x->hc, QPCI_DEVFN(4, 0), 0);
@@ -331,6 +345,12 @@ static void xhci_test_start_on(XHCITest *x, const char *machine,
     qtest_writeq(x->qts, x->input_ctx + 0x48, ep0_ring | 1);
     xhci_command(x, x->input_ctx,
                  TRB_TYPE(CR_ADDRESS_DEVICE) | (x->slot << 24));
+}
+
+static void xhci_test_start_on(XHCITest *x, const char *machine,
+                               const char *usb_device)
+{
+    xhci_test_start_hc(x, machine, "qemu-xhci", usb_device);
 }
 
 static void xhci_test_start(XHCITest *x, const char *usb_device)
@@ -771,6 +791,124 @@ static void test_xhci_set_ltv(void)
     }
 }
 
+typedef struct XHCICommandCase {
+    uint64_t parameter;
+    uint32_t control;
+    /* what its Command Completion Event TRB holds */
+    unsigned int type;
+    unsigned int ccode;
+    uint32_t param;     /* Command Completion Parameter */
+    unsigned int vf;
+    unsigned int slot;
+    bool vendor;        /* a vendor defined reply: check its type alone */
+} XHCICommandCase;
+
+/*
+ * Queue cases[] on the Command Ring, ring its doorbell once, and check that
+ * each command's completion holds what that command alone gives it.
+ */
+static void xhci_check_commands(XHCITest *x, const XHCICommandCase *cases,
+                                int n)
+{
+    uint64_t trb[8];
+    uint32_t status, control;
+    int i;
+
+    g_assert_cmpint(n, <=, ARRAY_SIZE(trb));
+    g_assert_cmpuint(x->cmd_idx + n, <=, XHCI_RING_TRBS);
+    for (i = 0; i < n; i++) {
+        trb[i] = x->cmd_ring + 16 * x->cmd_idx++;
+        xhci_write_trb(x, trb[i], cases[i].parameter, 0,
+                       cases[i].control | TRB_C);
+    }
+    xhci_writel(x, x->doorbell, 0);
+
+    for (i = 0; i < n; i++) {
+        uint64_t ptr = qtest_readq(x->qts, x->event_ring + 16 * x->event_idx);
+
+        g_assert_true(xhci_next_event(x, &status, &control));
+        g_assert_cmphex(ptr, ==, trb[i]);
+        g_assert_cmpuint(TRB_GET_TYPE(control), ==, cases[i].type);
+        if (cases[i].vendor) {
+            continue;
+        }
+        g_assert_cmpuint(TRB_GET_CCODE(status), ==, cases[i].ccode);
+        g_assert_cmphex(TRB_GET_PARAM(status), ==, cases[i].param);
+        g_assert_cmpuint(TRB_GET_VF(control), ==, cases[i].vf);
+        g_assert_cmpuint(TRB_GET_SLOT(control), ==, cases[i].slot);
+    }
+    g_assert_false(xhci_next_event(x, NULL, NULL));
+}
+
+/*
+ * Commands taken at one doorbell complete with their own fields (xHCI
+ * 6.4.2.2): a command that is not for a slot has Slot ID 0 after one that
+ * is, an NEC reply has Success after a command that failed, and a Command
+ * Completion Event after an NEC reply holds none of the reply's fields.
+ */
+static void test_xhci_command_completion_fields(void)
+{
+    XHCITest x;
+    uint64_t bw, deq;
+    uint32_t ep0;
+
+    if (!xhci_test_supported("usb-kbd") ||
+        !qtest_has_device("nec-usb-xhci")) {
+        return;
+    }
+
+    xhci_test_start(&x, "-device usb-kbd");
+    bw = xhci_alloc_page(&x);
+    deq = xhci_alloc_page(&x) | 1;
+    ep0 = TRB_CR_SLOT(x.slot) | TRB_CR_EPID(1);
+    {
+        const XHCICommandCase cases[] = {
+            { 0, TRB_TYPE(CR_STOP_ENDPOINT) | ep0,
+              ER_COMMAND_COMPLETE, CC_SUCCESS, 0, 0, x.slot },
+            { 0, TRB_TYPE(CR_NOOP), ER_COMMAND_COMPLETE, CC_SUCCESS },
+            { deq, TRB_TYPE(CR_SET_TR_DEQUEUE) | ep0,
+              ER_COMMAND_COMPLETE, CC_SUCCESS, 0, 0, x.slot },
+            { bw, TRB_TYPE(CR_GET_PORT_BANDWIDTH) |
+              TRB_CR_DEV_SPEED(SPEED_ID_HIGH),
+              ER_COMMAND_COMPLETE, CC_SUCCESS },
+            { deq, TRB_TYPE(CR_SET_TR_DEQUEUE) | ep0,
+              ER_COMMAND_COMPLETE, CC_SUCCESS, 0, 0, x.slot },
+            /* no NEC commands on qemu-xhci */
+            { 0, TRB_TYPE(CR_NEC_FIRMWARE_REVISION),
+              ER_COMMAND_COMPLETE, CC_TRB_ERROR },
+            { deq, TRB_TYPE(CR_SET_TR_DEQUEUE) | ep0,
+              ER_COMMAND_COMPLETE, CC_SUCCESS, 0, 0, x.slot },
+            /* a command it does not support */
+            { 0, TRB_TYPE(CR_FORCE_HEADER),
+              ER_COMMAND_COMPLETE, CC_TRB_ERROR },
+        };
+
+        xhci_check_commands(&x, cases, ARRAY_SIZE(cases));
+    }
+    xhci_test_end(&x);
+
+    xhci_test_start_hc(&x, "pc", "nec-usb-xhci", "-device usb-kbd");
+    {
+        const XHCICommandCase cases[] = {
+            { 0, TRB_TYPE(CR_NEC_FIRMWARE_REVISION),
+              ER_NEC_REPLY, CC_SUCCESS, 0x3034 },
+            { 0, TRB_TYPE(CR_NOOP), ER_COMMAND_COMPLETE, CC_SUCCESS },
+            /* slot 5 is not enabled */
+            { 0, TRB_TYPE(CR_STOP_ENDPOINT) | TRB_CR_SLOT(5) | TRB_CR_EPID(1),
+              ER_COMMAND_COMPLETE, CC_SLOT_NOT_ENABLED },
+            { 0, TRB_TYPE(CR_NEC_FIRMWARE_REVISION),
+              ER_NEC_REPLY, CC_SUCCESS, 0x3034 },
+            /* its reply's Slot ID and VF ID fields are not 0 */
+            { 0x0102030405060708ULL, TRB_TYPE(CR_NEC_CHALLENGE_RESPONSE),
+              ER_NEC_REPLY, .vendor = true },
+            { 0, TRB_TYPE(CR_NOOP), ER_COMMAND_COMPLETE, CC_SUCCESS },
+        };
+
+        xhci_check_commands(&x, cases, ARRAY_SIZE(cases));
+    }
+    xhci_test_end(&x);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -798,6 +936,8 @@ int main(int argc, char **argv)
     qtest_add_func("/xhci/pci/bei", test_xhci_bei);
     qtest_add_func("/xhci/pci/imod", test_xhci_imod);
     qtest_add_func("/xhci/pci/set-ltv", test_xhci_set_ltv);
+    qtest_add_func("/xhci/pci/command-completion-fields",
+                   test_xhci_command_completion_fields);
 
     qtest_start("-device nec-usb-xhci,id=xhci"
                 " -drive id=drive0,if=none,file=null-co://,"
