@@ -60,6 +60,13 @@ typedef struct PWVoice {
 
     pwvolume volume;
     bool muted;
+
+    /*
+     * The capture overruns: the cycles that found the ring full, and the
+     * bytes they dropped. Written on PipeWire's data thread, read once the
+     * stream is gone.
+     */
+    uint64_t overruns, overrun_bytes;
 } PWVoice;
 
 typedef struct PWVoiceOut {
@@ -184,12 +191,25 @@ capture_on_process(void *data)
         error_report("%p: underrun write:%u filled:%d", p, index, filled);
         pw_stream_queue_buffer(v->stream, b);
         return;
-    } else {
-        if ((uint32_t) filled + n_bytes > RINGBUFFER_SIZE) {
-            error_report("%p: overrun write:%u filled:%d + size:%u > max:%u",
-            p, index, filled, n_bytes, RINGBUFFER_SIZE);
-            n_bytes = RINGBUFFER_SIZE - (uint32_t)filled;
+    } else if ((uint32_t) filled + n_bytes > RINGBUFFER_SIZE) {
+        /*
+         * Nothing has read the ring for as long as it holds: the guest's
+         * input stream runs, and the guest takes none of it. The source runs
+         * on, a cycle each quantum (every 5.3 ms at 256 frames of 48 kHz),
+         * each finding the ring full: what does not fit is dropped, said at
+         * the first such cycle and counted, and the count is said as the
+         * stream closes.
+         */
+        uint32_t room = RINGBUFFER_SIZE - (uint32_t)filled;
+
+        if (v->overruns++ == 0) {
+            warn_report("pipewire: capture stream %s: its %u-byte buffer is "
+                        "full of audio nothing has read: captured audio is "
+                        "dropped while it stays full, and counted",
+                        pw_stream_get_name(v->stream), RINGBUFFER_SIZE);
         }
+        v->overrun_bytes += n_bytes - room;
+        n_bytes = room;
     }
     spa_ringbuffer_write_data(&v->ring,
                                 v->buffer, RINGBUFFER_SIZE,
@@ -630,13 +650,21 @@ qpw_init_in(HWVoiceIn *hw, struct audsettings *as)
 static void
 qpw_voice_fini(AudioPw *c, PWVoice *v)
 {
+    g_autofree char *name = NULL;
+
     if (!v->stream) {
         return;
     }
     pw_thread_loop_lock(c->thread_loop);
+    name = g_strdup(pw_stream_get_name(v->stream));
     pw_stream_destroy(v->stream);
     v->stream = NULL;
     pw_thread_loop_unlock(c->thread_loop);
+    if (v->overruns) {
+        info_report("pipewire: capture stream %s: %" PRIu64 " bytes of "
+                    "captured audio dropped in %" PRIu64 " cycles that found "
+                    "its buffer full", name, v->overrun_bytes, v->overruns);
+    }
 }
 
 static void
