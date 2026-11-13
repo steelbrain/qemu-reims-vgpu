@@ -12,11 +12,13 @@
  *    and PBA from RVG_GRAPHICS_MSIX_OFFSET, and one vector. A guest write of
  *    RVG_GRAPHICS_DOORBELL_CONTROL to the DOORBELL register is taken by an
  *    ioeventfd, which the library's control thread polls, so ringing the
- *    control ring never runs the library on the vCPU. A write of a command
- *    queue's ring goes to the library on the vCPU, which may answer the
- *    queue's next command buffer there, posting the event that says it is
- *    submitted, and leave the buffer to the queue's thread
- *    (rvg_graphics_device_mmio_write_taking).
+ *    control ring never runs the library on the vCPU. So is a write of a
+ *    command queue's ring the library routes (route_doorbell): an ioeventfd
+ *    matching the ring's id signals the queue's own eventfd, which its thread
+ *    polls. Any other write of a queue's ring goes to the library on the vCPU,
+ *    which may answer the queue's next command buffer there, posting the
+ *    event that says it is submitted, and leave the buffer to the queue's
+ *    thread (rvg_graphics_device_mmio_write_taking).
  *  - BAR 2: the library's region, 64-bit and prefetchable, memory of QEMU's
  *    process (on Linux a shared mapping of a memfd of the library's, on macOS
  *    private anonymous memory) that the guest maps write-back: the control
@@ -29,7 +31,8 @@
  *    ours into the library waits for. An interrupt is raised by a write of
  *    the vector's irqfd, where the accelerator injects MSI-X through one
  *    (KVM's in-kernel irqchip) and MSI-X is enabled, and by a BH otherwise;
- *    neither waits for a lock.
+ *    neither waits for a lock. route_doorbell applies its change under the
+ *    BQL before it returns.
  *
  * Under -display none the library opens a window for the display, unless
  * REIMS_VGPU_WINDOW is "0": it opens at the resolution
@@ -98,6 +101,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsGraphicsPCIState, REIMS_GRAPHICS_PCI)
 
 typedef struct ReimsGraphicsEvent ReimsGraphicsEvent;
 
+/* A route applied: the DOORBELL register's ioeventfd matching `ring_id`. */
+typedef struct ReimsGraphicsRoute {
+    uint64_t route;
+    uint32_t ring_id;
+    EventNotifier bell; /* over our copy of the queue's eventfd */
+} ReimsGraphicsRoute;
+
 struct ReimsGraphicsPCIState {
     PCIDevice parent_obj;
 
@@ -108,6 +118,9 @@ struct ReimsGraphicsPCIState {
     EventNotifier doorbell;
     bool doorbell_made;  /* the notifier is initialised */
     bool doorbell_added; /* the notifier is BAR 0's ioeventfd */
+    /* The queues' doorbells the library routes (route_doorbell). */
+    GHashTable *routes; /* BQL protected: route number -> ReimsGraphicsRoute */
+    bool routes_closed; /* BQL protected: the teardown dropped them */
     EventNotifier irqfd; /* the vector's, where the accelerator has irqfds */
     bool irqfd_made;     /* the notifier is initialised */
     RvgGraphicsDevice *device;
@@ -746,6 +759,123 @@ static const MemoryRegionOps reims_graphics_pci_ops = {
     },
 };
 
+/* ------ The queues' doorbells ------ */
+
+/*
+ * Drops route `r`: its ioeventfd goes, in a transaction of its own, before its
+ * file is closed, as KVM finds the ioeventfd it removes by the file.
+ */
+static void reims_graphics_route_free(ReimsGraphicsPCIState *s,
+                                      ReimsGraphicsRoute *r)
+{
+    memory_region_del_eventfd(&s->registers, RVG_GRAPHICS_REG_DOORBELL, 4,
+                              true, r->ring_id, &r->bell);
+    close(event_notifier_get_fd(&r->bell));
+    g_free(r);
+}
+
+static gboolean reims_graphics_route_holds_ring(gpointer key, gpointer value,
+                                                gpointer opaque)
+{
+    ReimsGraphicsRoute *r = value;
+
+    return r->ring_id == *(uint32_t *)opaque;
+}
+
+/*
+ * Takes route `route` of `ring_id` into `copy`, ours, under the BQL; false,
+ * with `copy` closed, once RVG_GRAPHICS_DOORBELL_ROUTES are taken or the
+ * teardown dropped them. A route of a ring another route holds replaces it
+ * first: KVM refuses a second ioeventfd of the same value, and QEMU ends the
+ * VM where KVM refuses one. Each change is a transaction of its own, so a
+ * replaced ioeventfd is gone before its successor is added.
+ */
+static bool reims_graphics_route_add(ReimsGraphicsPCIState *s, uint64_t route,
+                                     uint32_t ring_id, int copy)
+{
+    ReimsGraphicsRoute *r;
+
+    if (s->routes_closed ||
+        g_hash_table_size(s->routes) >= RVG_GRAPHICS_DOORBELL_ROUTES) {
+        close(copy);
+        return false;
+    }
+    while ((r = g_hash_table_find(s->routes, reims_graphics_route_holds_ring,
+                                  &ring_id)) != NULL) {
+        g_hash_table_steal(s->routes, &r->route);
+        reims_graphics_route_free(s, r);
+    }
+    r = g_new0(ReimsGraphicsRoute, 1);
+    r->route = route;
+    r->ring_id = ring_id;
+    event_notifier_init_fd(&r->bell, copy);
+    memory_region_add_eventfd(&s->registers, RVG_GRAPHICS_REG_DOORBELL, 4,
+                              true, ring_id, &r->bell);
+    g_hash_table_insert(s->routes, &r->route, r);
+    return true;
+}
+
+/*
+ * The library's route_doorbell: on its threads as a queue is made or ends,
+ * or inside a STATUS write of 0 on the vCPU or our reset. It applies the
+ * change before it returns, under the BQL, which it takes where its thread
+ * does not hold it: once a route is dropped no write reaches its file, so a
+ * queue made again over the same ring gets every write of its own. The BQL's
+ * holders wait for none of the library's threads but the teardown's release,
+ * for at most 5 s (reims_vgpu.h), and the vCPU holds no lock of ours around
+ * the register write, the registers being lockless. Under the BQL the address spaces' flat views it reads are the
+ * current ones, held by reference, so a thread of the library's needs no RCU
+ * registration for it.
+ */
+static bool reims_graphics_route_doorbell_cb(void *ctx, uint64_t route,
+                                             uint32_t ring_id, int32_t bell)
+{
+    ReimsGraphicsPCIState *s = ctx;
+    bool locked = bql_locked();
+    bool taken = true;
+    ReimsGraphicsRoute *r;
+    int copy = -1;
+
+    if (bell >= 0) {
+        copy = qemu_dup(bell);
+        if (copy < 0) {
+            return false;
+        }
+    }
+    if (!locked) {
+        bql_lock();
+    }
+    if (copy >= 0) {
+        taken = reims_graphics_route_add(s, route, ring_id, copy);
+    } else {
+        r = g_hash_table_lookup(s->routes, &route);
+        if (r) {
+            g_hash_table_steal(s->routes, &r->route);
+            reims_graphics_route_free(s, r);
+        }
+    }
+    if (!locked) {
+        bql_unlock();
+    }
+    return taken;
+}
+
+/* The teardown's, under the BQL: every route goes, and none is taken after. */
+static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
+{
+    GHashTableIter it;
+    gpointer value;
+
+    s->routes_closed = true;
+    if (s->routes) {
+        g_hash_table_iter_init(&it, s->routes);
+        while (g_hash_table_iter_next(&it, NULL, &value)) {
+            g_hash_table_iter_steal(&it);
+            reims_graphics_route_free(s, value);
+        }
+    }
+}
+
 /* ------ Initialisation and startup ------ */
 
 /* ------ The console: what the display shows, read back ------ */
@@ -911,6 +1041,7 @@ static void reims_graphics_pci_init(Object *obj)
     memory_region_add_subregion(&s->bar0, 0, &s->registers);
     qemu_mutex_init(&s->event_lock);
     QSIMPLEQ_INIT(&s->events);
+    s->routes = g_hash_table_new(g_int64_hash, g_int64_equal);
     qemu_mutex_init(&s->read_lock);
     qemu_cond_init(&s->read_ended);
 }
@@ -968,6 +1099,7 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
     g_free(s->pixels);
     s->pixels = NULL;
     s->pixels_length = 0;
+    reims_graphics_routes_close(s);
     if (s->doorbell_added) {
         memory_region_del_eventfd(&s->registers, RVG_GRAPHICS_REG_DOORBELL,
                                   4, true, RVG_GRAPHICS_DOORBELL_CONTROL,
@@ -1136,6 +1268,7 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .cursor_glyph = reims_graphics_cursor_glyph_cb,
         .cursor_show = reims_graphics_cursor_show_cb,
         .cursor_move = reims_graphics_cursor_move_cb,
+        .route_doorbell = reims_graphics_route_doorbell_cb,
     };
     RvgWindowCallbacks window_callbacks = {
         .struct_size = sizeof(window_callbacks),
@@ -1224,7 +1357,7 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                     TYPE_REIMS_GRAPHICS_PCI);
     }
 
-    /* The window's input runs from here on; the callbacks need the BH. */
+    /* The window's input runs from here on; the callbacks need the BHs. */
     s->event_bh = qemu_bh_new(reims_graphics_event_bh, s);
     status = rvg_graphics_device_create(&config, &s->device);
     if (status != RVG_OK) {
@@ -1317,6 +1450,7 @@ static void reims_graphics_pci_finalize(Object *obj)
     ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(obj);
 
     qemu_mutex_destroy(&s->event_lock);
+    g_hash_table_destroy(s->routes);
     qemu_mutex_destroy(&s->read_lock);
     qemu_cond_destroy(&s->read_ended);
 }
