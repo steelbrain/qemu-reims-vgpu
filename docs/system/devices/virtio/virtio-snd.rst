@@ -22,7 +22,9 @@ Device properties
 The Virtio sound device can be configured with the following properties:
 
  * ``jacks`` number of physical jacks (Unimplemented).
- * ``streams`` number of PCM streams. At the moment, no stream configuration is supported: the first one will always be a playback stream, an optional second will always be a capture stream. Adding more will cycle stream directions from playback to capture.
+ * ``streams`` number of PCM streams: the playback streams first, then the capture streams.
+ * ``input-streams`` how many of the streams capture; by default the second half of them (none of
+   one stream, one of two). ``streams=1,input-streams=1`` makes a capture-only device.
  * ``chmaps`` number of channel maps (Unimplemented).
 
 All streams are stereo and have the default channel positions ``Front left, right``.
