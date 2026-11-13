@@ -74,6 +74,13 @@ static void virtio_snd_process_cmdq(VirtIOSound *s);
 static void virtio_snd_pcm_flush(VirtIOSoundPCMStream *stream);
 static void virtio_snd_pcm_close(VirtIOSoundPCMStream *stream);
 static void virtio_snd_pcm_in_cb(void *data, int available);
+static size_t virtio_snd_pcm_get_io_msgs_count(VirtIOSoundPCMStream *stream);
+
+/* The stream's id: its index in the device's array of streams. */
+static uint32_t virtio_snd_pcm_stream_id(VirtIOSoundPCMStream *stream)
+{
+    return stream - stream->s->streams;
+}
 
 static uint32_t supported_formats = BIT(VIRTIO_SND_PCM_FMT_S8)
                                   | BIT(VIRTIO_SND_PCM_FMT_U8)
@@ -404,6 +411,9 @@ uint32_t virtio_snd_set_pcm_params(VirtIOSound *s,
     st_params->channels = params->channels;
     st_params->format = params->format;
     st_params->rate = params->rate;
+    trace_virtio_snd_pcm_params(stream_id, st_params->buffer_bytes,
+                                st_params->period_bytes, st_params->channels,
+                                st_params->format, st_params->rate);
 
     if (virtio_snd_pcm_state_prepared(stream->state)) {
         /* implicit VIRTIO_SND_R_PCM_RELEASE */
@@ -685,6 +695,8 @@ static uint32_t virtio_snd_pcm_start_stop(VirtIOSound *s,
         return cpu_to_le32(VIRTIO_SND_S_BAD_MSG);
     }
 
+    trace_virtio_snd_pcm_state(stream_id, start ? "start" : "stop",
+                               virtio_snd_pcm_get_io_msgs_count(stream));
     if (start) {
         switch (stream->state) {
         case VIRTIO_SND_PCM_STATE_PREPARED:
@@ -801,6 +813,10 @@ static void virtio_snd_handle_pcm_release(VirtIOSound *s,
     stream_id = le32_to_cpu(stream_id);
     trace_virtio_snd_handle_pcm_release(stream_id);
     stream = virtio_snd_pcm_get_stream(s, stream_id);
+    if (stream) {
+        trace_virtio_snd_pcm_state(stream_id, "release",
+                                   virtio_snd_pcm_get_io_msgs_count(stream));
+    }
     if (stream == NULL) {
         error_report("%s already released stream %"PRIu32,
                      VIRTIO_DEVICE(s)->name, stream_id);
@@ -1091,6 +1107,8 @@ static void virtio_snd_handle_tx_xfer(VirtIODevice *vdev, VirtQueue *vq)
         stream->latency_bytes += size;
 
         QSIMPLEQ_INSERT_TAIL(&stream->queue, buffer, entry);
+        trace_virtio_snd_pcm_queued(stream_id, size,
+                                    virtio_snd_pcm_get_io_msgs_count(stream));
         continue;
 
 tx_err:
@@ -1173,6 +1191,8 @@ static void virtio_snd_handle_rx_xfer(VirtIODevice *vdev, VirtQueue *vq)
         buffer->size = 0;
         buffer->offset = 0;
         QSIMPLEQ_INSERT_TAIL(&stream->queue, buffer, entry);
+        trace_virtio_snd_pcm_queued(stream_id, size,
+                                    virtio_snd_pcm_get_io_msgs_count(stream));
         if (stream->state == VIRTIO_SND_PCM_STATE_STARTED) {
             virtio_snd_pcm_set_active(stream, true);
         }
@@ -1327,6 +1347,9 @@ static inline void return_tx_buffer(VirtIOSoundPCMStream *stream,
                     buffer,
                     VirtIOSoundPCMBuffer,
                     entry);
+    trace_virtio_snd_pcm_completed(virtio_snd_pcm_stream_id(stream),
+                                   buffer->offset, stream->latency_bytes,
+                                   virtio_snd_pcm_get_io_msgs_count(stream));
     virtio_snd_pcm_buffer_free(buffer);
 }
 
@@ -1422,6 +1445,9 @@ static inline void return_rx_buffer(VirtIOSoundPCMStream *stream,
                     buffer,
                     VirtIOSoundPCMBuffer,
                     entry);
+    trace_virtio_snd_pcm_completed(virtio_snd_pcm_stream_id(stream),
+                                   buffer->size, 0,
+                                   virtio_snd_pcm_get_io_msgs_count(stream));
     virtio_snd_pcm_buffer_free(buffer);
 }
 
