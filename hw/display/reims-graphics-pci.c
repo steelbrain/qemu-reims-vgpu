@@ -46,7 +46,9 @@
  *
  * At QEMU's quit, once the VM stopped for good, the device is torn down
  * (reims_graphics_pci_vm_state_change): the library's release of its last
- * device lets go of the GPU device before the process exits.
+ * device lets go of the GPU device before the process exits. A read of the
+ * display still waiting for the GPU 5 s into the teardown keeps the device to
+ * the exit instead, so a GPU that stopped answering does not hold the quit.
  *
  * The device has no default option ROM: romfile names one.
  */
@@ -87,6 +89,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsGraphicsPCIState, REIMS_GRAPHICS_PCI)
 /* The most wheel notches one scroll event sends the guest, on each axis. */
 #define REIMS_GRAPHICS_PCI_WHEEL_MAX_NOTCHES 256
 
+/*
+ * How long the teardown at QEMU's quit waits for a read of the display under
+ * way, the bound the library's release of its last device waits for its own
+ * threads.
+ */
+#define REIMS_GRAPHICS_PCI_READ_END_MS 5000
+
 typedef struct ReimsGraphicsEvent ReimsGraphicsEvent;
 
 struct ReimsGraphicsPCIState {
@@ -105,6 +114,9 @@ struct ReimsGraphicsPCIState {
     VMChangeStateEntry *vm_state; /* the teardown at QEMU's quit */
     QemuConsole *con;
     ThreadPool *pool; /* where the console's reads of the display run */
+    QemuMutex read_lock;
+    QemuCond read_ended;
+    bool read_running; /* read_lock protected: a read is in the library */
 
     /* The window's input, queued on its thread and run under the BQL. */
     QemuMutex event_lock;
@@ -775,6 +787,10 @@ static int reims_graphics_pci_do_read(void *opaque)
                                                        &job->width,
                                                        &job->height);
     }
+    WITH_QEMU_LOCK_GUARD(&job->s->read_lock) {
+        job->s->read_running = false;
+        qemu_cond_broadcast(&job->s->read_ended);
+    }
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             reims_graphics_pci_read_done_bh, job);
     return 0;
@@ -848,9 +864,34 @@ static bool reims_graphics_pci_gfx_update(void *opaque)
     job->length = s->pixels_length;
     s->pixels = NULL;
     s->pixels_length = 0;
+    WITH_QEMU_LOCK_GUARD(&s->read_lock) {
+        s->read_running = true;
+    }
     thread_pool_submit_immediate(s->pool, reims_graphics_pci_do_read, job,
                                  NULL);
     return false;
+}
+
+/*
+ * Whether no read of the display is in the library, waiting for one under
+ * way at most REIMS_GRAPHICS_PCI_READ_END_MS: a read waits for its draw on
+ * the GPU, which a GPU that stopped answering never finishes.
+ */
+static bool reims_graphics_pci_read_ended(ReimsGraphicsPCIState *s)
+{
+    int64_t deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                       REIMS_GRAPHICS_PCI_READ_END_MS;
+    int64_t left;
+
+    QEMU_LOCK_GUARD(&s->read_lock);
+    while (s->read_running) {
+        left = deadline - qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        if (left <= 0) {
+            return false;
+        }
+        qemu_cond_timedwait(&s->read_ended, &s->read_lock, left);
+    }
+    return true;
 }
 
 static const GraphicHwOps reims_graphics_pci_console_ops = {
@@ -870,18 +911,26 @@ static void reims_graphics_pci_init(Object *obj)
     memory_region_add_subregion(&s->bar0, 0, &s->registers);
     qemu_mutex_init(&s->event_lock);
     QSIMPLEQ_INIT(&s->events);
+    qemu_mutex_init(&s->read_lock);
+    qemu_cond_init(&s->read_ended);
 }
 
 /*
  * Undoes what realize did, from its failure, at unrealize, or at QEMU's quit
  * (reims_graphics_pci_vm_state_change), with BAR 2 out of the guest's address
- * space; a second call finds nothing left to undo. The release of the
- * library's last device waits, at most 5 s, for its threads and the window's
- * GPU work, which no callback of ours holds up, as none takes the BQL; its
- * region stays mapped until they let it go. A callback they or the window run
- * meanwhile, or past those 5 s, still schedules its BH, or writes the irqfd,
- * which stays open for it: the device is not hotpluggable, so that is only at
- * QEMU's end.
+ * space; a second call finds nothing left to undo but what a read kept. A
+ * read of the display under way ends first, as it uses the device: the
+ * teardown waits for it at most REIMS_GRAPHICS_PCI_READ_END_MS, under the
+ * BQL, and a read that waits for a GPU which stopped answering ends no
+ * sooner. Past that the read keeps the device, its pool and the rest to the
+ * process's exit, as a VM whose shutdown pauses it does, and the teardown says
+ * so and returns; a second call waits for the read again. The release
+ * of the library's last device waits, at most 5 s, for its threads and the
+ * window's GPU work, which no callback of ours holds up, as none takes the
+ * BQL; its region stays mapped until they let it go. A callback they or the
+ * window run meanwhile, or past those 5 s, still schedules its BH, or writes
+ * the irqfd, which stays open for it: the device is not hotpluggable, so that
+ * is only at QEMU's end.
  */
 static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
 {
@@ -899,6 +948,13 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
     }
     /* A read under way ends first: it uses the device. */
     if (s->pool) {
+        if (!reims_graphics_pci_read_ended(s)) {
+            warn_report("%s: a read of the display still waits for its draw "
+                        "on the GPU after %d ms: the device stays to the exit",
+                        TYPE_REIMS_GRAPHICS_PCI,
+                        REIMS_GRAPHICS_PCI_READ_END_MS);
+            return;
+        }
         thread_pool_free(s->pool);
         s->pool = NULL;
     }
@@ -1046,7 +1102,9 @@ static void reims_graphics_pci_check_low_ram(void)
  * A shutdown whose action pauses the VM (-action shutdown=pause,
  * -no-shutdown) keeps the device, which the guest uses again after a reset,
  * and then so does its quit, as does a quit of a VM stopped before it: no
- * handler hears it. The device then stays to the exit, as before.
+ * handler hears it. The device then stays to the exit, as before. So does it
+ * when a read of the display under way still waits for the GPU 5 s into the
+ * teardown (reims_graphics_pci_teardown).
  */
 static void reims_graphics_pci_vm_state_change(void *opaque, bool running,
                                                RunState state)
@@ -1252,6 +1310,8 @@ static void reims_graphics_pci_finalize(Object *obj)
     ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(obj);
 
     qemu_mutex_destroy(&s->event_lock);
+    qemu_mutex_destroy(&s->read_lock);
+    qemu_cond_destroy(&s->read_ended);
 }
 
 static const Property reims_graphics_pci_properties[] = {
