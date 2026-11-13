@@ -1433,14 +1433,18 @@ static void virtio_snd_pcm_in_cb(void *data, int available)
         }
         max_size -= sizeof(virtio_snd_pcm_status);
 
+        /*
+         * A message completes once its buffer is full, whatever its size
+         * against period_bytes: the device MUST NOT complete it before, but
+         * at the stream's end (5.14.6.8, Input Stream), where a flush and a
+         * stopped stream complete it as it is.
+         */
         for (;;) {
             if (buffer->size >= max_size) {
                 return_rx_buffer(stream, buffer);
                 break;
             }
-            to_read = stream->params.period_bytes - buffer->size;
-            to_read = MIN(to_read, available);
-            to_read = MIN(to_read, max_size - buffer->size);
+            to_read = MIN(max_size - buffer->size, available);
             size = audio_be_read(stream->s->audio_be,
                                     stream->voice.in,
                                     buffer->data + buffer->size,
@@ -1451,7 +1455,7 @@ static void virtio_snd_pcm_in_cb(void *data, int available)
             }
             buffer->size += size;
             available -= size;
-            if (buffer->size >= stream->params.period_bytes) {
+            if (buffer->size >= max_size) {
                 return_rx_buffer(stream, buffer);
                 break;
             }
