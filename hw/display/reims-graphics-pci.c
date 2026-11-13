@@ -942,6 +942,13 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s)
         s->vm_state = NULL;
     }
     if (s->con) {
+        /*
+         * A screendump waiting for the read under way is answered now, with
+         * what the console shows: the read's end updates no closed console,
+         * and QEMU's quit waits for the QMP dispatcher the screendump holds
+         * (monitor_cleanup).
+         */
+        qemu_console_hw_update_done(s->con);
         qemu_graphic_console_close(s->con);
         s->con = NULL;
         s->surface = NULL;
