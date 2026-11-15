@@ -827,9 +827,9 @@ static uint64_t xhci_transfer_event(XHCITest *x, uint32_t *status)
  * that crosses a page as an Isoch TRB with ISP chained to a Normal TRB with
  * ISP and IOC, and waits for the second event. Without it, it took each
  * later event of the endpoint as mismatched and a camera's stream stopped.
- * usb-kbd answers each TD on its interrupt endpoint with an 8-byte report;
- * typed isoch, the endpoint takes an Isoch TRB, and its empty ring is then
- * reported after the TD.
+ * The idle usb-kbd NAKs a TD on its interrupt endpoint, and answers it with
+ * an 8-byte report when a key goes down; typed isoch, the endpoint takes an
+ * Isoch TRB, and its ring, empty after the TD, is reported.
  */
 static void test_xhci_short_packet(void)
 {
@@ -847,7 +847,7 @@ static void test_xhci_short_packet(void)
           { TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_CH | TRB_TR_BEI,
             TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_IOC | TRB_TR_BEI },
           false, { { 0, CC_SHORT_PACKET, 8 }, { 1, CC_SHORT_PACKET, 8 } }, 2 },
-        /* ISP and IOC on the first TRB: one event for it */
+        /* ISP and IOC on the first TRB: one event for it, one for the last */
         { EP_TYPE_INTR_IN, 3, { 16, 8 },
           { TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_IOC | TRB_TR_CH,
             TRB_TYPE(TR_NORMAL) | TRB_TR_IOC },
@@ -882,16 +882,19 @@ static void test_xhci_short_packet(void)
         xhci_test_start(&x, "-device usb-kbd");
         ring = xhci_configure_ep(&x, 3, cases[i].ep_type, cases[i].interval,
                                  8);
-        xhci_clear_ip(&x);
-        qtest_qmp_assert_success(x.qts,
-            "{'execute': 'send-key', 'arguments': "
-            "{'keys': [{'type': 'qcode', 'data': 'a'}]}}");
-
         for (j = 0; j < 2; j++) {
             xhci_write_trb(&x, ring + 16 * j, xhci_alloc_page(&x),
                            cases[i].len[j], cases[i].control[j] | TRB_C);
         }
         xhci_writel(&x, x.doorbell + 4 * x.slot, 3);
+        qtest_clock_step(x.qts, 16 * XHCI_MICROFRAME_NS);
+        g_assert_false(xhci_next_event(&x, NULL, NULL));
+
+        /* the key goes down: the TD completes */
+        xhci_clear_ip(&x);
+        qtest_qmp_assert_success(x.qts,
+            "{'execute': 'send-key', 'arguments': "
+            "{'keys': [{'type': 'qcode', 'data': 'a'}]}}");
         qtest_clock_step(x.qts, 16 * XHCI_MICROFRAME_NS);
 
         g_assert_cmpuint(xhci_ip(&x), ==, cases[i].ip);
