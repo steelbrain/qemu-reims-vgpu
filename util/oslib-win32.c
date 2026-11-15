@@ -867,8 +867,8 @@ void *qemu_win32_map_alloc(size_t size, HANDLE *h, Error **errp)
 
     trace_win32_map_alloc(size);
 
-    *h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
-                          size, NULL);
+    *h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                           (DWORD)((uint64_t)size >> 32), (DWORD)size, NULL);
     if (*h == NULL) {
         error_setg_win32(errp, GetLastError(), "Failed to CreateFileMapping");
         return NULL;
@@ -882,6 +882,24 @@ void *qemu_win32_map_alloc(size_t size, HANDLE *h, Error **errp)
     }
 
     return bits;
+}
+
+/*
+ * RAM another mapping can share: a view of a section the paging file backs,
+ * committed whole (SEC_COMMIT, CreateFileMapping's default) as
+ * qemu_anon_ram_alloc's memory is, with the section's handle in @h. The view
+ * starts on the allocation granularity, which @align gets, as
+ * qemu_anon_ram_alloc's does. qemu_win32_map_free frees it.
+ */
+void *qemu_win32_ram_alloc(size_t size, uint64_t *align, HANDLE *h,
+                           Error **errp)
+{
+    void *ptr = qemu_win32_map_alloc(size, h, errp);
+
+    if (ptr && align) {
+        *align = MAX(get_allocation_granularity(), getpagesize());
+    }
+    return ptr;
 }
 
 void qemu_win32_map_free(void *ptr, HANDLE h, Error **errp)

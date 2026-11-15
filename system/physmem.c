@@ -1935,6 +1935,13 @@ int qemu_ram_get_fd(const RAMBlock *rb)
     return rb->fd;
 }
 
+#ifdef _WIN32
+HANDLE qemu_ram_get_section(const RAMBlock *rb)
+{
+    return rb->section;
+}
+#endif
+
 /* Called with the BQL held.  */
 void qemu_ram_set_idstr(RAMBlock *new_block, const char *name, DeviceState *dev)
 {
@@ -2492,7 +2499,7 @@ RAMBlock *qemu_ram_alloc_internal(ram_addr_t size, ram_addr_t max_size,
     assert(!host ^ (ram_flags & RAM_PREALLOC));
     assert(max_size >= size);
 
-    /* ignore RAM_SHARED for Windows and emscripten*/
+    /* Windows gives RAM_SHARED a section, below; emscripten ignores it */
 #if defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)
     if (!host) {
         if (!share_flags && current_machine->aux_ram_share) {
@@ -2552,8 +2559,33 @@ RAMBlock *qemu_ram_alloc_internal(ram_addr_t size, ram_addr_t max_size,
     new_block->page_size = qemu_real_host_page_size();
     new_block->host = host;
     new_block->flags = ram_flags;
+#ifdef _WIN32
+    /*
+     * Shared RAM is a view of a section the paging file backs, whose handle
+     * (qemu_ram_get_section) lets another mapping share its pages: a device's
+     * library views a guest buffer's pages in place through it. RAM_NORESERVE
+     * keeps qemu_anon_ram_alloc's path, which refuses it.
+     */
+    if (!host && (ram_flags & RAM_SHARED) && !(ram_flags & RAM_NORESERVE)) {
+        new_block->host = qemu_win32_ram_alloc(max_size, &mr->align,
+                                               &new_block->section,
+                                               &local_err);
+        if (!new_block->host) {
+            g_free(new_block);
+            error_propagate_prepend(errp, local_err,
+                                    "Cannot set up guest memory '%s': ",
+                                    memory_region_name(mr));
+            return NULL;
+        }
+    }
+#endif
     ram_block_add(new_block, &local_err);
     if (local_err) {
+#ifdef _WIN32
+        if (new_block->section) {
+            qemu_win32_map_free(new_block->host, new_block->section, NULL);
+        }
+#endif
         g_free(new_block);
         error_propagate(errp, local_err);
         return NULL;
@@ -2594,6 +2626,10 @@ static void reclaim_ramblock(RAMBlock *block)
     } else if (block->fd >= 0) {
         qemu_ram_munmap(block->fd, block->host, block->max_length);
         close(block->fd);
+#endif
+#ifdef _WIN32
+    } else if (block->section) {
+        qemu_win32_map_free(block->host, block->section, NULL);
 #endif
     } else {
         qemu_anon_ram_free(block->host, block->max_length);

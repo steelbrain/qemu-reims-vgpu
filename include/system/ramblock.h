@@ -40,6 +40,14 @@ struct RAMBlock {
     Error *cpr_blocker;
     int fd;
     uint64_t fd_offset;
+#ifdef _WIN32
+    /*
+     * Shared RAM's section (RAM_SHARED): @host is a view of the whole
+     * section, which the paging file backs, so another mapping of it shares
+     * the block's pages. NULL for RAM that is not such a view.
+     */
+    HANDLE section;
+#endif
     /*
      * When RAM_GUEST_MEMFD_PRIVATE flag is set, this ramblock can have
      * private pages backed by guest_memfd_private specified, while shared
@@ -182,6 +190,9 @@ void qemu_ram_set_migratable(RAMBlock *rb);
 void qemu_ram_unset_migratable(RAMBlock *rb);
 bool qemu_ram_is_named_file(const RAMBlock *rb);
 int qemu_ram_get_fd(const RAMBlock *rb);
+#ifdef _WIN32
+HANDLE qemu_ram_get_section(const RAMBlock *rb);
+#endif
 
 size_t qemu_ram_pagesize(const RAMBlock *block);
 size_t qemu_ram_pagesize_largest(void);
