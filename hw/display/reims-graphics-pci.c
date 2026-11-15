@@ -46,25 +46,28 @@
  *    BQL before it returns, and the BQL's holders wait for none of the
  *    library's threads: the release at QEMU's quit runs with it let go.
  *
- * Under -display none the library opens a window for the display, unless
- * REIMS_VGPU_WINDOW is "0": it opens at the resolution
- * property's size, "<width>x<height>" (1920x1080 without it), then keeps the
- * size the person gives it, and the guest follows it. Its input reaches the
- * guest through the device's console. The console shows what the display shows,
- * read back from the library on a thread of the device's pool at each of its
- * updates (rvg_graphics_device_read_display): QEMU's own displays and its
- * screendump read it there. A read waits for its draw on the GPU; one still
- * waiting 3 s after it started is late, and a screendump is answered then with
- * what the console shows, so that the QMP monitors, which wait for the
- * screendump's command, go on. The console also has the guest's cursor, which
- * the library tells the device on its display thread and a BH gives the
- * console, so QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw it; the image
- * read back has none, and under -display none the console has no display,
- * where the window shows the cursor as the host's pointer.
+ * The device has the displays property's count of displays, 1 to
+ * RVG_GRAPHICS_DISPLAYS_MAX (1 by default), display i head i of QEMU's UI,
+ * with a console of its own. Under -display none the library opens a window
+ * for each display, unless REIMS_VGPU_WINDOW is "0": each opens at the
+ * resolution property's size, "<width>x<height>" (1920x1080 without it), then
+ * keeps the size the person gives it, and the guest follows it. A window's
+ * input reaches the guest through its display's console. A console shows what
+ * its display shows, read back from the library on a thread of the device's
+ * pool at each of its updates (rvg_graphics_device_read_display_at): QEMU's
+ * own displays and its screendump of the console's head read it there. A
+ * read waits for its draw on the GPU; one still waiting 3 s after it started
+ * is late, and a screendump is answered then with what the console shows, so
+ * that the QMP monitors, which wait for the screendump's command, go on. Each
+ * console also has its display's guest cursor, which the library tells the
+ * device on its display thread and a BH gives the console, so QEMU's own
+ * displays (SPICE, VNC, GTK, D-Bus) draw it; the image read back has none,
+ * and under -display none the console has no display, where the window shows
+ * the cursor as the host's pointer.
  *
  * At QEMU's quit, once the VM stopped for good, the device is torn down
  * (reims_graphics_pci_vm_state_change): the library's release of its last
- * device lets go of the GPU device before the process exits. A read of the
+ * device lets go of the GPU device before the process exits. A read of a
  * display still waiting for the GPU 5 s into the teardown keeps the device to
  * the exit instead, so a GPU that stopped answering does not hold the quit.
  *
@@ -109,17 +112,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsGraphicsPCIState, REIMS_GRAPHICS_PCI)
 #define REIMS_GRAPHICS_PCI_WHEEL_MAX_NOTCHES 256
 
 /*
- * How long the teardown at QEMU's quit waits for a read of the display under
- * way, the bound the library's release of its last device waits for its own
- * threads.
+ * How long the teardown at QEMU's quit waits for the reads of the displays
+ * under way, the bound the library's release of its last device waits for its
+ * own threads.
  */
 #define REIMS_GRAPHICS_PCI_READ_END_MS 5000
 
 /*
- * How long after its start a read of the display under way is late: an update
- * (a screendump) that waits for it is answered then with what the console
- * shows. A read on a GPU that answers takes milliseconds; the bound leaves a
- * QMP client that waits 5 s for an answer (reims-ctl's viewer) 2 s of margin.
+ * How long after its start a read of a display under way is late: an update
+ * (a screendump) that waits for it is answered then with what the display's
+ * console shows. A read on a GPU that answers takes milliseconds; the bound
+ * leaves a QMP client that waits 5 s for an answer (reims-ctl's viewer) 2 s of
+ * margin.
  */
 #define REIMS_GRAPHICS_PCI_READ_LATE_MS 3000
 
@@ -136,6 +140,27 @@ typedef struct ReimsGraphicsRoute {
     hwaddr addr;
     EventNotifier bell; /* over our copy of the queue's eventfd */
 } ReimsGraphicsRoute;
+
+/*
+ * One of the device's displays, head `index` of QEMU's UI: its console, which
+ * shows what the display shows, read back from the library, and its cursor.
+ */
+typedef struct ReimsGraphicsHead {
+    ReimsGraphicsPCIState *s;
+    uint32_t index;
+    QemuConsole *con;
+    bool read_running; /* s->read_lock protected: a read is in the library */
+
+    /* Mutable state (BQL protected) */
+    QEMUCursor *cursor;     /* the guest's cursor image, or NULL */
+    bool cursor_show;       /* the library says the cursor shows */
+    bool reading;           /* a read of the display is under way */
+    bool read_late;         /* it ran past REIMS_GRAPHICS_PCI_READ_LATE_MS */
+    QEMUTimer *read_bound;  /* fires that long after a read starts */
+    DisplaySurface *surface; /* the console's, which the reads fill */
+    uint8_t *pixels;        /* the last read's buffer, kept for the next */
+    size_t pixels_length;
+} ReimsGraphicsHead;
 
 struct ReimsGraphicsPCIState {
     PCIDevice parent_obj;
@@ -155,29 +180,22 @@ struct ReimsGraphicsPCIState {
     bool irqfd_made;     /* the notifier is initialised */
     RvgGraphicsDevice *device;
     VMChangeStateEntry *vm_state; /* the teardown at QEMU's quit */
-    QemuConsole *con;
-    ThreadPool *pool; /* where the console's reads of the display run */
+    /* The displays, display i head i: the first `displays` of them. */
+    ReimsGraphicsHead heads[RVG_GRAPHICS_DISPLAYS_MAX];
+    ThreadPool *pool; /* where the consoles' reads of the displays run */
     QemuMutex read_lock;
     QemuCond read_ended;
-    bool read_running; /* read_lock protected: a read is in the library */
 
     /* The window's input, queued on its thread and run under the BQL. */
     QemuMutex event_lock;
     QSIMPLEQ_HEAD(, ReimsGraphicsEvent) events; /* event_lock protected */
     QEMUBH *event_bh;
 
-    char *resolution; /* the property: the window's first size, or NULL */
+    char *resolution; /* the property: each window's first size, or NULL */
+    uint32_t displays; /* the property: 1 to RVG_GRAPHICS_DISPLAYS_MAX */
 
     /* Mutable state (BQL protected) */
     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
-    QEMUCursor *cursor;     /* the guest's cursor image, or NULL */
-    bool cursor_show;       /* the library says the cursor shows */
-    bool reading;           /* a read of the display is under way */
-    bool read_late;         /* it ran past REIMS_GRAPHICS_PCI_READ_LATE_MS */
-    QEMUTimer *read_bound;  /* fires that long after a read starts */
-    DisplaySurface *surface; /* the console's, which the reads fill */
-    uint8_t *pixels;        /* the last read's buffer, kept for the next */
-    size_t pixels_length;
     int irqfd_virq;         /* the vector's MSI route while MSI-X is enabled */
     bool irqfd_unmasked;    /* the irqfd is the route's */
     /* Atomic, set under the BQL: whether a raise writes the irqfd. */
@@ -354,7 +372,7 @@ static void reims_graphics_pci_write_config(PCIDevice *dev, uint32_t address,
     }
 }
 
-/* ------ Input from the display's window ------ */
+/* ------ Input from the displays' windows ------ */
 
 typedef enum ReimsGraphicsEventKind {
     REIMS_GRAPHICS_EVENT_POINTER,
@@ -369,6 +387,7 @@ typedef enum ReimsGraphicsEventKind {
 struct ReimsGraphicsEvent {
     QSIMPLEQ_ENTRY(ReimsGraphicsEvent) next;
     ReimsGraphicsEventKind kind;
+    uint32_t head; /* the display whose window or cursor it is */
     union {
         struct {
             uint16_t x;
@@ -401,7 +420,12 @@ static void reims_graphics_event_free(ReimsGraphicsEvent *event)
     g_free(event);
 }
 
+/*
+ * The pointer of @con's window, in its display's pixels. The guest has one
+ * pointing device, whose buttons every window's pointer shares.
+ */
 static void reims_graphics_input_pointer(ReimsGraphicsPCIState *s,
+                                         QemuConsole *con,
                                          ReimsGraphicsEvent *event)
 {
     static uint32_t button_map[INPUT_BUTTON__MAX] = {
@@ -415,11 +439,11 @@ static void reims_graphics_input_pointer(ReimsGraphicsPCIState *s,
     uint16_t height = MAX(event->pointer.height, 1);
 
     /* QEMU's input layer does not clamp absolute axes. */
-    qemu_input_queue_abs(s->con, INPUT_AXIS_X,
+    qemu_input_queue_abs(con, INPUT_AXIS_X,
                          MIN(event->pointer.x, width - 1), 0, width);
-    qemu_input_queue_abs(s->con, INPUT_AXIS_Y,
+    qemu_input_queue_abs(con, INPUT_AXIS_Y,
                          MIN(event->pointer.y, height - 1), 0, height);
-    qemu_input_update_buttons(s->con, button_map, s->input_buttons,
+    qemu_input_update_buttons(con, button_map, s->input_buttons,
                               event->pointer.buttons);
     s->input_buttons = event->pointer.buttons;
     qemu_input_event_sync();
@@ -429,7 +453,7 @@ static void reims_graphics_input_pointer(ReimsGraphicsPCIState *s,
  * @notches wheel notches on one axis: a press and release of @up for each
  * notch above 0, of @down for each below.
  */
-static void reims_graphics_input_wheel_axis(ReimsGraphicsPCIState *s,
+static void reims_graphics_input_wheel_axis(QemuConsole *con,
                                             int32_t notches, InputButton up,
                                             InputButton down)
 {
@@ -438,8 +462,8 @@ static void reims_graphics_input_wheel_axis(ReimsGraphicsPCIState *s,
                         REIMS_GRAPHICS_PCI_WHEEL_MAX_NOTCHES);
 
     for (int64_t i = 0; i < count; i++) {
-        qemu_input_queue_btn(s->con, button, true);
-        qemu_input_queue_btn(s->con, button, false);
+        qemu_input_queue_btn(con, button, true);
+        qemu_input_queue_btn(con, button, false);
         qemu_input_event_sync();
     }
 }
@@ -448,7 +472,7 @@ static void reims_graphics_input_wheel_axis(ReimsGraphicsPCIState *s,
  * A scroll event: smooth scrolling where the device that takes the wheel
  * takes it, the event's notches elsewhere, up and left above 0.
  */
-static void reims_graphics_input_scroll(ReimsGraphicsPCIState *s,
+static void reims_graphics_input_scroll(QemuConsole *con,
                                         const RvgWindowScroll *scroll)
 {
     static const InputScrollPhase phases[] = {
@@ -468,11 +492,11 @@ static void reims_graphics_input_scroll(ReimsGraphicsPCIState *s,
     InputScrollPhase phase = INPUT_SCROLL_PHASE_NONE;
     InputScrollMomentum momentum = INPUT_SCROLL_MOMENTUM_NONE;
 
-    if (!qemu_input_scrolls_smoothly(s->con)) {
-        reims_graphics_input_wheel_axis(s, scroll->notches_dy,
+    if (!qemu_input_scrolls_smoothly(con)) {
+        reims_graphics_input_wheel_axis(con, scroll->notches_dy,
                                         INPUT_BUTTON_WHEEL_UP,
                                         INPUT_BUTTON_WHEEL_DOWN);
-        reims_graphics_input_wheel_axis(s, scroll->notches_dx,
+        reims_graphics_input_wheel_axis(con, scroll->notches_dx,
                                         INPUT_BUTTON_WHEEL_LEFT,
                                         INPUT_BUTTON_WHEEL_RIGHT);
         return;
@@ -484,14 +508,14 @@ static void reims_graphics_input_scroll(ReimsGraphicsPCIState *s,
         momentum = momenta[scroll->momentum];
     }
     /* 1/256 of the host's point, as 1/256 pixel. */
-    qemu_input_queue_scroll(s->con, INPUT_AXIS_Y, scroll->dy, phase,
+    qemu_input_queue_scroll(con, INPUT_AXIS_Y, scroll->dy, phase,
                             momentum);
-    qemu_input_queue_scroll(s->con, INPUT_AXIS_X, scroll->dx, phase,
+    qemu_input_queue_scroll(con, INPUT_AXIS_X, scroll->dx, phase,
                             momentum);
     qemu_input_event_sync();
 }
 
-static void reims_graphics_input_key(ReimsGraphicsPCIState *s, uint16_t usage,
+static void reims_graphics_input_key(QemuConsole *con, uint16_t usage,
                                      bool down)
 {
     unsigned int lnx = 0;
@@ -500,44 +524,45 @@ static void reims_graphics_input_key(ReimsGraphicsPCIState *s, uint16_t usage,
         lnx = qemu_input_map_usb_to_linux[usage];
     }
     if (lnx != 0) {
-        qemu_input_event_send_key_linux(s->con, lnx, down);
+        qemu_input_event_send_key_linux(con, lnx, down);
     }
 }
 
-/* ------ The guest's cursor, on the console ------ */
+/* ------ The guest's cursors, on the consoles ------ */
 
 /*
- * The console's cursor place and whether it shows. The library gives the
- * place of the hot spot; QEMU's displays take the image's top-left corner,
- * as virtio-gpu gives it, and SPICE adds the hot spot back.
+ * The console's cursor place and whether it shows, of @head's display. The
+ * library gives the place of the hot spot; QEMU's displays take the image's
+ * top-left corner, as virtio-gpu gives it, and SPICE adds the hot spot back.
  */
-static void reims_graphics_cursor_update(ReimsGraphicsPCIState *s)
+static void reims_graphics_cursor_update(ReimsGraphicsHead *head)
 {
+    ReimsGraphicsPCIState *s = head->s;
     RvgDisplayCoord at;
     int hot_x = 0;
     int hot_y = 0;
 
     assert(bql_locked());
-    if (!s->con || !s->device) {
+    if (!head->con || !s->device) {
         return;
     }
-    at = rvg_graphics_device_cursor_position(s->device);
-    if (s->cursor) {
-        hot_x = s->cursor->hot_x;
-        hot_y = s->cursor->hot_y;
+    at = rvg_graphics_device_cursor_position_at(s->device, head->index);
+    if (head->cursor) {
+        hot_x = head->cursor->hot_x;
+        hot_y = head->cursor->hot_y;
     }
-    qemu_console_set_mouse(s->con, at.x - hot_x, at.y - hot_y,
-                           s->cursor_show && s->cursor);
+    qemu_console_set_mouse(head->con, at.x - hot_x, at.y - hot_y,
+                           head->cursor_show && head->cursor);
 }
 
-static void reims_graphics_cursor_glyph(ReimsGraphicsPCIState *s,
+static void reims_graphics_cursor_glyph(ReimsGraphicsHead *head,
                                         ReimsGraphicsEvent *event)
 {
     const uint8_t *px = event->glyph.rgba;
     size_t count = (size_t)event->glyph.width * event->glyph.height;
     QEMUCursor *cursor;
 
-    if (!s->con) {
+    if (!head->con) {
         return;
     }
     cursor = cursor_alloc(event->glyph.width, event->glyph.height);
@@ -551,16 +576,17 @@ static void reims_graphics_cursor_glyph(ReimsGraphicsPCIState *s,
         cursor->data[i] = ((uint32_t)px[3] << 24) | ((uint32_t)px[0] << 16) |
                           ((uint32_t)px[1] << 8) | px[2];
     }
-    cursor_unref(s->cursor);
-    s->cursor = cursor;
-    qemu_console_set_cursor(s->con, cursor);
-    reims_graphics_cursor_update(s);
+    cursor_unref(head->cursor);
+    head->cursor = cursor;
+    qemu_console_set_cursor(head->con, cursor);
+    reims_graphics_cursor_update(head);
 }
 
 static void reims_graphics_event_bh(void *opaque)
 {
     ReimsGraphicsPCIState *s = opaque;
     ReimsGraphicsEvent *event;
+    ReimsGraphicsHead *head;
 
     assert(bql_locked());
     /* One at a time, so a nested run still takes them in order. */
@@ -575,22 +601,24 @@ static void reims_graphics_event_bh(void *opaque)
             break;
         }
         /*
-         * The teardown closed the console: an event a callback queued past it
+         * The teardown closed the consoles: an event a callback queued past it
          * (reims_graphics_pci_teardown) goes nowhere.
          */
-        if (!s->con) {
+        head = &s->heads[event->head];
+        if (!head->con) {
             reims_graphics_event_free(event);
             continue;
         }
         switch (event->kind) {
         case REIMS_GRAPHICS_EVENT_POINTER:
-            reims_graphics_input_pointer(s, event);
+            reims_graphics_input_pointer(s, head->con, event);
             break;
         case REIMS_GRAPHICS_EVENT_SCROLL:
-            reims_graphics_input_scroll(s, &event->scroll);
+            reims_graphics_input_scroll(head->con, &event->scroll);
             break;
         case REIMS_GRAPHICS_EVENT_KEY:
-            reims_graphics_input_key(s, event->key.usage, event->key.down);
+            reims_graphics_input_key(head->con, event->key.usage,
+                                     event->key.down);
             break;
         case REIMS_GRAPHICS_EVENT_CLOSE:
             /* As QEMU's own windows do: closing one powers the VM off. */
@@ -598,14 +626,14 @@ static void reims_graphics_event_bh(void *opaque)
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
             break;
         case REIMS_GRAPHICS_EVENT_CURSOR_GLYPH:
-            reims_graphics_cursor_glyph(s, event);
+            reims_graphics_cursor_glyph(head, event);
             break;
         case REIMS_GRAPHICS_EVENT_CURSOR_SHOW:
-            s->cursor_show = event->show;
-            reims_graphics_cursor_update(s);
+            head->cursor_show = event->show;
+            reims_graphics_cursor_update(head);
             break;
         case REIMS_GRAPHICS_EVENT_CURSOR_MOVE:
-            reims_graphics_cursor_update(s);
+            reims_graphics_cursor_update(head);
             break;
         default:
             g_assert_not_reached();
@@ -615,11 +643,12 @@ static void reims_graphics_event_bh(void *opaque)
 }
 
 /*
- * Queues @event behind every earlier one, on the window's thread (on macOS
- * the process's main thread, which QEMU leaves in its run loop under
- * -display none, and on Linux the library's reims-vgpu.ui thread) or on the
- * library's display thread, for the cursor. None of them holds the BQL, and
- * the window's may not block, so the BH runs the input and the cursor.
+ * Queues @event behind every earlier one of every display, on the windows'
+ * thread (on macOS the process's main thread, which QEMU leaves in its run
+ * loop under -display none, and on Linux the library's reims-vgpu.ui thread)
+ * or on the library's display thread, for the cursors. None of them holds the
+ * BQL, and the windows' may not block, so the BH runs the input and the
+ * cursors.
  */
 static void reims_graphics_event_push(ReimsGraphicsPCIState *s,
                                       ReimsGraphicsEvent *event)
@@ -630,91 +659,135 @@ static void reims_graphics_event_push(ReimsGraphicsPCIState *s,
     qemu_bh_schedule(s->event_bh);
 }
 
-static ReimsGraphicsEvent *reims_graphics_event_new(ReimsGraphicsEventKind kind)
+static ReimsGraphicsEvent *reims_graphics_event_new(ReimsGraphicsEventKind kind,
+                                                    uint32_t head)
 {
     ReimsGraphicsEvent *event = g_new0(ReimsGraphicsEvent, 1);
 
     event->kind = kind;
+    event->head = head;
     return event;
 }
 
+/* A window's callbacks, on the windows' thread: @ctx is its display's head. */
 static void reims_graphics_window_pointer_cb(void *ctx, uint16_t x, uint16_t y,
                                              uint16_t width, uint16_t height,
                                              uint32_t buttons)
 {
+    ReimsGraphicsHead *head = ctx;
     ReimsGraphicsEvent *event =
-        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_POINTER);
+        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_POINTER, head->index);
 
     event->pointer.x = x;
     event->pointer.y = y;
     event->pointer.width = width;
     event->pointer.height = height;
     event->pointer.buttons = buttons;
-    reims_graphics_event_push(ctx, event);
+    reims_graphics_event_push(head->s, event);
 }
 
 static void reims_graphics_window_scroll_cb(void *ctx,
                                             const RvgWindowScroll *scroll)
 {
+    ReimsGraphicsHead *head = ctx;
     ReimsGraphicsEvent *event =
-        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_SCROLL);
+        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_SCROLL, head->index);
 
     /* The fields the library's version has; the rest stay 0. */
     memcpy(&event->scroll, scroll,
            MIN(scroll->struct_size, sizeof(event->scroll)));
-    reims_graphics_event_push(ctx, event);
+    reims_graphics_event_push(head->s, event);
 }
 
 /* usage is a USB HID keyboard usage (page 0x07). */
 static void reims_graphics_window_key_cb(void *ctx, uint16_t usage, bool down)
 {
+    ReimsGraphicsHead *head = ctx;
     ReimsGraphicsEvent *event =
-        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_KEY);
+        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_KEY, head->index);
 
     event->key.usage = usage;
     event->key.down = down;
-    reims_graphics_event_push(ctx, event);
+    reims_graphics_event_push(head->s, event);
 }
 
 static void reims_graphics_window_close_cb(void *ctx)
 {
+    ReimsGraphicsHead *head = ctx;
     ReimsGraphicsEvent *event =
-        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CLOSE);
+        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CLOSE, head->index);
 
-    reims_graphics_event_push(ctx, event);
+    reims_graphics_event_push(head->s, event);
 }
 
-/* The cursor's callbacks, on the library's display thread. */
-static void reims_graphics_cursor_glyph_cb(void *ctx,
-                                           const RvgCursorGlyph *glyph)
+/*
+ * The cursors' callbacks, on the library's display thread: display 0's
+ * (cursor_glyph, cursor_show, cursor_move) and, naming it, each other
+ * display's (the _at three), for a display the device has.
+ */
+static void reims_graphics_cursor_glyph_at_cb(void *ctx, uint32_t display,
+                                              const RvgCursorGlyph *glyph)
 {
-    ReimsGraphicsEvent *event =
-        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_GLYPH);
+    ReimsGraphicsPCIState *s = ctx;
+    ReimsGraphicsEvent *event;
     /* height rows of width * 4 bytes */
     size_t length = (size_t)glyph->width * 4 * glyph->height;
 
+    if (display >= s->displays) {
+        return;
+    }
+    event = reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_GLYPH,
+                                     display);
     event->glyph.width = glyph->width;
     event->glyph.height = glyph->height;
     event->glyph.hot_spot = glyph->hot_spot;
     event->glyph.rgba = g_malloc0(length);
     memcpy(event->glyph.rgba, glyph->rgba, MIN(glyph->rgba_length, length));
-    reims_graphics_event_push(ctx, event);
+    reims_graphics_event_push(s, event);
+}
+
+static void reims_graphics_cursor_glyph_cb(void *ctx,
+                                           const RvgCursorGlyph *glyph)
+{
+    reims_graphics_cursor_glyph_at_cb(ctx, 0, glyph);
 }
 
 /* show is the library's byte: any value but 0 shows the cursor. */
+static void reims_graphics_cursor_show_at_cb(void *ctx, uint32_t display,
+                                             uint8_t show)
+{
+    ReimsGraphicsPCIState *s = ctx;
+    ReimsGraphicsEvent *event;
+
+    if (display >= s->displays) {
+        return;
+    }
+    event = reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_SHOW,
+                                     display);
+    event->show = show != 0;
+    reims_graphics_event_push(s, event);
+}
+
 static void reims_graphics_cursor_show_cb(void *ctx, uint8_t show)
 {
-    ReimsGraphicsEvent *event =
-        reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_SHOW);
+    reims_graphics_cursor_show_at_cb(ctx, 0, show);
+}
 
-    event->show = show != 0;
-    reims_graphics_event_push(ctx, event);
+static void reims_graphics_cursor_move_at_cb(void *ctx, uint32_t display)
+{
+    ReimsGraphicsPCIState *s = ctx;
+
+    if (display >= s->displays) {
+        return;
+    }
+    reims_graphics_event_push(
+        s, reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_MOVE,
+                                    display));
 }
 
 static void reims_graphics_cursor_move_cb(void *ctx)
 {
-    reims_graphics_event_push(
-        ctx, reims_graphics_event_new(REIMS_GRAPHICS_EVENT_CURSOR_MOVE));
+    reims_graphics_cursor_move_at_cb(ctx, 0);
 }
 
 /*
@@ -748,7 +821,7 @@ static bool reims_graphics_parse_resolution(const char *str, uint16_t *width,
 
 /*
  * Window mode: under -display none, QEMU shows no display of its own, and the
- * library opens a window for the display, unless REIMS_VGPU_WINDOW is "0".
+ * library opens a window for each display, unless REIMS_VGPU_WINDOW is "0".
  */
 static bool reims_graphics_window_wanted(void)
 {
@@ -998,10 +1071,10 @@ static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
 
 /* ------ Initialisation and startup ------ */
 
-/* ------ The console: what the display shows, read back ------ */
+/* ------ The consoles: what each display shows, read back ------ */
 
 typedef struct ReimsGraphicsReadJob {
-    ReimsGraphicsPCIState *s;
+    ReimsGraphicsHead *head;
     RvgGraphicsDevice *device;
     /* length bytes; the read fills height rows of width * 4, x8r8g8b8 */
     uint8_t *pixels;
@@ -1017,6 +1090,8 @@ static void reims_graphics_pci_read_done_bh(void *opaque);
 static int reims_graphics_pci_do_read(void *opaque)
 {
     ReimsGraphicsReadJob *job = opaque;
+    ReimsGraphicsHead *head = job->head;
+    ReimsGraphicsPCIState *s = head->s;
 
     /*
      * This runs on a pool thread, not under the BQL: the read waits for its
@@ -1024,22 +1099,24 @@ static int reims_graphics_pci_do_read(void *opaque)
      * so a buffer too small for the mode is made its size, and the read runs
      * once more.
      */
-    job->status = rvg_graphics_device_read_display(job->device, job->pixels,
-                                                   job->length, &job->width,
-                                                   &job->height);
+    job->status = rvg_graphics_device_read_display_at(job->device, head->index,
+                                                      job->pixels, job->length,
+                                                      &job->width,
+                                                      &job->height);
     if (job->status == RVG_ERR_INVALID_ARGUMENT &&
         (size_t)job->width * job->height * 4 > job->length) {
         job->length = (size_t)job->width * job->height * 4;
         job->pixels = g_realloc(job->pixels, job->length);
-        job->status = rvg_graphics_device_read_display(job->device,
-                                                       job->pixels,
-                                                       job->length,
-                                                       &job->width,
-                                                       &job->height);
+        job->status = rvg_graphics_device_read_display_at(job->device,
+                                                          head->index,
+                                                          job->pixels,
+                                                          job->length,
+                                                          &job->width,
+                                                          &job->height);
     }
-    WITH_QEMU_LOCK_GUARD(&job->s->read_lock) {
-        job->s->read_running = false;
-        qemu_cond_broadcast(&job->s->read_ended);
+    WITH_QEMU_LOCK_GUARD(&s->read_lock) {
+        head->read_running = false;
+        qemu_cond_broadcast(&s->read_ended);
     }
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             reims_graphics_pci_read_done_bh, job);
@@ -1049,29 +1126,29 @@ static int reims_graphics_pci_do_read(void *opaque)
 static void reims_graphics_pci_read_done_bh(void *opaque)
 {
     ReimsGraphicsReadJob *job = opaque;
-    ReimsGraphicsPCIState *s = job->s;
-    DisplaySurface *surface = s->surface;
+    ReimsGraphicsHead *head = job->head;
+    DisplaySurface *surface = head->surface;
     size_t stride = (size_t)job->width * 4;
     uint32_t y;
 
     assert(bql_locked());
-    s->reading = false;
-    s->read_late = false;
-    if (s->read_bound) {
-        timer_del(s->read_bound);
+    head->reading = false;
+    head->read_late = false;
+    if (head->read_bound) {
+        timer_del(head->read_bound);
     }
     if (job->status != RVG_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: rvg_graphics_device_read_display: %s\n",
-                      TYPE_REIMS_GRAPHICS_PCI,
+                      "%s: rvg_graphics_device_read_display_at %u: %s\n",
+                      TYPE_REIMS_GRAPHICS_PCI, head->index,
                       rvg_status_message(job->status));
-    } else if (s->con) {
+    } else if (head->con) {
         if (!surface || surface_width(surface) != job->width ||
             surface_height(surface) != job->height) {
             /* The console frees the surface it had. */
             surface = qemu_create_displaysurface(job->width, job->height);
-            s->surface = surface;
-            qemu_console_set_surface(s->con, surface);
+            head->surface = surface;
+            qemu_console_set_surface(head->con, surface);
         }
         /* The pixels have the surface's size and pixman's x8r8g8b8 layout. */
         for (y = 0; y < job->height; y++) {
@@ -1079,85 +1156,101 @@ static void reims_graphics_pci_read_done_bh(void *opaque)
                    (size_t)y * surface_stride(surface),
                    job->pixels + y * stride, stride);
         }
-        qemu_console_update_full(s->con);
+        qemu_console_update_full(head->con);
     }
-    g_free(s->pixels);
-    s->pixels = job->pixels;
-    s->pixels_length = job->length;
+    g_free(head->pixels);
+    head->pixels = job->pixels;
+    head->pixels_length = job->length;
     g_free(job);
     /*
      * The update gfx_update asked for, if one did, read or not: an update
      * that waits for it, a screendump's, never waits for another.
      */
-    qemu_console_hw_update_done(s->con);
+    qemu_console_hw_update_done(head->con);
 }
 
 /*
- * A read of the display REIMS_GRAPHICS_PCI_READ_LATE_MS after its start,
+ * A read of a display REIMS_GRAPHICS_PCI_READ_LATE_MS after its start,
  * still waiting for its draw on the GPU, which a GPU that stopped answering
  * never finishes: the read is late. An update waiting for it, a screendump's,
- * is answered now with what the console shows: the frame of the last read
- * that ended, or QEMU's placeholder where none has. So is every update until
- * the read ends, which starts no other read meanwhile: QMP runs one command at
+ * is answered now with what its console shows: the frame of the last read
+ * that ended, or QEMU's placeholder where none has. So is every update of
+ * the console until the read ends, which starts no other read of the display
+ * meanwhile: QMP runs one command at
  * a time, and a screendump's holds every monitor until it is answered. The
  * read's end updates the console as any read's does.
  */
 static void reims_graphics_pci_read_bound(void *opaque)
 {
-    ReimsGraphicsPCIState *s = opaque;
+    ReimsGraphicsHead *head = opaque;
 
     assert(bql_locked());
-    if (!s->reading) {
+    if (!head->reading) {
         return;
     }
-    s->read_late = true;
-    warn_report("%s: a read of the display still waits for its draw on the "
-                "GPU after %d ms: the console shows the last frame read until "
-                "it ends", TYPE_REIMS_GRAPHICS_PCI,
+    head->read_late = true;
+    warn_report("%s: a read of display %u still waits for its draw on the "
+                "GPU after %d ms: its console shows the last frame read until "
+                "it ends", TYPE_REIMS_GRAPHICS_PCI, head->index,
                 REIMS_GRAPHICS_PCI_READ_LATE_MS);
-    qemu_console_hw_update_done(s->con);
+    qemu_console_hw_update_done(head->con);
 }
 
 /*
- * QEMU's display system asks for the surface: a display change listener's
- * refresh, or a screendump. A read of the display starts, unless one is
- * under way, and signals the update done; it reads what the display shows
- * when it runs. An update while a read is under way waits for it, but for
- * REIMS_GRAPHICS_PCI_READ_LATE_MS from its start at most: once it is late,
- * an update is done at once (reims_graphics_pci_read_bound).
+ * QEMU's display system asks for a console's surface: a display change
+ * listener's refresh, or a screendump of its head. A read of the head's
+ * display starts, unless one is under way, and signals the update done; it
+ * reads what the display shows when it runs. An update while a read is under
+ * way waits for it, but for REIMS_GRAPHICS_PCI_READ_LATE_MS from its start at
+ * most: once it is late, an update is done at once
+ * (reims_graphics_pci_read_bound). Each display's reads are its own.
  */
 static bool reims_graphics_pci_gfx_update(void *opaque)
 {
-    ReimsGraphicsPCIState *s = opaque;
+    ReimsGraphicsHead *head = opaque;
+    ReimsGraphicsPCIState *s = head->s;
     ReimsGraphicsReadJob *job;
 
     assert(bql_locked());
-    if (s->reading) {
-        return s->read_late;
+    if (head->reading) {
+        return head->read_late;
     }
     if (!s->device || !s->pool) {
         return true;
     }
-    s->reading = true;
-    timer_mod(s->read_bound, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-                             REIMS_GRAPHICS_PCI_READ_LATE_MS);
+    head->reading = true;
+    timer_mod(head->read_bound, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                                REIMS_GRAPHICS_PCI_READ_LATE_MS);
     job = g_new0(ReimsGraphicsReadJob, 1);
-    job->s = s;
+    job->head = head;
     job->device = s->device;
-    job->pixels = s->pixels;
-    job->length = s->pixels_length;
-    s->pixels = NULL;
-    s->pixels_length = 0;
+    job->pixels = head->pixels;
+    job->length = head->pixels_length;
+    head->pixels = NULL;
+    head->pixels_length = 0;
     WITH_QEMU_LOCK_GUARD(&s->read_lock) {
-        s->read_running = true;
+        head->read_running = true;
     }
     thread_pool_submit_immediate(s->pool, reims_graphics_pci_do_read, job,
                                  NULL);
     return false;
 }
 
+/* Whether a read of any display is in the library (s->read_lock held). */
+static bool reims_graphics_pci_read_running(ReimsGraphicsPCIState *s)
+{
+    uint32_t i;
+
+    for (i = 0; i < RVG_GRAPHICS_DISPLAYS_MAX; i++) {
+        if (s->heads[i].read_running) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
- * Whether no read of the display is in the library, waiting for one under
+ * Whether no read of any display is in the library, waiting for those under
  * way at most REIMS_GRAPHICS_PCI_READ_END_MS: a read waits for its draw on
  * the GPU, which a GPU that stopped answering never finishes.
  */
@@ -1168,7 +1261,7 @@ static bool reims_graphics_pci_read_ended(ReimsGraphicsPCIState *s)
     int64_t left;
 
     QEMU_LOCK_GUARD(&s->read_lock);
-    while (s->read_running) {
+    while (reims_graphics_pci_read_running(s)) {
         left = deadline - qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         if (left <= 0) {
             return false;
@@ -1185,6 +1278,7 @@ static const GraphicHwOps reims_graphics_pci_console_ops = {
 static void reims_graphics_pci_init(Object *obj)
 {
     ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(obj);
+    uint32_t i;
 
     memory_region_init(&s->bar0, obj, "reims-graphics-pci.bar0",
                        RVG_GRAPHICS_REGISTERS_SIZE);
@@ -1202,20 +1296,24 @@ static void reims_graphics_pci_init(Object *obj)
     s->routes = g_hash_table_new(g_int64_hash, g_int64_equal);
     qemu_mutex_init(&s->read_lock);
     qemu_cond_init(&s->read_ended);
+    for (i = 0; i < RVG_GRAPHICS_DISPLAYS_MAX; i++) {
+        s->heads[i].s = s;
+        s->heads[i].index = i;
+    }
 }
 
 /*
  * Undoes what realize did, from its failure, at unrealize, or at QEMU's quit
  * (reims_graphics_pci_vm_state_change), with BAR 2 out of the guest's address
- * space; a second call finds nothing left to undo but what a read kept. A
- * read of the display under way ends first, as it uses the device: the
- * teardown waits for it at most REIMS_GRAPHICS_PCI_READ_END_MS, under the
+ * space; a second call finds nothing left to undo but what a read kept. The
+ * reads of the displays under way end first, as they use the device: the
+ * teardown waits for them at most REIMS_GRAPHICS_PCI_READ_END_MS, under the
  * BQL, and a read that waits for a GPU which stopped answering ends no
  * sooner. Past that the read keeps the device, its pool and the rest to the
  * process's exit, as a VM whose shutdown pauses it does, and the teardown says
- * so and returns; a second call waits for the read again. The release
+ * so and returns; a second call waits for the reads again. The release
  * of the library's last device waits, at most 5 s, for its threads and the
- * window's GPU work; its region stays mapped until they let it go. Of our
+ * windows' GPU work; its region stays mapped until they let it go. Of our
  * callbacks only route_doorbell takes the BQL, so at QEMU's quit (@quit) the
  * release, and nothing else, runs with the BQL let go: a route_doorbell
  * waiting for it takes it, finds the routes closed and returns, holding the
@@ -1225,11 +1323,11 @@ static void reims_graphics_pci_init(Object *obj)
  * realize that fails ran no guest, and the device is not hotpluggable, so no
  * unrealize comes while its guest runs. A callback can still run past the
  * release: a window's pointer, scroll, key or close already running on the
- * window's thread as the release closes the window, which waits for nothing,
+ * windows' thread as the release closes the windows, which waits for nothing,
  * and a cursor callback or raise_interrupt of a device thread the release's
  * 5 s left running. Such a callback still queues its event and schedules
  * event_bh, which stays to the exit for it and drops what it finds once the
- * console is closed, or writes the irqfd, which stays open for it, or
+ * consoles are closed, or writes the irqfd, which stays open for it, or
  * schedules a BH of its own: the device is not hotpluggable, so that is only
  * at QEMU's end.
  */
@@ -1238,30 +1336,35 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s, bool quit)
     PCIDevice *dev = PCI_DEVICE(s);
     RvgGraphicsDevice *device;
     ReimsGraphicsEvent *event;
+    ReimsGraphicsHead *head;
+    uint32_t i;
 
     if (s->vm_state) {
         qemu_del_vm_change_state_handler(s->vm_state);
         s->vm_state = NULL;
     }
-    if (s->con) {
-        /*
-         * A screendump waiting for the read under way is answered now, with
-         * what the console shows: the read's end updates no closed console,
-         * and QEMU's quit waits for the QMP dispatcher the screendump holds
-         * (monitor_cleanup).
-         */
-        qemu_console_hw_update_done(s->con);
-        qemu_graphic_console_close(s->con);
-        s->con = NULL;
-        s->surface = NULL;
+    for (i = 0; i < RVG_GRAPHICS_DISPLAYS_MAX; i++) {
+        head = &s->heads[i];
+        if (head->con) {
+            /*
+             * A screendump waiting for the read under way is answered now,
+             * with what the console shows: the read's end updates no closed
+             * console, and QEMU's quit waits for the QMP dispatcher the
+             * screendump holds (monitor_cleanup).
+             */
+            qemu_console_hw_update_done(head->con);
+            qemu_graphic_console_close(head->con);
+            head->con = NULL;
+            head->surface = NULL;
+        }
+        /* The bound serves the console's updates, which have ended. */
+        timer_free(head->read_bound);
+        head->read_bound = NULL;
     }
-    /* The bound serves the console's updates, which have ended. */
-    timer_free(s->read_bound);
-    s->read_bound = NULL;
-    /* A read under way ends first: it uses the device. */
+    /* The reads under way end first: they use the device. */
     if (s->pool) {
         if (!reims_graphics_pci_read_ended(s)) {
-            warn_report("%s: a read of the display still waits for its draw "
+            warn_report("%s: a read of a display still waits for its draw "
                         "on the GPU after %d ms: the device stays to the exit",
                         TYPE_REIMS_GRAPHICS_PCI,
                         REIMS_GRAPHICS_PCI_READ_END_MS);
@@ -1270,9 +1373,12 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s, bool quit)
         thread_pool_free(s->pool);
         s->pool = NULL;
     }
-    g_free(s->pixels);
-    s->pixels = NULL;
-    s->pixels_length = 0;
+    for (i = 0; i < RVG_GRAPHICS_DISPLAYS_MAX; i++) {
+        head = &s->heads[i];
+        g_free(head->pixels);
+        head->pixels = NULL;
+        head->pixels_length = 0;
+    }
     reims_graphics_routes_close(s);
     if (s->doorbell_added) {
         memory_region_del_eventfd(&s->registers, RVG_GRAPHICS_REG_DOORBELL,
@@ -1305,8 +1411,10 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s, bool quit)
             reims_graphics_event_free(event);
         }
     }
-    cursor_unref(s->cursor);
-    s->cursor = NULL;
+    for (i = 0; i < RVG_GRAPHICS_DISPLAYS_MAX; i++) {
+        cursor_unref(s->heads[i].cursor);
+        s->heads[i].cursor = NULL;
+    }
 }
 
 typedef struct ReimsGraphicsMemoryWalk {
@@ -1442,7 +1550,7 @@ static void reims_graphics_pci_check_low_ram(void)
  * -no-shutdown) keeps the device, which the guest uses again after a reset,
  * and then so does its quit, as does a quit of a VM stopped before it: no
  * handler hears it. The device then stays to the exit, as before. So does it
- * when a read of the display under way still waits for the GPU 5 s into the
+ * when a read of a display under way still waits for the GPU 5 s into the
  * teardown (reims_graphics_pci_teardown).
  */
 static void reims_graphics_pci_vm_state_change(void *opaque, bool running,
@@ -1472,20 +1580,15 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .route_doorbell = reims_graphics_route_doorbell_cb,
         .route_doorbell_page = reims_graphics_route_doorbell_page_cb,
 #endif
+        .cursor_glyph_at = reims_graphics_cursor_glyph_at_cb,
+        .cursor_show_at = reims_graphics_cursor_show_at_cb,
+        .cursor_move_at = reims_graphics_cursor_move_at_cb,
     };
-    RvgWindowCallbacks window_callbacks = {
-        .struct_size = sizeof(window_callbacks),
-        .ctx = s,
-        .pointer = reims_graphics_window_pointer_cb,
-        .key = reims_graphics_window_key_cb,
-        .close = reims_graphics_window_close_cb,
-        .scroll = reims_graphics_window_scroll_cb,
-    };
-    /* The library opens the window at the mode, and ignores the flags. */
-    RvgWindowConfig window_config = {
-        .struct_size = sizeof(window_config),
-        .callbacks = &window_callbacks,
-    };
+    /* Each display's window, its callbacks' ctx the display's head. */
+    RvgWindowCallbacks window_callbacks[RVG_GRAPHICS_DISPLAYS_MAX];
+    RvgWindowConfig window_configs[RVG_GRAPHICS_DISPLAYS_MAX];
+    const RvgWindowConfig *display_windows[RVG_GRAPHICS_DISPLAYS_MAX - 1];
+    bool window = reims_graphics_window_wanted();
     /*
      * The guest's architecture is this QEMU's target: the device answers an
      * arm64 guest's Metal as an Apple silicon Mac's GPU answers where the two
@@ -1494,7 +1597,6 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     RvgGraphicsDeviceConfig config = {
         .struct_size = sizeof(config),
         .callbacks = &callbacks,
-        .window = reims_graphics_window_wanted() ? &window_config : NULL,
         .guest_arch = target_aarch64() ? RVG_GUEST_ARCH_ARM64
                                        : RVG_GUEST_ARCH_X86_64,
         /* BAR 4 is registered below, its writes sent to the library. */
@@ -1510,13 +1612,50 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     };
     RvgMemoryMap memory_map;
     RvgStatus status;
+    uint16_t mode_width = 0;
+    uint16_t mode_height = 0;
     uint8_t *base;
     uint64_t size;
+    uint32_t i;
 
-    if (!reims_graphics_parse_resolution(s->resolution,
-                                         &window_config.mode_width,
-                                         &window_config.mode_height, errp)) {
+    if (s->displays < 1 || s->displays > RVG_GRAPHICS_DISPLAYS_MAX) {
+        error_setg(errp, "%s: displays must be 1 to %d, not %" PRIu32,
+                   TYPE_REIMS_GRAPHICS_PCI, RVG_GRAPHICS_DISPLAYS_MAX,
+                   s->displays);
         return;
+    }
+    if (!reims_graphics_parse_resolution(s->resolution, &mode_width,
+                                         &mode_height, errp)) {
+        return;
+    }
+    /*
+     * Under -display none, a window per display, each at the resolution
+     * property's size: the library opens it at that mode, and ignores the
+     * flags.
+     */
+    for (i = 0; i < s->displays; i++) {
+        window_callbacks[i] = (RvgWindowCallbacks) {
+            .struct_size = sizeof(window_callbacks[i]),
+            .ctx = &s->heads[i],
+            .pointer = reims_graphics_window_pointer_cb,
+            .key = reims_graphics_window_key_cb,
+            .close = reims_graphics_window_close_cb,
+            .scroll = reims_graphics_window_scroll_cb,
+        };
+        window_configs[i] = (RvgWindowConfig) {
+            .struct_size = sizeof(window_configs[i]),
+            .callbacks = &window_callbacks[i],
+            .mode_width = mode_width,
+            .mode_height = mode_height,
+        };
+        if (i > 0) {
+            display_windows[i - 1] = &window_configs[i];
+        }
+    }
+    config.display_count = s->displays;
+    if (window) {
+        config.window = &window_configs[0];
+        config.display_windows = s->displays > 1 ? display_windows : NULL;
     }
     reims_graphics_pci_check_low_ram();
 
@@ -1567,7 +1706,7 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                     TYPE_REIMS_GRAPHICS_PCI);
     }
 
-    /* The window's input runs from here on; the callbacks need the BHs. */
+    /* The windows' input runs from here on; the callbacks need the BHs. */
     s->event_bh = qemu_bh_new(reims_graphics_event_bh, s);
     status = rvg_graphics_device_create(&config, &s->device);
     if (status != RVG_OK) {
@@ -1631,14 +1770,19 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                      PCI_BASE_ADDRESS_MEM_PREFETCH, &s->region);
 
     /*
-     * The source of the window's input, the head QEMU's UI names, and what
-     * the display shows, which its reads run in the pool for.
+     * Each display's console: the source of its window's input, head i of
+     * QEMU's UI, and what the display shows, which its reads run in the pool
+     * for.
      */
     s->pool = thread_pool_new();
-    s->read_bound = timer_new_ms(QEMU_CLOCK_REALTIME,
-                                 reims_graphics_pci_read_bound, s);
-    s->con = qemu_graphic_console_create(DEVICE(dev), 0,
-                                         &reims_graphics_pci_console_ops, s);
+    for (i = 0; i < s->displays; i++) {
+        ReimsGraphicsHead *head = &s->heads[i];
+
+        head->read_bound = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                        reims_graphics_pci_read_bound, head);
+        head->con = qemu_graphic_console_create(
+            DEVICE(dev), i, &reims_graphics_pci_console_ops, head);
+    }
     s->vm_state = qemu_add_vm_change_state_handler(
         reims_graphics_pci_vm_state_change, s);
     return;
@@ -1686,6 +1830,7 @@ static void reims_graphics_pci_finalize(Object *obj)
 
 static const Property reims_graphics_pci_properties[] = {
     DEFINE_PROP_STRING("resolution", ReimsGraphicsPCIState, resolution),
+    DEFINE_PROP_UINT32("displays", ReimsGraphicsPCIState, displays, 1),
 };
 
 static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
