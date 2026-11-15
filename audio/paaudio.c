@@ -40,12 +40,22 @@ typedef struct {
     AudioPa *g;
 } PAVoiceOut;
 
+/*
+ * A capture voice has a record stream only while the voice is enabled, so
+ * the host's sound server lists a recording client only while the guest
+ * captures. What the stream opens with, and the guest's last volume for
+ * it, are kept with the voice.
+ */
 typedef struct {
     HWVoiceIn hw;
     pa_stream *stream;
     const void *read_data;
     size_t read_length;
     AudioPa *g;
+    pa_sample_spec ss;
+    pa_buffer_attr ba;
+    bool has_volume;
+    Volume volume;
 } PAVoiceIn;
 
 static void qpa_conn_fini(PAConnection *c);
@@ -92,8 +102,15 @@ static void *qpa_get_buffer_in(HWVoiceIn *hw, size_t *size)
 
     pa_threaded_mainloop_lock(c->mainloop);
 
+    if (!p->stream) {
+        goto unlock_empty;
+    }
     CHECK_DEAD_GOTO(c, p->stream, unlock_and_fail,
                     "pa_threaded_mainloop_lock failed");
+    if (pa_stream_get_state(p->stream) != PA_STREAM_READY) {
+        /* wait for stream to become ready */
+        goto unlock_empty;
+    }
 
     if (!p->read_length) {
         r = pa_stream_peek(p->stream, &p->read_data, &p->read_length);
@@ -107,6 +124,7 @@ static void *qpa_get_buffer_in(HWVoiceIn *hw, size_t *size)
     return (void *) p->read_data;
 
 unlock_and_fail:
+unlock_empty:
     pa_threaded_mainloop_unlock(c->mainloop);
     *size = 0;
     return NULL;
@@ -120,6 +138,9 @@ static void qpa_put_buffer_in(HWVoiceIn *hw, void *buf, size_t size)
 
     pa_threaded_mainloop_lock(c->mainloop);
 
+    if (!p->stream) {
+        goto unlock;
+    }
     CHECK_DEAD_GOTO(c, p->stream, unlock,
                     "pa_threaded_mainloop_lock failed");
 
@@ -145,6 +166,9 @@ static size_t qpa_read(HWVoiceIn *hw, void *data, size_t length)
 
     pa_threaded_mainloop_lock(c->mainloop);
 
+    if (!p->stream) {
+        goto unlock;
+    }
     CHECK_DEAD_GOTO(c, p->stream, unlock_and_fail,
                     "pa_threaded_mainloop_lock failed");
     if (pa_stream_get_state(p->stream) != PA_STREAM_READY) {
@@ -398,6 +422,54 @@ static void stream_state_cb (pa_stream *s, void * userdata)
     }
 }
 
+/* The channel map of a stream of CHANNELS, false where none is known */
+static bool qpa_channel_map_init(pa_channel_map *map, int channels)
+{
+    pa_channel_map_init(map);
+    map->channels = channels;
+
+    /*
+     * TODO: This currently expects the only frontend supporting more than 2
+     * channels is the usb-audio.  We will need some means to set channel
+     * order when a new frontend gains multi-channel support.
+     */
+    switch (channels) {
+    case 1:
+        map->map[0] = PA_CHANNEL_POSITION_MONO;
+        break;
+
+    case 2:
+        map->map[0] = PA_CHANNEL_POSITION_LEFT;
+        map->map[1] = PA_CHANNEL_POSITION_RIGHT;
+        break;
+
+    case 6:
+        map->map[0] = PA_CHANNEL_POSITION_FRONT_LEFT;
+        map->map[1] = PA_CHANNEL_POSITION_FRONT_RIGHT;
+        map->map[2] = PA_CHANNEL_POSITION_CENTER;
+        map->map[3] = PA_CHANNEL_POSITION_LFE;
+        map->map[4] = PA_CHANNEL_POSITION_REAR_LEFT;
+        map->map[5] = PA_CHANNEL_POSITION_REAR_RIGHT;
+        break;
+
+    case 8:
+        map->map[0] = PA_CHANNEL_POSITION_FRONT_LEFT;
+        map->map[1] = PA_CHANNEL_POSITION_FRONT_RIGHT;
+        map->map[2] = PA_CHANNEL_POSITION_CENTER;
+        map->map[3] = PA_CHANNEL_POSITION_LFE;
+        map->map[4] = PA_CHANNEL_POSITION_REAR_LEFT;
+        map->map[5] = PA_CHANNEL_POSITION_REAR_RIGHT;
+        map->map[6] = PA_CHANNEL_POSITION_SIDE_LEFT;
+        map->map[7] = PA_CHANNEL_POSITION_SIDE_RIGHT;
+        break;
+
+    default:
+        error_report("pulseaudio: unsupported channel count %d", channels);
+        return false;
+    }
+    return true;
+}
+
 static pa_stream *qpa_simple_new (
         PAConnection *c,
         const char *name,
@@ -405,6 +477,8 @@ static pa_stream *qpa_simple_new (
         const char *dev,
         const pa_sample_spec *ss,
         const pa_buffer_attr *attr,
+        pa_stream_notify_cb_t state_cb,
+        void *state_userdata,
         int *rerror)
 {
     int r;
@@ -414,46 +488,7 @@ static pa_stream *qpa_simple_new (
 
     pa_threaded_mainloop_lock(c->mainloop);
 
-    pa_channel_map_init(&map);
-    map.channels = ss->channels;
-
-    /*
-     * TODO: This currently expects the only frontend supporting more than 2
-     * channels is the usb-audio.  We will need some means to set channel
-     * order when a new frontend gains multi-channel support.
-     */
-    switch (ss->channels) {
-    case 1:
-        map.map[0] = PA_CHANNEL_POSITION_MONO;
-        break;
-
-    case 2:
-        map.map[0] = PA_CHANNEL_POSITION_LEFT;
-        map.map[1] = PA_CHANNEL_POSITION_RIGHT;
-        break;
-
-    case 6:
-        map.map[0] = PA_CHANNEL_POSITION_FRONT_LEFT;
-        map.map[1] = PA_CHANNEL_POSITION_FRONT_RIGHT;
-        map.map[2] = PA_CHANNEL_POSITION_CENTER;
-        map.map[3] = PA_CHANNEL_POSITION_LFE;
-        map.map[4] = PA_CHANNEL_POSITION_REAR_LEFT;
-        map.map[5] = PA_CHANNEL_POSITION_REAR_RIGHT;
-        break;
-
-    case 8:
-        map.map[0] = PA_CHANNEL_POSITION_FRONT_LEFT;
-        map.map[1] = PA_CHANNEL_POSITION_FRONT_RIGHT;
-        map.map[2] = PA_CHANNEL_POSITION_CENTER;
-        map.map[3] = PA_CHANNEL_POSITION_LFE;
-        map.map[4] = PA_CHANNEL_POSITION_REAR_LEFT;
-        map.map[5] = PA_CHANNEL_POSITION_REAR_RIGHT;
-        map.map[6] = PA_CHANNEL_POSITION_SIDE_LEFT;
-        map.map[7] = PA_CHANNEL_POSITION_SIDE_RIGHT;
-        break;
-
-    default:
-        error_report("pulseaudio: unsupported channel count %d", ss->channels);
+    if (!qpa_channel_map_init(&map, ss->channels)) {
         goto fail;
     }
 
@@ -462,7 +497,7 @@ static pa_stream *qpa_simple_new (
         goto fail;
     }
 
-    pa_stream_set_state_callback(stream, stream_state_cb, c);
+    pa_stream_set_state_callback(stream, state_cb, state_userdata);
 
     flags = PA_STREAM_EARLY_REQUESTS;
 
@@ -530,6 +565,8 @@ static int qpa_init_out(HWVoiceOut *hw, struct audsettings *as)
         ppdo->name,
         &ss,
         &ba,                    /* buffering attributes */
+        stream_state_cb,
+        c,
         &error
         );
     if (!pa->stream) {
@@ -552,41 +589,30 @@ static int qpa_init_in(HWVoiceIn *hw, struct audsettings *as)
 {
     AudioMixengBackend *amb = hw->s;
     AudioPa *apa = AUDIO_PA(amb);
-    int error;
-    pa_sample_spec ss;
-    pa_buffer_attr ba;
     struct audsettings obt_as = *as;
     PAVoiceIn *pa = (PAVoiceIn *) hw;
     AudiodevPaOptions *popts = &amb->dev->u.pa;
     AudiodevPaPerDirectionOptions *ppdo = popts->in;
-    PAConnection *c = apa->conn;
+    pa_channel_map map;
 
     pa->g = apa;
-    ss.format = audfmt_to_pa (as->fmt, as->big_endian);
-    ss.channels = as->nchannels;
-    ss.rate = as->freq;
+    pa->ss.format = audfmt_to_pa (as->fmt, as->big_endian);
+    pa->ss.channels = as->nchannels;
+    pa->ss.rate = as->freq;
 
-    ba.fragsize = pa_usec_to_bytes((amb->dev->timer_period >> 1) * 3, &ss);
-    ba.maxlength = pa_usec_to_bytes(
-        MAX(ppdo->latency, amb->dev->timer_period * 3), &ss);
-    ba.minreq = -1;
-    ba.prebuf = -1;
+    pa->ba.fragsize = pa_usec_to_bytes((amb->dev->timer_period >> 1) * 3,
+                                       &pa->ss);
+    pa->ba.maxlength = pa_usec_to_bytes(
+        MAX(ppdo->latency, amb->dev->timer_period * 3), &pa->ss);
+    pa->ba.minreq = -1;
+    pa->ba.prebuf = -1;
 
-    obt_as.fmt = pa_to_audfmt (ss.format, &obt_as.big_endian);
-
-    pa->stream = qpa_simple_new (
-        c,
-        ppdo->stream_name ?: amb->dev->id,
-        PA_STREAM_RECORD,
-        ppdo->name,
-        &ss,
-        &ba,                    /* buffering attributes */
-        &error
-        );
-    if (!pa->stream) {
-        qpa_logerr(error, "pa_simple_new for capture failed");
-        goto fail1;
+    /* What the record stream would refuse, refused before it is opened */
+    if (!qpa_channel_map_init(&map, pa->ss.channels)) {
+        return -1;
     }
+
+    obt_as.fmt = pa_to_audfmt (pa->ss.format, &obt_as.big_endian);
 
     audio_pcm_init_info (&hw->info, &obt_as);
     /* hw->samples counts in frames */
@@ -594,9 +620,6 @@ static int qpa_init_in(HWVoiceIn *hw, struct audsettings *as)
         qapi_AudiodevPaPerDirectionOptions_base(ppdo), &obt_as, 46440);
 
     return 0;
-
- fail1:
-    return -1;
 }
 
 static void qpa_simple_disconnect(PAConnection *c, pa_stream *stream)
@@ -632,10 +655,8 @@ static void qpa_fini_out (HWVoiceOut *hw)
     }
 }
 
-static void qpa_fini_in (HWVoiceIn *hw)
+static void qpa_close_in(PAVoiceIn *pa)
 {
-    PAVoiceIn *pa = (PAVoiceIn *) hw;
-
     if (pa->stream) {
         PAConnection *c = pa->g->conn;
 
@@ -652,6 +673,11 @@ static void qpa_fini_in (HWVoiceIn *hw)
         pa->stream = NULL;
         pa_threaded_mainloop_unlock(c->mainloop);
     }
+}
+
+static void qpa_fini_in (HWVoiceIn *hw)
+{
+    qpa_close_in((PAVoiceIn *) hw);
 }
 
 static void qpa_volume_out(HWVoiceOut *hw, Volume *vol)
@@ -694,12 +720,12 @@ static void qpa_volume_out(HWVoiceOut *hw, Volume *vol)
     pa_threaded_mainloop_unlock(c->mainloop);
 }
 
-static void qpa_volume_in(HWVoiceIn *hw, Volume *vol)
+/* Give a record stream the guest's volume, with the mainloop locked */
+static void qpa_set_source_output_volume(PAConnection *c, pa_stream *stream,
+                                         Volume *vol)
 {
-    PAVoiceIn *pa = (PAVoiceIn *) hw;
     pa_operation *op;
     pa_cvolume v;
-    PAConnection *c = pa->g->conn;
     int i;
 
     pa_cvolume_init(&v);
@@ -709,10 +735,8 @@ static void qpa_volume_in(HWVoiceIn *hw, Volume *vol)
         v.values[i] = ((PA_VOLUME_NORM - PA_VOLUME_MUTED) * vol->vol[i]) / 255;
     }
 
-    pa_threaded_mainloop_lock(c->mainloop);
-
     op = pa_context_set_source_output_volume(c->context,
-        pa_stream_get_index(pa->stream),
+        pa_stream_get_index(stream),
         &v, NULL, NULL);
     if (!op) {
         qpa_logerr(pa_context_errno(c->context),
@@ -722,7 +746,7 @@ static void qpa_volume_in(HWVoiceIn *hw, Volume *vol)
     }
 
     op = pa_context_set_source_output_mute(c->context,
-        pa_stream_get_index(pa->stream),
+        pa_stream_get_index(stream),
         vol->mute, NULL, NULL);
     if (!op) {
         qpa_logerr(pa_context_errno(c->context),
@@ -730,8 +754,67 @@ static void qpa_volume_in(HWVoiceIn *hw, Volume *vol)
     } else {
         pa_operation_unref(op);
     }
+}
+
+static void qpa_volume_in(HWVoiceIn *hw, Volume *vol)
+{
+    PAVoiceIn *pa = (PAVoiceIn *) hw;
+    PAConnection *c = pa->g->conn;
+
+    pa_threaded_mainloop_lock(c->mainloop);
+
+    pa->volume = *vol;
+    pa->has_volume = true;
+    if (pa->stream && pa_stream_get_state(pa->stream) == PA_STREAM_READY) {
+        qpa_set_source_output_volume(c, pa->stream, vol);
+    }
 
     pa_threaded_mainloop_unlock(c->mainloop);
+}
+
+/* A record stream takes the guest's last volume as it becomes ready */
+static void record_state_cb(pa_stream *s, void *userdata)
+{
+    PAVoiceIn *pa = userdata;
+
+    if (pa_stream_get_state(s) == PA_STREAM_READY && pa->has_volume) {
+        qpa_set_source_output_volume(pa->g->conn, s, &pa->volume);
+    }
+    stream_state_cb(s, pa->g->conn);
+}
+
+/*
+ * The record stream opens as the guest's capture starts, and closes as it
+ * stops.
+ */
+static void qpa_enable_in(HWVoiceIn *hw, bool enable)
+{
+    PAVoiceIn *pa = (PAVoiceIn *) hw;
+    AudioMixengBackend *amb = hw->s;
+    AudiodevPaPerDirectionOptions *ppdo = amb->dev->u.pa.in;
+    int error;
+
+    if (!enable) {
+        qpa_close_in(pa);
+        return;
+    }
+    if (pa->stream) {
+        return;
+    }
+    pa->stream = qpa_simple_new (
+        pa->g->conn,
+        ppdo->stream_name ?: amb->dev->id,
+        PA_STREAM_RECORD,
+        ppdo->name,
+        &pa->ss,
+        &pa->ba,                /* buffering attributes */
+        record_state_cb,
+        pa,
+        &error
+        );
+    if (!pa->stream) {
+        qpa_logerr(error, "pa_simple_new for capture failed");
+    }
 }
 
 static void qpa_validate_per_direction_opts(Audiodev *dev,
@@ -916,6 +999,7 @@ static void audio_pa_class_init(ObjectClass *klass, const void *data)
     k->read = qpa_read;
     k->get_buffer_in = qpa_get_buffer_in;
     k->put_buffer_in = qpa_put_buffer_in;
+    k->enable_in = qpa_enable_in;
     k->volume_in = qpa_volume_in;
 }
 
