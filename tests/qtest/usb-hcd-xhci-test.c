@@ -48,6 +48,8 @@
 #define HCCP1_LTC               (1 << 6)
 
 #define TRB_C                   (1 << 0)
+#define TRB_TR_ISP              (1 << 2)
+#define TRB_TR_CH               (1 << 4)
 #define TRB_TR_IOC              (1 << 5)
 #define TRB_TR_BEI              (1 << 9)
 #define TRB_TR_SIA              (1U << 31)
@@ -82,7 +84,9 @@
 #define CC_TRB_ERROR            5
 #define CC_STALL_ERROR          6
 #define CC_SLOT_NOT_ENABLED     11
+#define CC_SHORT_PACKET         13
 #define CC_RING_UNDERRUN        14
+#define CC_RING_OVERRUN         15
 
 #define SPEED_ID_HIGH           3
 
@@ -802,6 +806,114 @@ static void xhci_clear_ip(XHCITest *x)
 }
 
 /*
+ * Fetch the next event, which has to be a Transfer Event, and return its
+ * TRB pointer. Does not advance the clock.
+ */
+static uint64_t xhci_transfer_event(XHCITest *x, uint32_t *status)
+{
+    uint64_t trb = qtest_readq(x->qts, x->event_ring + 16 * x->event_idx);
+    uint32_t control;
+
+    g_assert_true(xhci_next_event(x, status, &control));
+    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
+    return trb;
+}
+
+/*
+ * A Short Packet ends a TD's data on the TRB it meets, which reports it if
+ * it has ISP or IOC, and each later TRB of the TD with IOC reports it again
+ * with the same residue (xHCI 4.10.1.1.2): software takes the TD as
+ * complete only at the event of its last TRB. macOS queues an isoch IN TD
+ * that crosses a page as an Isoch TRB with ISP chained to a Normal TRB with
+ * ISP and IOC, and waits for the second event. Without it, it took each
+ * later event of the endpoint as mismatched and a camera's stream stopped.
+ * usb-kbd answers each TD on its interrupt endpoint with an 8-byte report;
+ * typed isoch, the endpoint takes an Isoch TRB, and its empty ring is then
+ * reported after the TD.
+ */
+static void test_xhci_short_packet(void)
+{
+    static const struct {
+        unsigned int ep_type, interval;
+        uint32_t len[2], control[2];
+        bool ip;
+        struct {
+            unsigned int trb, ccode, length;
+        } events[2];
+        unsigned int nr_events;
+    } cases[] = {
+        /* ISP on the first TRB and IOC on the last: two events, no IRQ */
+        { EP_TYPE_INTR_IN, 3, { 16, 8 },
+          { TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_CH | TRB_TR_BEI,
+            TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_IOC | TRB_TR_BEI },
+          false, { { 0, CC_SHORT_PACKET, 8 }, { 1, CC_SHORT_PACKET, 8 } }, 2 },
+        /* ISP and IOC on the first TRB: one event for it */
+        { EP_TYPE_INTR_IN, 3, { 16, 8 },
+          { TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_IOC | TRB_TR_CH,
+            TRB_TYPE(TR_NORMAL) | TRB_TR_IOC },
+          true, { { 0, CC_SHORT_PACKET, 8 }, { 1, CC_SHORT_PACKET, 8 } }, 2 },
+        /* IOC on a TRB filled before the short one */
+        { EP_TYPE_INTR_IN, 3, { 8, 8 },
+          { TRB_TYPE(TR_NORMAL) | TRB_TR_IOC | TRB_TR_CH,
+            TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_IOC },
+          true, { { 0, CC_SUCCESS, 0 }, { 1, CC_SHORT_PACKET, 8 } }, 2 },
+        /* no Short Packet: the last TRB's event alone */
+        { EP_TYPE_INTR_IN, 3, { 4, 4 },
+          { TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_CH,
+            TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_IOC },
+          true, { { 1, CC_SUCCESS, 0 } }, 1 },
+        /* macOS's isoch IN TD */
+        { EP_TYPE_ISOCH_IN, 0, { 16, 8 },
+          { TRB_TYPE(TR_ISOCH) | TRB_TR_SIA | TRB_TR_ISP | TRB_TR_CH |
+            TRB_TR_BEI,
+            TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_IOC | TRB_TR_BEI },
+          true, { { 0, CC_SHORT_PACKET, 8 }, { 1, CC_SHORT_PACKET, 8 } }, 2 },
+    };
+    uint32_t status;
+    uint64_t ring;
+    XHCITest x;
+    int i, j;
+
+    if (!xhci_test_supported("usb-kbd")) {
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(cases); i++) {
+        xhci_test_start(&x, "-device usb-kbd");
+        ring = xhci_configure_ep(&x, 3, cases[i].ep_type, cases[i].interval,
+                                 8);
+        xhci_clear_ip(&x);
+        qtest_qmp_assert_success(x.qts,
+            "{'execute': 'send-key', 'arguments': "
+            "{'keys': [{'type': 'qcode', 'data': 'a'}]}}");
+
+        for (j = 0; j < 2; j++) {
+            xhci_write_trb(&x, ring + 16 * j, xhci_alloc_page(&x),
+                           cases[i].len[j], cases[i].control[j] | TRB_C);
+        }
+        xhci_writel(&x, x.doorbell + 4 * x.slot, 3);
+        qtest_clock_step(x.qts, 16 * XHCI_MICROFRAME_NS);
+
+        g_assert_cmpuint(xhci_ip(&x), ==, cases[i].ip);
+        for (j = 0; j < cases[i].nr_events; j++) {
+            g_assert_cmphex(xhci_transfer_event(&x, &status), ==,
+                            ring + 16 * cases[i].events[j].trb);
+            g_assert_cmpuint(TRB_GET_CCODE(status), ==,
+                             cases[i].events[j].ccode);
+            g_assert_cmpuint(TRB_GET_PARAM(status), ==,
+                             cases[i].events[j].length);
+        }
+        if (cases[i].ep_type == EP_TYPE_ISOCH_IN) {
+            g_assert_cmphex(xhci_transfer_event(&x, &status), ==, ring + 32);
+            g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_RING_OVERRUN);
+        }
+        g_assert_false(xhci_next_event(&x, NULL, NULL));
+
+        xhci_test_end(&x);
+    }
+}
+
+/*
  * Interrupt moderation (xHCI 4.17.2): IMODI defaults to 4000 (1 ms). Once
  * the interrupter asserts, IMODC counts IMODI down, and an event posted
  * meanwhile asserts it only when IMODC reaches 0. An event posted after the
@@ -1046,6 +1158,7 @@ int main(int argc, char **argv)
     qtest_add_func("/xhci/pci/stopped-ep-wakeup",
                    test_xhci_stopped_ep_wakeup);
     qtest_add_func("/xhci/pci/bei", test_xhci_bei);
+    qtest_add_func("/xhci/pci/short-packet", test_xhci_short_packet);
     qtest_add_func("/xhci/pci/imod", test_xhci_imod);
     qtest_add_func("/xhci/pci/set-ltv", test_xhci_set_ltv);
     qtest_add_func("/xhci/pci/command-completion-fields",

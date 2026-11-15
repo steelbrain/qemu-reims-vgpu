@@ -1594,12 +1594,34 @@ err:
     return -1;
 }
 
+/*
+ * Post the Transfer Events of a transfer's TDs (xHCI 4.10.1.1). Without a
+ * Short Packet, each TRB with IOC posts Success. A Short Packet ends the
+ * data of its TD on the TRB it meets: that TRB posts Short Packet with its
+ * residue if it has ISP or IOC, and that event is the TD Completion Event.
+ * The xHC then advances to the end of the TD, and each later Transfer TRB
+ * with IOC posts Short Packet too, with the TD Completion Event's residue
+ * (4.10.1.1.2): a TD of TRBs with ISP whose last TRB has IOC posts two
+ * events, and software does not take the TD as complete before the one
+ * that points at its last TRB. An Event Data TRB after the Short Packet is
+ * parsed only if no event completed the TD yet, and then only the first
+ * (PAE is 0, 4.10.1.1.1). An error posts one event, at the first TRB with
+ * IOC or the TRB where the data transferred ran out, and ends the report.
+ */
 static void xhci_xfer_report(XHCITransfer *xfer)
 {
     uint32_t edtla = 0;
     unsigned int left;
-    bool reported = 0;
-    bool shortpkt = 0;
+    /*
+     * The current TD's Short Packet: shortpkt once the TD met it,
+     * short_reported once the TRB it met it on posted its event, with that
+     * event's residue in short_length, and ed_parsed once an Event Data TRB
+     * after it was parsed.
+     */
+    bool shortpkt = false;
+    bool short_reported = false;
+    uint32_t short_length = 0;
+    bool ed_parsed = false;
     XHCIEvent event = {ER_TRANSFER, CC_SUCCESS};
     XHCIState *xhci = xfer->epctx->xhci;
     int i;
@@ -1609,6 +1631,8 @@ static void xhci_xfer_report(XHCITransfer *xfer)
     for (i = 0; i < xfer->trb_count; i++) {
         XHCITRB *trb = &xfer->trbs[i];
         unsigned int chunk = 0;
+        bool short_trb = false;
+        bool post;
 
         switch (TRB_TYPE(*trb)) {
         case TR_SETUP:
@@ -1623,32 +1647,56 @@ static void xhci_xfer_report(XHCITransfer *xfer)
             chunk = trb->status & 0x1ffff;
             if (chunk > left) {
                 chunk = left;
-                if (xfer->status == CC_SUCCESS) {
-                    shortpkt = 1;
+                if (xfer->status == CC_SUCCESS && !shortpkt) {
+                    shortpkt = true;
+                    short_trb = true;
                 }
             }
             left -= chunk;
             edtla += chunk;
             break;
         case TR_STATUS:
-            reported = 0;
-            shortpkt = 0;
+            /* the Status Stage is a TD of its own */
+            shortpkt = false;
+            short_reported = false;
+            ed_parsed = false;
             break;
         }
 
-        if (!reported && ((trb->control & TRB_TR_IOC) ||
-                          (shortpkt && (trb->control & TRB_TR_ISP)) ||
-                          (xfer->status != CC_SUCCESS && left == 0))) {
-            event.slotid = xfer->epctx->slotid;
-            event.epid = xfer->epctx->epid;
-            event.length = (trb->status & 0x1ffff) - chunk;
-            event.flags = 0;
-            event.ptr = trb->addr;
-            if (xfer->status == CC_SUCCESS) {
-                event.ccode = shortpkt ? CC_SHORT_PACKET : CC_SUCCESS;
-            } else {
-                event.ccode = xfer->status;
+        event.slotid = xfer->epctx->slotid;
+        event.epid = xfer->epctx->epid;
+        event.length = (trb->status & 0x1ffff) - chunk;
+        event.flags = 0;
+        event.ptr = trb->addr;
+        if (xfer->status != CC_SUCCESS) {
+            post = (trb->control & TRB_TR_IOC) || left == 0;
+            event.ccode = xfer->status;
+        } else if (TRB_TYPE(*trb) == TR_EVDATA && shortpkt) {
+            post = false;
+            if (!short_reported && !ed_parsed) {
+                ed_parsed = true;
+                post = trb->control & TRB_TR_IOC;
             }
+            event.ccode = CC_SHORT_PACKET;
+        } else if (short_trb) {
+            post = trb->control & (TRB_TR_IOC | TRB_TR_ISP);
+            event.ccode = CC_SHORT_PACKET;
+            if (post) {
+                short_reported = true;
+                short_length = event.length;
+            }
+        } else if (shortpkt) {
+            post = trb->control & TRB_TR_IOC;
+            event.ccode = CC_SHORT_PACKET;
+            if (short_reported) {
+                event.length = short_length;
+            }
+        } else {
+            post = trb->control & TRB_TR_IOC;
+            event.ccode = CC_SUCCESS;
+        }
+
+        if (post) {
             if (TRB_TYPE(*trb) == TR_EVDATA) {
                 event.ptr = trb->parameter;
                 event.flags |= TRB_EV_ED;
@@ -1667,19 +1715,17 @@ static void xhci_xfer_report(XHCITransfer *xfer)
                                  (trb->control & TRB_TR_BEI) &&
                                  (event.ccode == CC_SUCCESS ||
                                   event.ccode == CC_SHORT_PACKET));
-            reported = 1;
             if (xfer->status != CC_SUCCESS) {
                 return;
             }
         }
 
-        switch (TRB_TYPE(*trb)) {
-        case TR_SETUP:
-            reported = 0;
-            shortpkt = 0;
-            break;
+        /* a TRB without Chain, and a Setup Stage TRB, end their TD */
+        if (TRB_TYPE(*trb) == TR_SETUP || !(trb->control & TRB_TR_CH)) {
+            shortpkt = false;
+            short_reported = false;
+            ed_parsed = false;
         }
-
     }
 }
 
