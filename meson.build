@@ -882,9 +882,9 @@ endif
 # reims-graphics-pci drives reims-vgpu's C API (reims_vgpu.h), a library
 # found through pkg-config: reims-vgpu.pc, which reims-vgpu's `cargo xtask
 # dist` writes into its target/dist/lib/pkgconfig. It is linked statically,
-# so the binary records no path to it. The library runs on macOS and on
-# Linux.
-if host_os in ['darwin', 'linux']
+# so the binary records no path to it. The library runs on macOS, on Linux
+# and on Windows.
+if host_os in ['darwin', 'linux', 'windows']
   reims_vgpu = dependency('reims-vgpu', method: 'pkg-config', static: true,
                           required: get_option('reims_vgpu'))
 endif

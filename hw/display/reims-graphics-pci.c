@@ -11,8 +11,9 @@
  *  - BAR 0: the library's 4 KiB of 32-bit registers, with the MSI-X table
  *    and PBA from RVG_GRAPHICS_MSIX_OFFSET, and one vector. A guest write of
  *    RVG_GRAPHICS_DOORBELL_CONTROL to the DOORBELL register is taken by an
- *    ioeventfd, which the library's control thread polls, so ringing the
- *    control ring never runs the library on the vCPU. So is a write of a
+ *    ioeventfd, which the library's control thread polls (on Windows QEMU's
+ *    event, which it waits on), so ringing the control ring never runs the
+ *    library on the vCPU. So is a write of a
  *    command queue's ring the library routes (route_doorbell): an ioeventfd
  *    matching the ring's id signals the queue's own eventfd, which its thread
  *    polls. Any other write of a queue's ring goes to the library on the vCPU,
@@ -30,7 +31,8 @@
  *    by an ioeventfd at the page's doorbell, as on DOORBELL.
  *  - BAR 2: the library's region, 64-bit and prefetchable, memory of QEMU's
  *    process (on Linux a shared mapping of a memfd of the library's, on macOS
- *    private anonymous memory) that the guest maps write-back: the control
+ *    private anonymous memory, on Windows a view of a section of the
+ *    library's) that the guest maps write-back: the control
  *    rings below RVG_GRAPHICS_ALLOCATIONS_OFFSET, the guest's allocations
  *    from there. It is one RAM region over the mapping, with no dirty log:
  *    the library's window shows the guest's scanout again at each of the
@@ -839,7 +841,11 @@ static void reims_graphics_route_free(ReimsGraphicsPCIState *s,
                                       ReimsGraphicsRoute *r)
 {
     memory_region_del_eventfd(r->mr, r->addr, 4, true, r->ring_id, &r->bell);
+#ifdef CONFIG_POSIX
     close(event_notifier_get_fd(&r->bell));
+#else
+    event_notifier_cleanup(&r->bell);
+#endif
     g_free(r);
 }
 
@@ -1322,6 +1328,12 @@ typedef struct ReimsGraphicsMemoryWalk {
  * (mach_vm_remap), with no file: every range of RAM in pages of the host's
  * size goes into the map, with an fd of -1, whatever backs it. A view so made
  * shares the pages of RAM that HVF maps into the guest, both ways.
+ *
+ * On Windows the library maps views of the section behind a range
+ * (MapViewOfFile3), which share the pages WHPX maps into the guest, both ways:
+ * only RAM that is a view of a section (memory-backend-ram,share=on) goes
+ * into the map, with the section's handle and the range's offset in it, and
+ * other RAM is left out, as on Linux.
  */
 static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
                                             const MemoryRegion *mr,
@@ -1332,8 +1344,13 @@ static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
     RAMBlock *rb = mr->ram_block;
     void *host;
     RvgMemoryRange range;
+#ifdef _WIN32
+    RvgMemoryRangeFile file = { .handle = NULL };
+    HANDLE section;
+#else
     RvgMemoryRangeFile file = { .fd = -1 };
     int fd;
+#endif
 
     if (!memory_access_is_direct(mr, true, MEMTXATTRS_UNSPECIFIED)) {
         return false;
@@ -1341,11 +1358,18 @@ static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
     if (qemu_ram_pagesize(rb) != qemu_real_host_page_size()) {
         return false;
     }
+#ifdef _WIN32
+    section = qemu_ram_get_section(rb);
+    if (!section) {
+        return false;
+    }
+#else
     fd = memory_region_get_fd(mr);
 #ifndef CONFIG_DARWIN
     if (fd < 0 || !qemu_ram_is_shared(rb)) {
         return false;
     }
+#endif
 #endif
     /* q35's RAM above 4 GiB is an alias of the block past the part below. */
     host = (uint8_t *)memory_region_get_ram_ptr(mr) + offset_in_region;
@@ -1354,7 +1378,11 @@ static bool reims_graphics_add_memory_range(Int128 start, Int128 len,
         .physical_length = int128_get64(len),
         .host_address = host,
     };
-#ifndef CONFIG_DARWIN
+#if defined(_WIN32)
+    /* The block's view maps its whole section from its start. */
+    file.handle = section;
+    file.offset = qemu_ram_block_host_offset(rb, host);
+#elif !defined(CONFIG_DARWIN)
     file.fd = fd;
     file.offset = qemu_ram_block_host_offset(rb, host) +
                   qemu_ram_get_fd_offset(rb);
@@ -1508,8 +1536,11 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
      * whose pages fall there is copied as every surface is without a map. A
      * surface in a mapped range is used in place, and IOSurfaces live only in
      * the main RAM, which a shared memfd backs, so in practice every surface
-     * maps in place. On macOS every range in pages of the host's size goes
-     * in, with no file (reims_graphics_add_memory_range), and the library
+     * maps in place. On Windows the section behind a range takes the file's
+     * place: RAM that is not a view of a section is left out, and the main
+     * RAM is one where the host gives memory-backend-ram,share=on. On macOS
+     * every range in pages of the host's size goes in, with no file
+     * (reims_graphics_add_memory_range), and the library
      * uses a surface in place only where the guest lays its pages out in
      * whole pages of the host's (16 KiB, an arm64 guest). The library keeps
      * views of the map's pages while the device lives, so they must stay the
@@ -1526,7 +1557,9 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         config.memory_files = (const RvgMemoryRangeFile *)walk.files->data;
     } else {
         warn_report("%s: no guest RAM is "
-#ifndef CONFIG_DARWIN
+#if defined(_WIN32)
+                    "a shared section "
+#elif !defined(CONFIG_DARWIN)
                     "a shared memfd "
 #endif
                     "in pages of the host's size: IOSurfaces are copied "
@@ -1569,8 +1602,13 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         goto fail;
     }
     s->doorbell_made = true;
+#ifdef _WIN32
+    status = rvg_graphics_device_set_doorbell(
+        s->device, event_notifier_get_handle(&s->doorbell));
+#else
     status = rvg_graphics_device_set_doorbell(
         s->device, event_notifier_get_fd(&s->doorbell));
+#endif
     if (status != RVG_OK) {
         error_setg(errp, "%s: rvg_graphics_device_set_doorbell: %s",
                    TYPE_REIMS_GRAPHICS_PCI, rvg_status_message(status));
