@@ -19,6 +19,15 @@
  *    which may answer the queue's next command buffer there, posting the
  *    event that says it is submitted, and leave the buffer to the queue's
  *    thread (rvg_graphics_device_mmio_write_taking).
+ *  - BAR 4: the library's doorbell pages, 32-bit and not prefetchable,
+ *    RVG_GRAPHICS_DOORBELLS_SIZE bytes of RVG_GRAPHICS_DOORBELL_PAGES pages.
+ *    The guest's kext binds a page to each process it opens and maps the
+ *    page into it, so the process rings its queues there with no call into
+ *    the kext. A write goes to the library on the vCPU
+ *    (rvg_graphics_device_doorbell_write), which wakes only a ring of the
+ *    page's process and drops the rest; a read answers 0. A plain write of a
+ *    queue's ring the library routes on a page (route_doorbell_page) is taken
+ *    by an ioeventfd at the page's doorbell, as on DOORBELL.
  *  - BAR 2: the library's region, 64-bit and prefetchable, memory of QEMU's
  *    process (on Linux a shared mapping of a memfd of the library's, on macOS
  *    private anonymous memory) that the guest maps write-back: the control
@@ -114,10 +123,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsGraphicsPCIState, REIMS_GRAPHICS_PCI)
 
 typedef struct ReimsGraphicsEvent ReimsGraphicsEvent;
 
-/* A route applied: the DOORBELL register's ioeventfd matching `ring_id`. */
+/*
+ * A route applied: the ioeventfd matching `ring_id` at `addr` in `mr`, the
+ * DOORBELL register or a doorbell page's doorbell.
+ */
 typedef struct ReimsGraphicsRoute {
     uint64_t route;
     uint32_t ring_id;
+    MemoryRegion *mr;
+    hwaddr addr;
     EventNotifier bell; /* over our copy of the queue's eventfd */
 } ReimsGraphicsRoute;
 
@@ -128,6 +142,7 @@ struct ReimsGraphicsPCIState {
     MemoryRegion bar0;      /* BAR 0: the registers, the MSI-X table, PBA */
     MemoryRegion registers; /* in BAR 0, below the MSI-X table */
     MemoryRegion region;    /* BAR 2 */
+    MemoryRegion doorbells; /* BAR 4: the doorbell pages */
     EventNotifier doorbell;
     bool doorbell_made;  /* the notifier is initialised */
     bool doorbell_added; /* the notifier is BAR 0's ioeventfd */
@@ -782,6 +797,38 @@ static const MemoryRegionOps reims_graphics_pci_ops = {
     },
 };
 
+/*
+ * The doorbell pages: no register to read, and a write to the library on the
+ * vCPU, as a DOORBELL write is.
+ */
+static uint64_t reims_graphics_doorbells_read(void *opaque, hwaddr offset,
+                                              unsigned size)
+{
+    return 0;
+}
+
+static void reims_graphics_doorbells_write(void *opaque, hwaddr offset,
+                                           uint64_t value, unsigned size)
+{
+    ReimsGraphicsPCIState *s = opaque;
+
+    rvg_graphics_device_doorbell_write(s->device, offset, value);
+}
+
+static const MemoryRegionOps reims_graphics_doorbells_ops = {
+    .read = reims_graphics_doorbells_read,
+    .write = reims_graphics_doorbells_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
 /* ------ The queues' doorbells ------ */
 
 /*
@@ -791,8 +838,7 @@ static const MemoryRegionOps reims_graphics_pci_ops = {
 static void reims_graphics_route_free(ReimsGraphicsPCIState *s,
                                       ReimsGraphicsRoute *r)
 {
-    memory_region_del_eventfd(&s->registers, RVG_GRAPHICS_REG_DOORBELL, 4,
-                              true, r->ring_id, &r->bell);
+    memory_region_del_eventfd(r->mr, r->addr, 4, true, r->ring_id, &r->bell);
     close(event_notifier_get_fd(&r->bell));
     g_free(r);
 }
@@ -807,21 +853,25 @@ static gboolean reims_graphics_route_holds_ring(gpointer key, gpointer value,
                                                 gpointer opaque)
 {
     ReimsGraphicsRoute *r = value;
+    ReimsGraphicsRoute *at = opaque;
 
-    return r->ring_id == *(uint32_t *)opaque;
+    return r->ring_id == at->ring_id && r->mr == at->mr && r->addr == at->addr;
 }
 
 /*
- * Takes route `route` of `ring_id` into `copy`, ours, under the BQL; false,
- * with `copy` closed, once RVG_GRAPHICS_DOORBELL_ROUTES are taken or the
- * teardown dropped them. A route of a ring another route holds replaces it
- * first: KVM refuses a second ioeventfd of the same value, and QEMU ends the
- * VM where KVM refuses one. Each change is a transaction of its own, so a
- * replaced ioeventfd is gone before its successor is added.
+ * Takes route `route` of `ring_id` at `addr` in `mr` into `copy`, ours, under
+ * the BQL; false, with `copy` closed, once RVG_GRAPHICS_DOORBELL_ROUTES are
+ * taken or the teardown dropped them. A route of a ring at the same address
+ * another route holds replaces it first: KVM refuses a second ioeventfd of the
+ * same value there, and QEMU ends the VM where KVM refuses one. Each change is
+ * a transaction of its own, so a replaced ioeventfd is gone before its
+ * successor is added.
  */
 static bool reims_graphics_route_add(ReimsGraphicsPCIState *s, uint64_t route,
+                                     MemoryRegion *mr, hwaddr addr,
                                      uint32_t ring_id, int copy)
 {
+    ReimsGraphicsRoute at = { .ring_id = ring_id, .mr = mr, .addr = addr };
     ReimsGraphicsRoute *r;
 
     if (s->routes_closed ||
@@ -830,22 +880,24 @@ static bool reims_graphics_route_add(ReimsGraphicsPCIState *s, uint64_t route,
         return false;
     }
     while ((r = g_hash_table_find(s->routes, reims_graphics_route_holds_ring,
-                                  &ring_id)) != NULL) {
+                                  &at)) != NULL) {
         g_hash_table_steal(s->routes, &r->route);
         reims_graphics_route_free(s, r);
     }
     r = g_new0(ReimsGraphicsRoute, 1);
     r->route = route;
     r->ring_id = ring_id;
+    r->mr = mr;
+    r->addr = addr;
     event_notifier_init_fd(&r->bell, copy);
-    memory_region_add_eventfd(&s->registers, RVG_GRAPHICS_REG_DOORBELL, 4,
-                              true, ring_id, &r->bell);
+    memory_region_add_eventfd(mr, addr, 4, true, ring_id, &r->bell);
     g_hash_table_insert(s->routes, &r->route, r);
     return true;
 }
 
 /*
- * The library's route_doorbell: on its threads as a queue is made or ends,
+ * The library's route_doorbell and route_doorbell_page, at `addr` in `mr`:
+ * on its threads as a queue is made or ends,
  * or inside a STATUS write of 0 on the vCPU or our reset. It applies the
  * change before it returns, under the BQL, which it takes where its thread
  * does not hold it: once a route is dropped no write reaches its file, so a
@@ -853,15 +905,15 @@ static bool reims_graphics_route_add(ReimsGraphicsPCIState *s, uint64_t route,
  * holders wait for none of the library's threads: the teardown at QEMU's quit
  * releases the device with the BQL let go, so a call waiting for it then takes
  * it, finds the routes closed (reims_graphics_routes_close) and returns, and
- * the vCPU holds no lock of ours around the register write, the registers
+ * the vCPU holds no lock of ours around the register or page write, both
  * being lockless. Under the BQL the address spaces' flat views it reads are
  * the current ones, held by reference, so a thread of the library's needs no
  * RCU registration for it.
  */
-static bool reims_graphics_route_doorbell_cb(void *ctx, uint64_t route,
-                                             uint32_t ring_id, int32_t bell)
+static bool reims_graphics_route_at(ReimsGraphicsPCIState *s, uint64_t route,
+                                    MemoryRegion *mr, hwaddr addr,
+                                    uint32_t ring_id, int32_t bell)
 {
-    ReimsGraphicsPCIState *s = ctx;
     bool locked = bql_locked();
     bool taken = true;
     ReimsGraphicsRoute *r;
@@ -877,7 +929,7 @@ static bool reims_graphics_route_doorbell_cb(void *ctx, uint64_t route,
         bql_lock();
     }
     if (copy >= 0) {
-        taken = reims_graphics_route_add(s, route, ring_id, copy);
+        taken = reims_graphics_route_add(s, route, mr, addr, ring_id, copy);
     } else {
         r = g_hash_table_lookup(s->routes, &route);
         if (r) {
@@ -889,6 +941,35 @@ static bool reims_graphics_route_doorbell_cb(void *ctx, uint64_t route,
         bql_unlock();
     }
     return taken;
+}
+
+static bool reims_graphics_route_doorbell_cb(void *ctx, uint64_t route,
+                                             uint32_t ring_id, int32_t bell)
+{
+    ReimsGraphicsPCIState *s = ctx;
+
+    return reims_graphics_route_at(s, route, &s->registers,
+                                   RVG_GRAPHICS_REG_DOORBELL, ring_id, bell);
+}
+
+/*
+ * The library's route_doorbell_page: as route_doorbell, at the doorbell of
+ * page `page` in BAR 4, which only that page's process writes.
+ */
+static bool reims_graphics_route_doorbell_page_cb(void *ctx, uint64_t route,
+                                                  uint32_t page,
+                                                  uint32_t ring_id,
+                                                  int32_t bell)
+{
+    ReimsGraphicsPCIState *s = ctx;
+
+    if (page >= RVG_GRAPHICS_DOORBELL_PAGES) {
+        return false;
+    }
+    return reims_graphics_route_at(s, route, &s->doorbells,
+                                   (hwaddr)page *
+                                   RVG_GRAPHICS_DOORBELL_PAGE_SIZE,
+                                   ring_id, bell);
 }
 
 #endif /* CONFIG_EVENTFD */
@@ -1106,6 +1187,10 @@ static void reims_graphics_pci_init(Object *obj)
                           RVG_GRAPHICS_MSIX_OFFSET);
     memory_region_enable_lockless_io(&s->registers);
     memory_region_add_subregion(&s->bar0, 0, &s->registers);
+    memory_region_init_io(&s->doorbells, obj, &reims_graphics_doorbells_ops, s,
+                          "reims-graphics-pci.doorbells",
+                          RVG_GRAPHICS_DOORBELLS_SIZE);
+    memory_region_enable_lockless_io(&s->doorbells);
     qemu_mutex_init(&s->event_lock);
     QSIMPLEQ_INIT(&s->events);
     s->routes = g_hash_table_new(g_int64_hash, g_int64_equal);
@@ -1357,6 +1442,7 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .cursor_move = reims_graphics_cursor_move_cb,
 #ifdef CONFIG_EVENTFD
         .route_doorbell = reims_graphics_route_doorbell_cb,
+        .route_doorbell_page = reims_graphics_route_doorbell_page_cb,
 #endif
     };
     RvgWindowCallbacks window_callbacks = {
@@ -1383,6 +1469,8 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .window = reims_graphics_window_wanted() ? &window_config : NULL,
         .guest_arch = target_aarch64() ? RVG_GUEST_ARCH_ARM64
                                        : RVG_GUEST_ARCH_X86_64,
+        /* BAR 4 is registered below, its writes sent to the library. */
+        .doorbell_pages = 1,
     };
     g_autoptr(GArray) ranges = g_array_new(false, false,
                                            sizeof(RvgMemoryRange));
@@ -1492,6 +1580,9 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                               true, RVG_GRAPHICS_DOORBELL_CONTROL,
                               &s->doorbell);
     s->doorbell_added = true;
+
+    pci_register_bar(dev, RVG_GRAPHICS_PCI_BAR_DOORBELLS,
+                     PCI_BASE_ADDRESS_SPACE_MEMORY, &s->doorbells);
 
     base = rvg_graphics_device_region(s->device, &size);
     memory_region_init_ram_ptr(&s->region, OBJECT(dev),
