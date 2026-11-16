@@ -51,6 +51,8 @@ struct whpx_state {
 
     bool ignore_unknown_msr;
     bool intercept_msr_gp;
+    /* intercept-msr-gp was given on or off, not left to the host's vendor */
+    bool intercept_msr_gp_given;
 };
 
 extern struct whpx_state whpx_global;
