@@ -2078,12 +2078,12 @@ static void whpx_vcpu_pre_run(CPUState *cpu)
      * PIC's injection are kernel-irqchip=off's or wait for CPU_INTERRUPT_HARD.
      * So the vCPU goes on without the BQL, as kvm_arch_pre_run does with
      * KVM's in-kernel irqchip, and an exit (an MMIO write to a lockless
-     * region) does not wait for the BQL's holder: a PNG screendump held it
-     * for about 120 ms in png_save. A request raised after this check kicks
-     * the vCPU (cpu_interrupt, qemu_cpu_kick, whpx_vcpu_kick: the cancel of
-     * its run), which brings it back here; a request raised between the
-     * bql_unlock below and the run always had that window, and the
-     * exit_request kick before the run relies on the same cancel.
+     * region) does not wait for the BQL's holder. A request raised after
+     * this check kicks the vCPU (cpu_interrupt, qemu_cpu_kick,
+     * whpx_vcpu_kick: the cancel of its run), which brings it back here; a
+     * request raised between the bql_unlock below and the run always had
+     * that window, and the exit_request kick before the run relies on the
+     * same cancel.
      */
     if (whpx_irqchip_in_kernel() &&
         !cpu_test_interrupt(cpu, CPU_INTERRUPT_NMI | CPU_INTERRUPT_SMI |

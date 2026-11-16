@@ -14,6 +14,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "block/thread-pool.h"
 
 #include "io/channel-file.h"
 #include "monitor/qmp-helpers.h"
@@ -323,6 +324,24 @@ static bool ppm_save(int fd, pixman_image_t *image, Error **errp)
     return true;
 }
 
+/* A screendump's encode and write, on a thread of the pool */
+typedef struct ScreendumpSave {
+    int fd;
+    pixman_image_t *image;
+    bool png;
+    bool ok;
+    Error *err;
+} ScreendumpSave;
+
+static int screendump_save(void *opaque)
+{
+    ScreendumpSave *save = opaque;
+
+    save->ok = save->png ? png_save(save->fd, save->image, &save->err)
+                         : ppm_save(save->fd, save->image, &save->err);
+    return 0;
+}
+
 /* Safety: coroutine-only, concurrent-coroutine safe, main thread only */
 void coroutine_fn
 qmp_screendump(const char *filename, const char *device,
@@ -332,6 +351,8 @@ qmp_screendump(const char *filename, const char *device,
     g_autoptr(pixman_image_t) image = NULL;
     QemuConsole *con;
     DisplaySurface *surface;
+    ScreendumpSave save = { 0 };
+    int width, height;
     int fd;
 
     if (device) {
@@ -366,7 +387,21 @@ qmp_screendump(const char *filename, const char *device,
         object_unref(con);
         return;
     }
-    image = pixman_image_ref(surface->image);
+    /*
+     * A copy of the surface as the update left it, made here under the BQL,
+     * so the encode below sees no later update of it.
+     */
+    width = surface_width(surface);
+    height = surface_height(surface);
+    image = pixman_image_create_bits(surface_format(surface), width, height,
+                                     NULL, 0);
+    if (!image) {
+        error_setg(errp, "no memory for a copy of the surface");
+        object_unref(con);
+        return;
+    }
+    pixman_image_composite(PIXMAN_OP_SRC, surface->image, NULL, image,
+                           0, 0, 0, 0, 0, 0, width, height);
     object_unref(con);
 
     fd = qemu_create(filename, O_WRONLY | O_TRUNC | O_BINARY, 0666, errp);
@@ -375,20 +410,21 @@ qmp_screendump(const char *filename, const char *device,
     }
 
     /*
-     * The image content could potentially be updated as the coroutine
-     * yields and releases the BQL. It could produce corrupted dump, but
-     * it should be otherwise safe.
+     * The encode and the write run on a thread of the pool, while this
+     * coroutine waits for them with the BQL let go and the main loop
+     * running. Under the BQL they would hold it for their whole length (a
+     * PNG of 2880x1620 takes about 120 ms on a Mac mini 2018, measured), and
+     * a vCPU that touches a device the BQL guards would wait as long: under
+     * WHPX a vCPU's write of an AHCI port's register waited 127 ms for it,
+     * and a macOS guest's full-screen present loop stalled as long.
      */
-    if (has_format && format == IMAGE_FORMAT_PNG) {
-        /* PNG format specified for screendump */
-        if (!png_save(fd, image, errp)) {
-            qemu_unlink(filename);
-        }
-    } else {
-        /* PPM format specified/default for screendump */
-        if (!ppm_save(fd, image, errp)) {
-            qemu_unlink(filename);
-        }
+    save.fd = fd;
+    save.image = image;
+    save.png = has_format && format == IMAGE_FORMAT_PNG;
+    thread_pool_submit_co(screendump_save, &save);
+    if (!save.ok) {
+        error_propagate(errp, save.err);
+        qemu_unlink(filename);
     }
 }
 #endif /* CONFIG_PIXMAN */

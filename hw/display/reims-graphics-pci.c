@@ -47,12 +47,11 @@
  *    enabled vector is unmasked; and by a BH otherwise. Neither the irqfd's
  *    write nor the request waits for the BQL or the main loop, and the lock
  *    the request takes is held for nothing that waits. The BH runs in the
- *    main loop, so a hold of it holds the interrupt back: a PNG screendump
- *    of 2880x1620 held it about 120 ms on a Mac mini 2018 under WHPX, and
- *    the guest took no completion meanwhile. route_doorbell applies its
- *    change under the
- *    BQL before it returns, and the BQL's holders wait for none of the
- *    library's threads: the release at QEMU's quit runs with it let go.
+ *    main loop, so a long turn of the main loop holds the interrupt back,
+ *    and the guest takes no completion meanwhile. route_doorbell applies
+ *    its change under the BQL before it returns, and the BQL's holders wait
+ *    for none of the library's threads: the release at QEMU's quit runs
+ *    with it let go.
  *
  * The device has the displays property's count of displays, 1 to
  * RVG_GRAPHICS_DISPLAYS_MAX (1 by default), display i head i of QEMU's UI,
