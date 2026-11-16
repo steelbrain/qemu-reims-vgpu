@@ -1364,9 +1364,11 @@ static target_ulong read_cr(CPUState *cpu, int cr)
  * an AMD host answers a guest's write of an address above 4 GiB with #GP:
  * macOS writes its kernel's sysenter entry there at boot and panicked
  * ("Kernel trap ... type = 13", wrmsr of 0x176). With intercept-msr-gp the
- * #GP reaches QEMU, which keeps the MSRs' 64 bits here, as Intel's CPU does
- * (and KVM on AMD for an Intel guest), and gives Hyper-V their low 32 bits.
- * A 64-bit guest never executes SYSENTER, which it would reach through them.
+ * #GP reaches QEMU, which gives Hyper-V the low 32 bits and keeps all 64 in
+ * the CPU's state. Those answer only a read that faults as well, and only
+ * until the vCPU's next full register read (whpx_get_registers), which takes
+ * Hyper-V's 32 bits; a read Hyper-V answers itself gives the low 32. A 64-bit
+ * guest never executes SYSENTER, which it would reach through them.
  */
 static bool whpx_sysenter_msr(CPUState *cs, uint32_t msr, uint64_t **slot,
                               WHV_REGISTER_NAME *name)
