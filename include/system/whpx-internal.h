@@ -53,6 +53,11 @@ struct whpx_state {
     bool intercept_msr_gp;
     /* intercept-msr-gp was given on or off, not left to the host's vendor */
     bool intercept_msr_gp_given;
+    /*
+     * Hyper-V refuses the TSC deadline timer's register, so the guest is
+     * offered no TSC deadline timer (whpx_tsc_deadline_refused)
+     */
+    bool tsc_deadline_refused;
 };
 
 extern struct whpx_state whpx_global;

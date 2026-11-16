@@ -537,8 +537,8 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
         }
     }
 
-    /* Reset hypervisor-owned TSC deadline. */
-    if (level == WHPX_LEVEL_RESET_STATE) {
+    /* Reset hypervisor-owned TSC deadline, where Hyper-V has the register. */
+    if (level == WHPX_LEVEL_RESET_STATE && !whpx->tsc_deadline_refused) {
         WHV_REGISTER_VALUE tsc_deadline = {};
 
         whpx_set_reg(cpu, WHvX64RegisterTscDeadline, tsc_deadline);
@@ -1539,6 +1539,10 @@ uint32_t whpx_get_supported_cpuid(uint32_t func, uint32_t idx, int reg)
         ecx |= CPUID_EXT_X2APIC;
         ecx |= CPUID_EXT_HYPERVISOR;
         edx |= CPUID_HT;
+        /* A timer the guest could not arm (whpx_tsc_deadline_refused) */
+        if (whpx_global.tsc_deadline_refused) {
+            ecx &= ~CPUID_EXT_TSC_DEADLINE_TIMER;
+        }
     }
 
     switch (reg) {
@@ -3186,6 +3190,43 @@ void whpx_arch_accel_class_init(ObjectClass *oc)
         "Separate security domain");
 }
 
+/*
+ * Whether Hyper-V refuses the TSC deadline timer's register, asked as the
+ * reset of each vCPU sets it (whpx_set_registers), of a vCPU made for the
+ * question before any other. Hyper-V on a Ryzen 5 5600G refused it
+ * (hr=c0350005) while its CPUID offered the timer, and a macOS guest, whose
+ * kernel arms the TSC deadline timer where CPUID offers one, waited at boot
+ * for interrupts that never came; with the CPU model's tsc-deadline dropped
+ * it took the local APIC's timer and booted (measured on that host,
+ * 2026-11-16). Where the register is refused, the leaf the host supports
+ * offers no TSC deadline timer (whpx_get_supported_cpuid), so the CPU model's
+ * tsc-deadline is filtered out as any feature the host lacks is, and with
+ * "check" QEMU says so. KVM likewise offers the timer only where its own
+ * capability says it has one (KVM_CAP_TSC_DEADLINE_TIMER). Where the vCPU
+ * cannot be made, the timer is offered as before.
+ */
+static bool whpx_tsc_deadline_refused(void)
+{
+    WHV_REGISTER_NAME name = WHvX64RegisterTscDeadline;
+    WHV_REGISTER_VALUE value = {};
+    HRESULT hr;
+
+    hr = whp_dispatch.WHvCreateVirtualProcessor(whpx_global.partition, 0, 0);
+    if (FAILED(hr)) {
+        return false;
+    }
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(whpx_global.partition,
+                                                      0, &name, 1, &value);
+    whp_dispatch.WHvDeleteVirtualProcessor(whpx_global.partition, 0);
+    if (FAILED(hr)) {
+        warn_report("WHPX: Hyper-V refuses the TSC deadline timer's register,"
+                    " hr=%08lx: the guest is offered no TSC deadline timer",
+                    hr);
+        return true;
+    }
+    return false;
+}
+
 int whpx_accel_init(AccelState *as, MachineState *ms)
 {
     struct whpx_state *whpx;
@@ -3556,6 +3597,8 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
         ret = -EINVAL;
         goto error;
     }
+
+    whpx->tsc_deadline_refused = whpx_tsc_deadline_refused();
 
     whpx_memory_init();
     whpx_init_emu();
