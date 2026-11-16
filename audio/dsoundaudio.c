@@ -610,6 +610,11 @@ audio_dsound_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
         return false;
     }
 
+    /*
+     * Capture is optional: a host with no recording device (no microphone)
+     * still plays sound. Without the capture object, an input voice fails to
+     * initialize (dsound_init_in).
+     */
     hr = CoCreateInstance (
         &CLSID_DirectSoundCapture,
         NULL,
@@ -618,14 +623,17 @@ audio_dsound_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
         (void **) &s->dsound_capture
         );
     if (FAILED (hr)) {
-        dserror_set(errp, hr, "Could not create DirectSoundCapture instance");
-        return false;
-    }
-
-    hr = IDirectSoundCapture_Initialize (s->dsound_capture, NULL);
-    if (FAILED(hr)) {
-        dserror_set(errp, hr, "Could not initialize DirectSoundCapture");
-        return false;
+        dsound_logerr(hr, "Could not create DirectSoundCapture instance, "
+                      "no recording");
+        s->dsound_capture = NULL;
+    } else {
+        hr = IDirectSoundCapture_Initialize (s->dsound_capture, NULL);
+        if (FAILED(hr)) {
+            dsound_logerr(hr, "Could not initialize DirectSoundCapture, "
+                          "no recording");
+            IDirectSoundCapture_Release (s->dsound_capture);
+            s->dsound_capture = NULL;
+        }
     }
 
     hr = IDirectSound_SetCooperativeLevel (
