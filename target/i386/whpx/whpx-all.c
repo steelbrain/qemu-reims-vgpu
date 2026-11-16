@@ -658,10 +658,13 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
         vcxt.values[idx++].Reg64 = env->pat;
         assert(whpx_register_names[idx] == WHvX64RegisterSysenterCs);
         vcxt.values[idx++].Reg64 = env->sysenter_cs;
+        /* An AMD host keeps 32 bits of them (whpx_sysenter_msr) */
         assert(whpx_register_names[idx] == WHvX64RegisterSysenterEip);
-        vcxt.values[idx++].Reg64 = env->sysenter_eip;
+        vcxt.values[idx++].Reg64 = is_host_cpu_intel() ?
+            env->sysenter_eip : (uint32_t)env->sysenter_eip;
         assert(whpx_register_names[idx] == WHvX64RegisterSysenterEsp);
-        vcxt.values[idx++].Reg64 = env->sysenter_esp;
+        vcxt.values[idx++].Reg64 = is_host_cpu_intel() ?
+            env->sysenter_esp : (uint32_t)env->sysenter_esp;
         assert(whpx_register_names[idx] == WHvX64RegisterStar);
         vcxt.values[idx++].Reg64 = env->star;
 #ifdef TARGET_X86_64
@@ -1355,14 +1358,65 @@ static target_ulong read_cr(CPUState *cpu, int cr)
     return val.Reg64;
 }
 
+/*
+ * The SYSENTER MSRs of a guest whose CPU model is Intel's, on an AMD host.
+ * Intel's IA32_SYSENTER_ESP and _EIP hold 64 bits, AMD's 32, and Hyper-V on
+ * an AMD host answers a guest's write of an address above 4 GiB with #GP:
+ * macOS writes its kernel's sysenter entry there at boot and panicked
+ * ("Kernel trap ... type = 13", wrmsr of 0x176). With intercept-msr-gp the
+ * #GP reaches QEMU, which keeps the MSRs' 64 bits here, as Intel's CPU does
+ * (and KVM on AMD for an Intel guest), and gives Hyper-V their low 32 bits.
+ * A 64-bit guest never executes SYSENTER, which it would reach through them.
+ */
+static bool whpx_sysenter_msr(CPUState *cs, uint32_t msr, uint64_t **slot,
+                              WHV_REGISTER_NAME *name)
+{
+    CPUX86State *env = &X86_CPU(cs)->env;
+
+    switch (msr) {
+    case MSR_IA32_SYSENTER_ESP:
+        *slot = &env->sysenter_esp;
+        *name = WHvX64RegisterSysenterEsp;
+        return true;
+    case MSR_IA32_SYSENTER_EIP:
+        *slot = &env->sysenter_eip;
+        *name = WHvX64RegisterSysenterEip;
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool whpx_simulate_rdmsr(CPUState *cs)
 {
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
     uint32_t msr = ECX(env);
     uint64_t val = 0;
+    uint64_t *slot;
+    WHV_REGISTER_NAME name;
 
+    if (whpx_sysenter_msr(cs, msr, &slot, &name)) {
+        RAX(env) = (uint32_t)*slot;
+        RDX(env) = (uint32_t)(*slot >> 32);
+        return 0;
+    }
+
+    /*
+     * Intel's MSRs that Hyper-V on an AMD host answers with #GP, kept here
+     * as KVM keeps them for an Intel guest: macOS reads MISC_ENABLE at boot
+     * (commpage_post_ucode_update) and panicked on the #GP.
+     */
     switch (msr) {
+    case MSR_IA32_MISC_ENABLE:
+        val = env->msr_ia32_misc_enable;
+        break;
+    case MSR_IA32_FEATURE_CONTROL:
+        val = env->msr_ia32_feature_control;
+        break;
+    case 0xce: /* MSR_PLATFORM_INFO */
+        val = 0;
+        break;
     default:
         error_report("WHPX: unknown msr 0x%x", msr);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
@@ -1382,8 +1436,28 @@ static bool whpx_simulate_wrmsr(CPUState *cs)
     CPUX86State *env = &cpu->env;
     uint32_t msr = ECX(env);
     uint64_t data = ((uint64_t)EDX(env) << 32) | EAX(env);
+    uint64_t *slot;
+    WHV_REGISTER_NAME name;
+
+    if (whpx_sysenter_msr(cs, msr, &slot, &name)) {
+        WHV_REGISTER_VALUE reg = {.Reg64 = (uint32_t)data};
+
+        *slot = data;
+        whp_dispatch.WHvSetVirtualProcessorRegisters(whpx_global.partition,
+                                                     cs->cpu_index, &name, 1,
+                                                     &reg);
+        return 0;
+    }
 
     switch (msr) {
+    case MSR_IA32_MISC_ENABLE:
+        env->msr_ia32_misc_enable = data;
+        break;
+    case MSR_IA32_FEATURE_CONTROL:
+        env->msr_ia32_feature_control = data;
+        break;
+    case 0xce: /* MSR_PLATFORM_INFO */
+        break;
     default:
         error_report("WHPX: unknown msr 0x%x val %llx", msr, data);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
@@ -3059,6 +3133,7 @@ static void whpx_set_intercept_msr_gp(Object *obj, int value, Error **errp)
 {
     struct whpx_state *whpx = &whpx_global;
 
+    whpx->intercept_msr_gp_given = value != ON_OFF_AUTO_AUTO;
     switch (value) {
     case ON_OFF_AUTO_ON:
         whpx->intercept_msr_gp = true;
@@ -3067,7 +3142,6 @@ static void whpx_set_intercept_msr_gp(Object *obj, int value, Error **errp)
         whpx->intercept_msr_gp = false;
         break;
     case ON_OFF_AUTO_AUTO:
-        whpx->intercept_msr_gp = false;
         break;
     default:
         g_assert_not_reached();
@@ -3141,6 +3215,11 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
     if (!init_whp_dispatch()) {
         ret = -ENOSYS;
         goto error;
+    }
+
+    /* On an AMD host, for an Intel guest's SYSENTER MSRs (whpx_sysenter_msr) */
+    if (!whpx->intercept_msr_gp_given) {
+        whpx->intercept_msr_gp = !is_host_cpu_intel();
     }
 
     /* for isapc, disable Hyper-V enlightenments and LAPIC */
