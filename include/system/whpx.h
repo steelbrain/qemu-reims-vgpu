@@ -28,6 +28,15 @@ extern bool whpx_allowed;
 extern bool whpx_irqchip_in_kernel;
 #define whpx_enabled() (whpx_allowed)
 #define whpx_irqchip_in_kernel() (whpx_irqchip_in_kernel)
+/*
+ * Delivers the MSI of @address and @data as its write to the APIC's MSI
+ * region does, on any thread, with the BQL held or not. False, with nothing
+ * delivered, where the platform's APIC is not the hypervisor's
+ * (whpx_irqchip_in_kernel()), the vector is 0, or the hypervisor refused the
+ * request: the caller then sends it the usual way (msix_notify), which says
+ * why it is lost.
+ */
+bool whpx_send_msi_direct(uint64_t address, uint32_t data);
 #else /* !CONFIG_WHPX_IS_POSSIBLE */
 #define whpx_enabled() 0
 #define whpx_irqchip_in_kernel() (0)

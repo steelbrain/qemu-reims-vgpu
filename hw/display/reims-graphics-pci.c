@@ -41,8 +41,16 @@
  *    also on the vCPU inside that write, with no lock held that a call of
  *    ours into the library waits for. An interrupt is raised by a write of
  *    the vector's irqfd, where the accelerator injects MSI-X through one
- *    (KVM's in-kernel irqchip) and MSI-X is enabled, and by a BH otherwise;
- *    neither waits for a lock. route_doorbell applies its change under the
+ *    (KVM's in-kernel irqchip) and MSI-X is enabled; by a request to the
+ *    hypervisor's APIC on the raising thread, where the accelerator has no
+ *    irqfds but its APIC is the hypervisor's (WHPX's kernel-irqchip) and the
+ *    enabled vector is unmasked; and by a BH otherwise. Neither the irqfd's
+ *    write nor the request waits for the BQL or the main loop, and the lock
+ *    the request takes is held for nothing that waits. The BH runs in the
+ *    main loop, so a hold of it holds the interrupt back: a PNG screendump
+ *    of 2880x1620 held it about 120 ms on a Mac mini 2018 under WHPX, and
+ *    the guest took no completion meanwhile. route_doorbell applies its
+ *    change under the
  *    BQL before it returns, and the BQL's holders wait for none of the
  *    library's threads: the release at QEMU's quit runs with it let go.
  *
@@ -97,6 +105,7 @@
 #include "system/ramblock.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
+#include "system/whpx.h"
 #include "block/thread-pool.h"
 #include "ui/console.h"
 #include "ui/input.h"
@@ -200,6 +209,16 @@ struct ReimsGraphicsPCIState {
     bool irqfd_unmasked;    /* the irqfd is the route's */
     /* Atomic, set under the BQL: whether a raise writes the irqfd. */
     bool irqfd_on;
+    /*
+     * Where the accelerator has no irqfds and its APIC is the hypervisor's
+     * (WHPX), the vector's message while MSI-X is enabled, which a raise
+     * delivers on its own thread (whpx_send_msi_direct).
+     */
+    bool msi_direct_made;   /* set at realize, msi_lock initialised */
+    QemuMutex msi_lock;     /* held for no call of the library's */
+    bool msi_direct_on;     /* BQL protected: the vector notifiers are ours */
+    bool msi_unmasked;      /* msi_lock protected: the message is current */
+    MSIMessage msi_message; /* msi_lock protected */
 };
 
 QEMU_BUILD_BUG_ON(RVG_GRAPHICS_MSIX_VECTORS != 1);
@@ -226,18 +245,37 @@ static void reims_graphics_pci_raise_interrupt(void *opaque)
 /*
  * On the library's threads, or on the vCPU inside a register write
  * (rvg_graphics_device_mmio_write_taking, which holds no lock of ours), after
- * the library's write of what the interrupt reports: the irqfd's write
- * follows it on the same thread, so the guest takes the interrupt after it
- * sees the write, as it does through the BH. Neither waits for a lock.
+ * the library's write of what the interrupt reports: the irqfd's write, or
+ * the hypervisor's request, follows it on the same thread after a full
+ * barrier, so the guest takes the interrupt after it sees the write, as it
+ * does through the BH. The request is made under msi_lock, which the vector's
+ * mask and unmask take under the BQL and which waits for nothing else, so no
+ * interrupt is requested once the guest's mask of the vector has returned. A
+ * vector masked, MSI-X disabled, or a request the hypervisor refuses goes
+ * through the BH, where msix_notify sets the pending bit, drops it or says
+ * why it is lost, as before.
  */
 static void reims_graphics_pci_raise_interrupt_cb(void *ctx, uint32_t vector)
 {
     ReimsGraphicsPCIState *s = ctx;
     ReimsGraphicsInterruptJob *job;
+    bool sent = false;
 
     if (qatomic_load_acquire(&s->irqfd_on)) {
         event_notifier_set(&s->irqfd);
         return;
+    }
+    if (s->msi_direct_made) {
+        smp_mb();
+        qemu_mutex_lock(&s->msi_lock);
+        if (s->msi_unmasked) {
+            sent = whpx_send_msi_direct(s->msi_message.address,
+                                        s->msi_message.data);
+        }
+        qemu_mutex_unlock(&s->msi_lock);
+        if (sent) {
+            return;
+        }
     }
     job = g_new0(ReimsGraphicsInterruptJob, 1);
     job->device = ctx;
@@ -355,6 +393,64 @@ static void reims_graphics_pci_irqfd_disable(ReimsGraphicsPCIState *s)
     s->irqfd_virq = -1;
 }
 
+/*
+ * The vector's message for the hypervisor's direct delivery, while MSI-X is
+ * enabled: each unmask gives the message the table holds then, as the irqfd's
+ * route takes it. A raise while the vector is masked goes through the BH,
+ * whose msix_notify sets the pending bit that the unmask then delivers.
+ */
+static int reims_graphics_pci_direct_unmask(PCIDevice *dev, unsigned vector,
+                                            MSIMessage msg)
+{
+    ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(dev);
+
+    WITH_QEMU_LOCK_GUARD(&s->msi_lock) {
+        s->msi_message = msg;
+        s->msi_unmasked = true;
+    }
+    return 0;
+}
+
+static void reims_graphics_pci_direct_mask(PCIDevice *dev, unsigned vector)
+{
+    ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(dev);
+
+    WITH_QEMU_LOCK_GUARD(&s->msi_lock) {
+        s->msi_unmasked = false;
+    }
+}
+
+static void reims_graphics_pci_direct_enable(ReimsGraphicsPCIState *s)
+{
+    PCIDevice *dev = PCI_DEVICE(s);
+
+    if (msix_set_vector_notifiers(dev, reims_graphics_pci_direct_unmask,
+                                  reims_graphics_pci_direct_mask,
+                                  NULL) < 0) {
+        error_report("%s: set_vector_notifiers failed: interrupts go "
+                     "through a BH", TYPE_REIMS_GRAPHICS_PCI);
+        return;
+    }
+    s->msi_direct_on = true;
+}
+
+/*
+ * A raise between the guest's disable of MSI-X and this may still be
+ * delivered, as one that writes the irqfd then is.
+ */
+static void reims_graphics_pci_direct_disable(ReimsGraphicsPCIState *s)
+{
+    if (!s->msi_direct_on) {
+        return;
+    }
+    msix_unset_vector_notifiers(PCI_DEVICE(s));
+    s->msi_direct_on = false;
+    /* Where MSI-X was already disabled, unset called no mask notifier. */
+    WITH_QEMU_LOCK_GUARD(&s->msi_lock) {
+        s->msi_unmasked = false;
+    }
+}
+
 static void reims_graphics_pci_write_config(PCIDevice *dev, uint32_t address,
                                             uint32_t val, int len)
 {
@@ -362,13 +458,18 @@ static void reims_graphics_pci_write_config(PCIDevice *dev, uint32_t address,
     bool was_enabled = msix_enabled(dev);
 
     pci_default_write_config(dev, address, val, len);
-    if (!s->irqfd_made) {
-        return;
-    }
-    if (!was_enabled && msix_enabled(dev)) {
-        reims_graphics_pci_irqfd_enable(s);
-    } else if (was_enabled && !msix_enabled(dev)) {
-        reims_graphics_pci_irqfd_disable(s);
+    if (s->irqfd_made) {
+        if (!was_enabled && msix_enabled(dev)) {
+            reims_graphics_pci_irqfd_enable(s);
+        } else if (was_enabled && !msix_enabled(dev)) {
+            reims_graphics_pci_irqfd_disable(s);
+        }
+    } else if (s->msi_direct_made) {
+        if (!was_enabled && msix_enabled(dev)) {
+            reims_graphics_pci_direct_enable(s);
+        } else if (was_enabled && !msix_enabled(dev)) {
+            reims_graphics_pci_direct_disable(s);
+        }
     }
 }
 
@@ -1393,6 +1494,9 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s, bool quit)
     if (s->irqfd_made) {
         reims_graphics_pci_irqfd_disable(s);
     }
+    if (s->msi_direct_made) {
+        reims_graphics_pci_direct_disable(s);
+    }
     if (msix_present(dev)) {
         msix_uninit(dev, &s->bar0, &s->bar0);
     }
@@ -1731,6 +1835,9 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
             goto fail;
         }
         s->irqfd_made = true;
+    } else if (whpx_enabled() && whpx_irqchip_in_kernel()) {
+        qemu_mutex_init(&s->msi_lock);
+        s->msi_direct_made = true;
     }
     pci_register_bar(dev, RVG_GRAPHICS_PCI_BAR_REGISTERS,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar0);
@@ -1804,6 +1911,9 @@ static void reims_graphics_pci_reset(Object *obj, ResetType type)
     if (s->irqfd_made) {
         reims_graphics_pci_irqfd_disable(s);
     }
+    if (s->msi_direct_made) {
+        reims_graphics_pci_direct_disable(s);
+    }
     if (s->device) {
         rvg_graphics_device_reset(s->device);
     }
@@ -1826,6 +1936,9 @@ static void reims_graphics_pci_finalize(Object *obj)
     g_hash_table_destroy(s->routes);
     qemu_mutex_destroy(&s->read_lock);
     qemu_cond_destroy(&s->read_ended);
+    if (s->msi_direct_made) {
+        qemu_mutex_destroy(&s->msi_lock);
+    }
 }
 
 static const Property reims_graphics_pci_properties[] = {

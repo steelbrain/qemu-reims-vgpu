@@ -11,3 +11,8 @@
 
 bool whpx_allowed;
 bool whpx_irqchip_in_kernel;
+
+bool whpx_send_msi_direct(uint64_t address, uint32_t data)
+{
+    return false;
+}

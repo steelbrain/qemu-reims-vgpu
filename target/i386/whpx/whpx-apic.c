@@ -251,7 +251,15 @@ static void whpx_apic_external_nmi(APICCommonState *s)
 {
 }
 
-static void whpx_send_msi(MSIMessage *msg)
+/*
+ * The requests of MSIs, one at a time: whpx_apic_mem_write's, under the BQL,
+ * and whpx_send_msi_direct's, on any thread, so that they reach the partition
+ * one after another as the BQL alone kept them before.
+ */
+static GMutex whpx_msi_lock;
+
+/* The request of the MSI @msg describes, whose vector is not 0. */
+static HRESULT whpx_request_msi(const MSIMessage *msg)
 {
     uint64_t addr = msg->address;
     uint32_t data = msg->data;
@@ -260,11 +268,7 @@ static void whpx_send_msi(MSIMessage *msg)
     uint8_t dest_mode = (addr >> MSI_ADDR_DEST_MODE_SHIFT) & 0x1;
     uint8_t trigger_mode = (data >> MSI_DATA_TRIGGER_SHIFT) & 0x1;
     uint8_t delivery = (data >> MSI_DATA_DELIVERY_MODE_SHIFT) & 0x7;
-
-    if (vector == 0) {
-        warn_report("Ignoring request for interrupt vector 0");
-        return;
-    }
+    HRESULT hr;
 
     WHV_INTERRUPT_CONTROL interrupt = {
         /* Values correspond to delivery modes */
@@ -279,13 +283,50 @@ static void whpx_send_msi(MSIMessage *msg)
         .Vector = vector,
         .Destination = dest,
     };
-    HRESULT hr = whp_dispatch.WHvRequestInterrupt(whpx_global.partition,
-                     &interrupt, sizeof(interrupt));
+    g_mutex_lock(&whpx_msi_lock);
+    hr = whp_dispatch.WHvRequestInterrupt(whpx_global.partition,
+                                          &interrupt, sizeof(interrupt));
+    g_mutex_unlock(&whpx_msi_lock);
+    return hr;
+}
+
+static void whpx_send_msi(MSIMessage *msg)
+{
+    uint64_t addr = msg->address;
+    uint32_t data = msg->data;
+    uint8_t vector = (data & MSI_DATA_VECTOR_MASK) >> MSI_DATA_VECTOR_SHIFT;
+    uint8_t dest_mode = (addr >> MSI_ADDR_DEST_MODE_SHIFT) & 0x1;
+    uint8_t trigger_mode = (data >> MSI_DATA_TRIGGER_SHIFT) & 0x1;
+    uint8_t delivery = (data >> MSI_DATA_DELIVERY_MODE_SHIFT) & 0x7;
+    HRESULT hr;
+
+    if (vector == 0) {
+        warn_report("Ignoring request for interrupt vector 0");
+        return;
+    }
+
+    hr = whpx_request_msi(msg);
     if (FAILED(hr)) {
         fprintf(stderr, "whpx: injection failed, MSI (%llx, %x) delivery: %d, "
                 "dest_mode: %d, trigger mode: %d, vector: %d, lost (%08lx)\n",
                 addr, data, delivery, dest_mode, trigger_mode, vector, hr);
     }
+}
+
+/*
+ * The partition's WHvRequestInterrupt reads no state of QEMU's, so no BQL is
+ * needed. With the APIC the hypervisor's, a halted vCPU stays in
+ * WHvRunVirtualProcessor (X64Halt exits only with kernel-irqchip=off), so the
+ * request wakes it as one from a vCPU's MMIO exit does.
+ */
+bool whpx_send_msi_direct(uint64_t address, uint32_t data)
+{
+    MSIMessage msg = { .address = address, .data = data };
+
+    if (!whpx_irqchip_in_kernel() || !(data & MSI_DATA_VECTOR_MASK)) {
+        return false;
+    }
+    return SUCCEEDED(whpx_request_msi(&msg));
 }
 
 static uint64_t whpx_apic_mem_read(void *opaque, hwaddr addr,
