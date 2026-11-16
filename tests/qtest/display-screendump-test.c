@@ -1,6 +1,7 @@
 /*
  * QTest testcase for screendump: a PPM has the display's pixels, row for
- * row, at widths whose rows of 3-byte pixels end off a 4-byte boundary
+ * row, at widths whose rows of 3-byte pixels end off a 4-byte boundary; and
+ * a head the device lacks is an error, with text consoles beside its own
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -96,6 +97,40 @@ static void test_ppm(gconstpointer data)
     qtest_quit(qts);
 }
 
+/*
+ * A screendump naming a device and a head it has no console for answers an
+ * error, and QEMU goes on: the lookup passes over the text consoles, which
+ * have no device or head, rather than ending QEMU at the first.
+ */
+static void test_missing_head(void)
+{
+    g_autofree char *path = NULL;
+    QTestState *qts;
+    QDict *resp;
+    int fd;
+
+    fd = g_file_open_tmp("screendump-XXXXXX.ppm", &path, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+
+    qts = qtest_init("-vga none -device bochs-display,id=gfx,addr=04.0 "
+                     "-chardev vc,id=text0 "
+                     "-chardev vc,id=text1,cols=80,rows=24");
+
+    resp = qtest_qmp(qts, "{'execute': 'screendump', "
+                     "'arguments': {'filename': %s, 'device': 'gfx', "
+                     "'head': 1}}", path);
+    g_assert(qdict_haskey(resp, "error"));
+    qobject_unref(resp);
+
+    qtest_qmp_assert_success(qts, "{'execute': 'screendump', "
+                             "'arguments': {'filename': %s, 'device': 'gfx', "
+                             "'head': 0}}", path);
+
+    unlink(path);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     /* 66 * 3 bytes end 2 bytes off a 4-byte boundary, 67 * 3 bytes 1. */
@@ -110,6 +145,7 @@ int main(int argc, char **argv)
             qtest_add_data_func(testpath, GINT_TO_POINTER(widths[i]),
                                 test_ppm);
         }
+        qtest_add_func("/display/screendump/missing-head", test_missing_head);
     }
 
     return g_test_run();
