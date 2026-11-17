@@ -37,6 +37,14 @@
  *    from there. It is one RAM region over the mapping, with no dirty log:
  *    the library's window shows the guest's scanout again at each of the
  *    display's refreshes while it shows no presented surface.
+ *  - The guest's Shared pool: x-pool-size bytes of guest physical addresses
+ *    (64 GiB by default, whole GiB) with no RAM under them, from the host
+ *    bridge's pci-hole64-end, which the device reserves at realize; the
+ *    firmware places its 64-bit PCI window past them
+ *    (etc/reserved-memory-end). The library maps its blocks of host memory
+ *    into the range as the guest's pool grows and takes them out as it
+ *    shrinks, each its own RAM region, added and removed on the main loop
+ *    ("The guest's Shared pool", below).
  *  - The library's callbacks run on its own threads, and raise_interrupt
  *    also on the vCPU inside that write, with no lock held that a call of
  *    ours into the library waits for. An interrupt is raised by a write of
@@ -73,8 +81,9 @@
  * the cursor as the host's pointer.
  *
  * At QEMU's quit, once the VM stopped for good, the device is torn down
- * (reims_graphics_pci_vm_state_change): the library's release of its last
- * device lets go of the GPU device before the process exits. A read of a
+ * (reims_graphics_pci_vm_state_change): every pool piece leaves the guest's
+ * address space, and the library's release of its last device lets go of
+ * the GPU device before the process exits. A read of a
  * display still waiting for the GPU 5 s into the teardown keeps the device to
  * the exit instead, so a GPU that stopped answering does not hold the quit.
  *
