@@ -122,8 +122,7 @@
 #include "qemu/rcu.h"
 #include "trace.h"
 #ifdef CONFIG_LINUX
-#include "system/kvm.h"
-#include <linux/kvm.h>
+#include "reims-graphics-pci-kvm.h"
 #endif
 #include "ui/console.h"
 #include "ui/input.h"
@@ -1560,20 +1559,14 @@ static bool reims_graphics_pool_reserve(ReimsGraphicsPCIState *s,
     s->pool_length = size;
     trace_reims_graphics_pool_reserved(base, size);
 
-#if defined(CONFIG_LINUX) && defined(KVM_X86_QUIRK_SLOT_ZAP_ALL)
+#ifdef CONFIG_LINUX
     /*
      * A piece's removal deletes its KVM slot: by default that zaps every
      * slot's second-level maps, which the guest's RAM then refaults (1 GiB of
      * 4 KiB maps in about 0.3 s, measured 11-17). With the quirk off it zaps
      * only the deleted slot's.
      */
-    if (kvm_enabled() &&
-        (kvm_check_extension(kvm_state, KVM_CAP_DISABLE_QUIRKS2) &
-         KVM_X86_QUIRK_SLOT_ZAP_ALL) &&
-        kvm_vm_ioctl(kvm_state, KVM_ENABLE_CAP, &(struct kvm_enable_cap) {
-            .cap = KVM_CAP_DISABLE_QUIRKS2,
-            .args = { KVM_X86_QUIRK_SLOT_ZAP_ALL },
-        }) < 0) {
+    if (!reims_graphics_kvm_disable_slot_zap_all()) {
         warn_report("%s: KVM kept zapping every slot at a slot's delete: a "
                     "pool piece's removal refaults the guest's RAM",
                     TYPE_REIMS_GRAPHICS_PCI);

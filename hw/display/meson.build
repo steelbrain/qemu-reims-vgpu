@@ -67,8 +67,17 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
 
 # The reims-graphics device's transport; reims-vgpu's graphics device is its
 # host side.
-system_ss.add(when: [reims_vgpu, 'CONFIG_REIMS_GRAPHICS_PCI'],
-              if_true: files('reims-graphics-pci.c'))
+reims_graphics_ss = ss.source_set()
+reims_graphics_ss.add(files('reims-graphics-pci.c'))
+# Its calls into KVM. system_ss builds the device once for every target, and a
+# target without KVM links no KVM function, so those targets take the stub.
+if host_os == 'linux'
+  reims_graphics_ss.add(when: 'CONFIG_KVM',
+                        if_true: files('reims-graphics-pci-kvm.c'),
+                        if_false: files('reims-graphics-pci-kvm-stub.c'))
+endif
+system_ss.add_all(when: [reims_vgpu, 'CONFIG_REIMS_GRAPHICS_PCI'],
+                  if_true: reims_graphics_ss)
 
 if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   virtio_gpu_ss = ss.source_set()
