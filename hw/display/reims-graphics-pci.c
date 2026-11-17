@@ -106,6 +106,15 @@
 #include "system/runstate-action.h"
 #include "system/whpx.h"
 #include "block/thread-pool.h"
+#include "hw/nvram/fw_cfg.h"
+#include "hw/core/cpu.h"
+#include "qapi/visitor.h"
+#include "qemu/rcu.h"
+#include "trace.h"
+#ifdef CONFIG_LINUX
+#include "system/kvm.h"
+#include <linux/kvm.h>
+#endif
 #include "ui/console.h"
 #include "ui/input.h"
 #include <reims_vgpu.h>
@@ -136,6 +145,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsGraphicsPCIState, REIMS_GRAPHICS_PCI)
 #define REIMS_GRAPHICS_PCI_READ_LATE_MS 3000
 
 typedef struct ReimsGraphicsEvent ReimsGraphicsEvent;
+typedef struct ReimsGraphicsPoolAsk ReimsGraphicsPoolAsk;
 
 /*
  * A route applied: the ioeventfd matching `ring_id` at `addr` in `mr`, the
@@ -218,6 +228,21 @@ struct ReimsGraphicsPCIState {
     bool msi_direct_on;     /* BQL protected: the vector notifiers are ours */
     bool msi_unmasked;      /* msi_lock protected: the message is current */
     MSIMessage msi_message; /* msi_lock protected */
+
+    /*
+     * The guest's Shared pool: the range reserved for it at realize, and the
+     * library's asks to map and unmap its pieces, queued on its threads and
+     * carried out under the BQL (reims_graphics_pool_bh).
+     */
+    uint64_t pool_size;  /* the property x-pool-size: 0 for no pool */
+    hwaddr pool_base;    /* where the range starts, once reserved */
+    uint64_t pool_length; /* its length: 0 where the device has no pool */
+    QemuMutex pool_lock;
+    QSIMPLEQ_HEAD(, ReimsGraphicsPoolAsk) pool_asks; /* pool_lock protected */
+    bool pool_closed;   /* pool_lock protected: the teardown took the pieces */
+    QEMUBH *pool_bh;
+    GPtrArray *pool_pieces; /* BQL protected: the pieces in the guest */
+    int pool_alive;         /* BQL protected: pieces not yet finalized */
 };
 
 QEMU_BUILD_BUG_ON(RVG_GRAPHICS_MSIX_VECTORS != 1);
@@ -1169,6 +1194,388 @@ static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
     }
 }
 
+/* ------ The guest's Shared pool ------ */
+
+/*
+ * The guest's Shared pool is a range of guest physical addresses with no RAM
+ * under it, reserved at realize (reims_graphics_pool_reserve), which the
+ * library fills with blocks of host memory as the pool grows: one piece a
+ * block, each its own RAM region (so the flat view never merges two, and an
+ * add or a removal touches no other piece's KVM slot or WHPX mapping), owned
+ * by an object of its own, a ReimsGraphicsPoolPiece. The library asks on its
+ * threads (pool_add, pool_remove); the asks are queued and carried out on the
+ * main loop, under the BQL, in order. Under WHPX the add's hypervisor map runs
+ * on the asking thread first, outside the BQL (whpx_map_ahead).
+ *
+ * A piece leaves the guest's address space at its removal, under the BQL, but
+ * a flat view of an older generation or a device's DMA map
+ * (address_space_map) may still hold it: those hold its owner, so the piece's
+ * end, where it tells the library that the memory is free to go
+ * (rvg_graphics_device_pool_removed), comes once the last of them goes.
+ */
+
+#define TYPE_REIMS_GRAPHICS_POOL_PIECE "reims-graphics-pool-piece"
+OBJECT_DECLARE_SIMPLE_TYPE(ReimsGraphicsPoolPiece, REIMS_GRAPHICS_POOL_PIECE)
+
+/* The default length of the pool's range: 64 GiB of guest physical addresses. */
+#define REIMS_GRAPHICS_POOL_SIZE (64 * GiB)
+
+struct ReimsGraphicsPoolPiece {
+    Object parent_obj;
+    MemoryRegion mr;
+    ReimsGraphicsPCIState *s;
+    hwaddr gpa;
+};
+
+struct ReimsGraphicsPoolAsk {
+    bool add;
+    hwaddr gpa;
+    uint64_t size;
+    void *host;
+    bool mapped_ahead; /* whpx_map_ahead took it */
+    int64_t asked;     /* QEMU_CLOCK_REALTIME ns, at the ask */
+    int64_t map_ns;    /* the map ahead's time */
+    QSIMPLEQ_ENTRY(ReimsGraphicsPoolAsk) next;
+};
+
+static void reims_graphics_pool_piece_finalize(Object *obj)
+{
+    ReimsGraphicsPoolPiece *piece = REIMS_GRAPHICS_POOL_PIECE(obj);
+    ReimsGraphicsPCIState *s = piece->s;
+
+    /* Its region went before this, with the piece's properties. */
+    s->pool_alive--;
+    trace_reims_graphics_pool_removed(piece->gpa);
+    if (s->device) {
+        rvg_graphics_device_pool_removed(s->device, piece->gpa);
+    }
+}
+
+/* The added piece at @gpa, or -1. */
+static int reims_graphics_pool_find(ReimsGraphicsPCIState *s, hwaddr gpa)
+{
+    guint i;
+
+    for (i = 0; i < s->pool_pieces->len; i++) {
+        ReimsGraphicsPoolPiece *p = g_ptr_array_index(s->pool_pieces, i);
+
+        if (p->gpa == gpa) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Whether @gpa and @size lie in the range and overlap no added piece. */
+static bool reims_graphics_pool_free(ReimsGraphicsPCIState *s, hwaddr gpa,
+                                     uint64_t size)
+{
+    guint i;
+
+    if (gpa < s->pool_base || size > s->pool_length ||
+        gpa - s->pool_base > s->pool_length - size) {
+        return false;
+    }
+    for (i = 0; i < s->pool_pieces->len; i++) {
+        ReimsGraphicsPoolPiece *p = g_ptr_array_index(s->pool_pieces, i);
+        uint64_t len = memory_region_size(&p->mr);
+
+        if (gpa < p->gpa + len && p->gpa < gpa + size) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void reims_graphics_pool_add(ReimsGraphicsPCIState *s,
+                                    ReimsGraphicsPoolAsk *ask)
+{
+    ReimsGraphicsPoolPiece *piece;
+    int64_t t0, t1;
+
+    if (!reims_graphics_pool_free(s, ask->gpa, ask->size)) {
+        error_report_once("%s: the library asked a pool piece of 0x%" PRIx64
+                          " bytes at 0x%" PRIx64 ", outside the pool's free "
+                          "range: not mapped", TYPE_REIMS_GRAPHICS_PCI,
+                          ask->size, ask->gpa);
+        if (ask->mapped_ahead) {
+            whpx_unmap_ahead(ask->gpa, ask->size, ask->host);
+        }
+        return;
+    }
+    t0 = get_clock();
+    piece = REIMS_GRAPHICS_POOL_PIECE(object_new(TYPE_REIMS_GRAPHICS_POOL_PIECE));
+    piece->s = s;
+    piece->gpa = ask->gpa;
+    memory_region_init_ram_ptr(&piece->mr, OBJECT(piece),
+                               "reims-graphics-pci.pool-piece", ask->size,
+                               ask->host);
+    memory_region_set_unmergeable(&piece->mr, true);
+    memory_region_transaction_begin();
+    memory_region_add_subregion(get_system_memory(), ask->gpa, &piece->mr);
+    memory_region_transaction_commit();
+    t1 = get_clock();
+    g_ptr_array_add(s->pool_pieces, piece);
+    s->pool_alive++;
+    trace_reims_graphics_pool_add(ask->gpa, ask->size, ask->mapped_ahead,
+                                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
+                                  ask->asked, ask->map_ns, t1 - t0);
+    rvg_graphics_device_pool_added(s->device, ask->gpa);
+}
+
+/* Takes the piece at index @i out of the guest's address space. */
+static void reims_graphics_pool_take(ReimsGraphicsPCIState *s, guint i)
+{
+    ReimsGraphicsPoolPiece *piece = g_ptr_array_steal_index(s->pool_pieces, i);
+
+    memory_region_del_subregion(get_system_memory(), &piece->mr);
+    /* Its end, and the library's word, wait for its last holder. */
+    object_unref(OBJECT(piece));
+}
+
+static void reims_graphics_pool_remove(ReimsGraphicsPCIState *s,
+                                       ReimsGraphicsPoolAsk *ask)
+{
+    int i = reims_graphics_pool_find(s, ask->gpa);
+    int64_t t0;
+
+    if (i < 0) {
+        /* Its add was refused: nothing of it is in the guest. */
+        rvg_graphics_device_pool_removed(s->device, ask->gpa);
+        return;
+    }
+    t0 = get_clock();
+    memory_region_transaction_begin();
+    reims_graphics_pool_take(s, i);
+    memory_region_transaction_commit();
+    trace_reims_graphics_pool_remove(ask->gpa, ask->size, get_clock() - t0);
+}
+
+/* The library's asks, carried out in order under the BQL. */
+static void reims_graphics_pool_bh(void *opaque)
+{
+    ReimsGraphicsPCIState *s = opaque;
+    ReimsGraphicsPoolAsk *ask;
+
+    for (;;) {
+        WITH_QEMU_LOCK_GUARD(&s->pool_lock) {
+            ask = QSIMPLEQ_FIRST(&s->pool_asks);
+            if (ask) {
+                QSIMPLEQ_REMOVE_HEAD(&s->pool_asks, next);
+            }
+        }
+        if (!ask) {
+            return;
+        }
+        if (ask->add) {
+            reims_graphics_pool_add(s, ask);
+        } else {
+            reims_graphics_pool_remove(s, ask);
+        }
+        g_free(ask);
+    }
+}
+
+/* Queues @ask for the main loop; false where the teardown took the pool. */
+static bool reims_graphics_pool_queue(ReimsGraphicsPCIState *s,
+                                      ReimsGraphicsPoolAsk *ask)
+{
+    WITH_QEMU_LOCK_GUARD(&s->pool_lock) {
+        if (s->pool_closed) {
+            return false;
+        }
+        QSIMPLEQ_INSERT_TAIL(&s->pool_asks, ask, next);
+    }
+    qemu_bh_schedule(s->pool_bh);
+    return true;
+}
+
+/*
+ * The library's pool_add, on its pool thread, the BQL not held: under WHPX
+ * the hypervisor's map runs here, then the add is queued for the main loop.
+ */
+static void reims_graphics_pool_add_cb(void *ctx, uint64_t physical_address,
+                                       void *host_address, uint64_t length)
+{
+    ReimsGraphicsPCIState *s = ctx;
+    ReimsGraphicsPoolAsk *ask = g_new0(ReimsGraphicsPoolAsk, 1);
+    int64_t t0;
+
+    ask->add = true;
+    ask->gpa = physical_address;
+    ask->size = length;
+    ask->host = host_address;
+    ask->asked = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (whpx_enabled()) {
+        t0 = get_clock();
+        ask->mapped_ahead = whpx_map_ahead(host_address, physical_address,
+                                           length);
+        ask->map_ns = get_clock() - t0;
+    }
+    if (!reims_graphics_pool_queue(s, ask)) {
+        if (ask->mapped_ahead) {
+            whpx_unmap_ahead(ask->gpa, ask->size, ask->host);
+        }
+        g_free(ask);
+    }
+}
+
+/* The library's pool_remove, on the thread freeing the block. */
+static void reims_graphics_pool_remove_cb(void *ctx, uint64_t physical_address,
+                                          uint64_t length)
+{
+    ReimsGraphicsPCIState *s = ctx;
+    ReimsGraphicsPoolAsk *ask = g_new0(ReimsGraphicsPoolAsk, 1);
+
+    ask->gpa = physical_address;
+    ask->size = length;
+    if (!reims_graphics_pool_queue(s, ask)) {
+        /* The teardown takes the piece, and its end says so. */
+        g_free(ask);
+    }
+}
+
+/*
+ * The teardown's part, under the BQL, before the device's release: no ask is
+ * carried out from here on, every piece leaves the guest in one transaction,
+ * and the pieces' ends, which tell the library, run before the release where
+ * nothing else holds them (drain_call_rcu lets the BQL go meanwhile). The
+ * library frees the pieces' memory at the release, after this.
+ */
+static void reims_graphics_pool_close(ReimsGraphicsPCIState *s)
+{
+    ReimsGraphicsPoolAsk *ask;
+
+    if (!s->pool_bh) {
+        return;
+    }
+    WITH_QEMU_LOCK_GUARD(&s->pool_lock) {
+        s->pool_closed = true;
+        while ((ask = QSIMPLEQ_FIRST(&s->pool_asks)) != NULL) {
+            QSIMPLEQ_REMOVE_HEAD(&s->pool_asks, next);
+            if (ask->mapped_ahead) {
+                whpx_unmap_ahead(ask->gpa, ask->size, ask->host);
+            }
+            g_free(ask);
+        }
+    }
+    if (s->pool_pieces->len > 0) {
+        memory_region_transaction_begin();
+        while (s->pool_pieces->len > 0) {
+            reims_graphics_pool_take(s, s->pool_pieces->len - 1);
+        }
+        memory_region_transaction_commit();
+    }
+    if (s->pool_alive > 0) {
+        drain_call_rcu();
+    }
+    if (s->pool_alive > 0) {
+        warn_report("%s: %d pool pieces are still held past their removal: "
+                    "their memory goes at the release all the same",
+                    TYPE_REIMS_GRAPHICS_PCI, s->pool_alive);
+    }
+}
+
+/*
+ * Reserves the pool's range, @size bytes rounded down to 1 GiB, where the
+ * machine has room for it: on a PC machine (one whose PCI host bridge answers
+ * pci-hole64-end, q35's and i440fx's), at the first 1 GiB past the RAM and the
+ * bridge's default 64-bit window, which ends 32 GiB past the RAM before any
+ * BAR is placed, and below the top quarter of the guest's physical addresses,
+ * where OVMF puts its own 64-bit window when it sizes it from them. The
+ * firmware gets etc/reserved-memory-end past the range, so OVMF puts its
+ * 64-bit window above it otherwise, as above memory hotplug's. Nothing lies
+ * under the range: a piece's add is a pure add. False, with no pool, on any
+ * other machine or where nothing fits.
+ */
+static bool reims_graphics_pool_reserve(ReimsGraphicsPCIState *s,
+                                        uint64_t size)
+{
+    PCIDevice *dev = PCI_DEVICE(s);
+    Object *host = OBJECT(BUS(pci_device_root_bus(dev))->parent);
+    FWCfgState *fw_cfg = fw_cfg_find();
+    uint64_t base, end, limit, bits = 0, *val, *old;
+
+    if (!size || target_aarch64() || !fw_cfg ||
+        !object_property_find(host, "pci-hole64-end")) {
+        return false;
+    }
+    base = ROUND_UP(object_property_get_uint(host, "pci-hole64-end", NULL),
+                    GiB);
+    if (first_cpu && object_property_find(OBJECT(first_cpu), "phys-bits")) {
+        bits = object_property_get_uint(OBJECT(first_cpu), "phys-bits", NULL);
+    }
+    limit = bits >= 32 && bits < 64 ? (1ULL << bits) / 4 * 3 : UINT64_MAX;
+    if (base >= limit) {
+        warn_report("%s: the guest's %" PRIu64 " physical address bits leave "
+                    "no room for its pool past 0x%" PRIx64,
+                    TYPE_REIMS_GRAPHICS_PCI, bits, base);
+        return false;
+    }
+    size = QEMU_ALIGN_DOWN(MIN(size, limit - base), GiB);
+    if (!size) {
+        return false;
+    }
+    end = base + size;
+    val = g_new(uint64_t, 1);
+    *val = cpu_to_le64(end);
+    old = fw_cfg_modify_file(fw_cfg, "etc/reserved-memory-end", val,
+                             sizeof(*val));
+    if (old && le64_to_cpu(*old) > end) {
+        /* Memory hotplug's area ends past the pool: its end stays. */
+        *val = *old;
+    }
+    g_free(old);
+    s->pool_base = base;
+    s->pool_length = size;
+    trace_reims_graphics_pool_reserved(base, size);
+
+#if defined(CONFIG_LINUX) && defined(KVM_X86_QUIRK_SLOT_ZAP_ALL)
+    /*
+     * A piece's removal deletes its KVM slot: by default that zaps every
+     * slot's second-level maps, which the guest's RAM then refaults (1 GiB of
+     * 4 KiB maps in about 0.3 s, measured 11-17). With the quirk off it zaps
+     * only the deleted slot's.
+     */
+    if (kvm_enabled() &&
+        (kvm_check_extension(kvm_state, KVM_CAP_DISABLE_QUIRKS2) &
+         KVM_X86_QUIRK_SLOT_ZAP_ALL) &&
+        kvm_vm_ioctl(kvm_state, KVM_ENABLE_CAP, &(struct kvm_enable_cap) {
+            .cap = KVM_CAP_DISABLE_QUIRKS2,
+            .args = { KVM_X86_QUIRK_SLOT_ZAP_ALL },
+        }) < 0) {
+        warn_report("%s: KVM kept zapping every slot at a slot's delete: a "
+                    "pool piece's removal refaults the guest's RAM",
+                    TYPE_REIMS_GRAPHICS_PCI);
+    }
+#endif
+    return true;
+}
+
+/* The x-pool-grow property: asks the library for that many more bytes. */
+static void reims_graphics_pool_grow_set(Object *obj, Visitor *v,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(obj);
+    uint64_t value;
+    RvgStatus status;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+    if (!s->device) {
+        error_setg(errp, "%s: the device is not realized",
+                   TYPE_REIMS_GRAPHICS_PCI);
+        return;
+    }
+    status = rvg_graphics_device_pool_grow(s->device, value);
+    if (status != RVG_OK) {
+        error_setg(errp, "%s: rvg_graphics_device_pool_grow: %s",
+                   TYPE_REIMS_GRAPHICS_PCI, rvg_status_message(status));
+    }
+}
+
 /* ------ Initialisation and startup ------ */
 
 /* ------ The consoles: what each display shows, read back ------ */
@@ -1396,6 +1803,9 @@ static void reims_graphics_pci_init(Object *obj)
     s->routes = g_hash_table_new(g_int64_hash, g_int64_equal);
     qemu_mutex_init(&s->read_lock);
     qemu_cond_init(&s->read_ended);
+    qemu_mutex_init(&s->pool_lock);
+    QSIMPLEQ_INIT(&s->pool_asks);
+    s->pool_pieces = g_ptr_array_new();
     for (i = 0; i < RVG_GRAPHICS_DISPLAYS_MAX; i++) {
         s->heads[i].s = s;
         s->heads[i].index = i;
@@ -1499,6 +1909,7 @@ static void reims_graphics_pci_teardown(ReimsGraphicsPCIState *s, bool quit)
     if (msix_present(dev)) {
         msix_uninit(dev, &s->bar0, &s->bar0);
     }
+    reims_graphics_pool_close(s);
     device = s->device;
     s->device = NULL;
     if (quit) {
@@ -1686,6 +2097,8 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         .cursor_glyph_at = reims_graphics_cursor_glyph_at_cb,
         .cursor_show_at = reims_graphics_cursor_show_at_cb,
         .cursor_move_at = reims_graphics_cursor_move_at_cb,
+        .pool_add = reims_graphics_pool_add_cb,
+        .pool_remove = reims_graphics_pool_remove_cb,
     };
     /* Each display's window, its callbacks' ctx the display's head. */
     RvgWindowCallbacks window_callbacks[RVG_GRAPHICS_DISPLAYS_MAX];
@@ -1809,8 +2222,15 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                     TYPE_REIMS_GRAPHICS_PCI);
     }
 
+    /* The guest's Shared pool, where the machine has room for it. */
+    if (reims_graphics_pool_reserve(s, s->pool_size)) {
+        config.pool_physical_address = s->pool_base;
+        config.pool_physical_length = s->pool_length;
+    }
+
     /* The windows' input runs from here on; the callbacks need the BHs. */
     s->event_bh = qemu_bh_new(reims_graphics_event_bh, s);
+    s->pool_bh = qemu_bh_new(reims_graphics_pool_bh, s);
     status = rvg_graphics_device_create(&config, &s->device);
     if (status != RVG_OK) {
         error_setg(errp, "%s: rvg_graphics_device_create: %s",
@@ -1938,11 +2358,18 @@ static void reims_graphics_pci_finalize(Object *obj)
     if (s->msi_direct_made) {
         qemu_mutex_destroy(&s->msi_lock);
     }
+    if (s->pool_bh) {
+        qemu_bh_delete(s->pool_bh);
+    }
+    g_ptr_array_free(s->pool_pieces, true);
+    qemu_mutex_destroy(&s->pool_lock);
 }
 
 static const Property reims_graphics_pci_properties[] = {
     DEFINE_PROP_STRING("resolution", ReimsGraphicsPCIState, resolution),
     DEFINE_PROP_UINT32("displays", ReimsGraphicsPCIState, displays, 1),
+    DEFINE_PROP_SIZE("x-pool-size", ReimsGraphicsPCIState, pool_size,
+                     REIMS_GRAPHICS_POOL_SIZE),
 };
 
 static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
@@ -1956,6 +2383,8 @@ static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     device_class_set_props(dc, reims_graphics_pci_properties);
+    object_class_property_add(klass, "x-pool-grow", "uint64", NULL,
+                              reims_graphics_pool_grow_set, NULL, NULL);
 
     pci->vendor_id = RVG_GRAPHICS_PCI_VENDOR_ID;
     pci->device_id = RVG_GRAPHICS_PCI_DEVICE_ID;
@@ -1977,6 +2406,12 @@ static const TypeInfo reims_graphics_pci_types[] = {
             { INTERFACE_PCIE_DEVICE },
             { },
         },
+    },
+    {
+        .name              = TYPE_REIMS_GRAPHICS_POOL_PIECE,
+        .parent            = TYPE_OBJECT,
+        .instance_size     = sizeof(ReimsGraphicsPoolPiece),
+        .instance_finalize = reims_graphics_pool_piece_finalize,
     },
 };
 DEFINE_TYPES(reims_graphics_pci_types)
