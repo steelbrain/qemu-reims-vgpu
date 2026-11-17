@@ -16,3 +16,12 @@ bool whpx_send_msi_direct(uint64_t address, uint32_t data)
 {
     return false;
 }
+
+bool whpx_map_ahead(void *host, uint64_t gpa, uint64_t size)
+{
+    return false;
+}
+
+void whpx_unmap_ahead(uint64_t gpa, uint64_t size, void *host)
+{
+}

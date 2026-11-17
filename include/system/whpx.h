@@ -37,6 +37,21 @@ extern bool whpx_irqchip_in_kernel;
  * why it is lost.
  */
 bool whpx_send_msi_direct(uint64_t address, uint32_t data);
+/*
+ * Maps @size bytes of host memory at @host into the guest at @gpa, read,
+ * write and execute, on any thread, without the BQL, ahead of the add of the
+ * RAM region that holds exactly that memory there: the listener's add of that
+ * section then maps nothing, so the hypervisor's map, which takes about 26 ms
+ * a GiB, is not spent under the BQL. The range must hold nothing in the
+ * guest's address space until that add. False, with nothing mapped, where the
+ * hypervisor refused it; the add then maps it as usual.
+ */
+bool whpx_map_ahead(void *host, uint64_t gpa, uint64_t size);
+/*
+ * Undoes a whpx_map_ahead of exactly @gpa, @size and @host whose region was
+ * never added; nothing where the add took it.
+ */
+void whpx_unmap_ahead(uint64_t gpa, uint64_t size, void *host);
 #else /* !CONFIG_WHPX_IS_POSSIBLE */
 #define whpx_enabled() 0
 #define whpx_irqchip_in_kernel() (0)
