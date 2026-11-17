@@ -108,6 +108,7 @@
 #include "block/thread-pool.h"
 #include "hw/nvram/fw_cfg.h"
 #include "hw/core/cpu.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
 #include "qemu/rcu.h"
 #include "trace.h"
@@ -2383,7 +2384,8 @@ static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     device_class_set_props(dc, reims_graphics_pci_properties);
-    object_class_property_add(klass, "x-pool-grow", "uint64", NULL,
+    object_class_property_add(klass, "x-pool-grow", "uint64",
+                              &uint64_type_info, NULL,
                               reims_graphics_pool_grow_set, NULL, NULL);
 
     pci->vendor_id = RVG_GRAPHICS_PCI_VENDOR_ID;
