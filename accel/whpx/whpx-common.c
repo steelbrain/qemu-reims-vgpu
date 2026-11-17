@@ -290,7 +290,9 @@ void whpx_vcpu_kick(CPUState *cpu)
 
 /*
  * The ranges a device mapped ahead of their RAM region's add
- * (whpx_map_ahead), each until the listener meets its add.
+ * (whpx_map_ahead), each until the listener meets its add; and those it
+ * unmapped ahead of their RAM region's removal (whpx_unmap_before_del), each
+ * until the listener meets the removal.
  */
 typedef struct WhpxMappedAhead {
     uint64_t gpa;
@@ -301,6 +303,8 @@ typedef struct WhpxMappedAhead {
 
 static QSLIST_HEAD(, WhpxMappedAhead) whpx_mapped_ahead =
     QSLIST_HEAD_INITIALIZER(whpx_mapped_ahead);
+static QSLIST_HEAD(, WhpxMappedAhead) whpx_unmapped_ahead =
+    QSLIST_HEAD_INITIALIZER(whpx_unmapped_ahead);
 static QemuMutex whpx_mapped_ahead_lock;
 
 static void __attribute__((__constructor__)) whpx_mapped_ahead_init(void)
@@ -362,6 +366,57 @@ void whpx_unmap_ahead(uint64_t gpa, uint64_t size, void *host)
     }
 }
 
+/*
+ * Takes the entry a device unmapped ahead for exactly @gpa and @size, if any:
+ * true where the listener's unmap of that section is already done.
+ */
+static bool whpx_take_unmapped_ahead(uint64_t gpa, uint64_t size)
+{
+    WhpxMappedAhead *m;
+    bool found = false;
+
+    qemu_mutex_lock(&whpx_mapped_ahead_lock);
+    QSLIST_FOREACH(m, &whpx_unmapped_ahead, next) {
+        if (m->gpa == gpa && m->size == size) {
+            QSLIST_REMOVE(&whpx_unmapped_ahead, m, WhpxMappedAhead, next);
+            g_free(m);
+            found = true;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&whpx_mapped_ahead_lock);
+    return found;
+}
+
+bool whpx_unmap_before_del(uint64_t gpa, uint64_t size)
+{
+    struct whpx_state *whpx = &whpx_global;
+    WhpxMappedAhead *m, *a;
+    HRESULT hr;
+
+    m = g_new0(WhpxMappedAhead, 1);
+    m->gpa = gpa;
+    m->size = size;
+    qemu_mutex_lock(&whpx_mapped_ahead_lock);
+    QSLIST_FOREACH(a, &whpx_mapped_ahead, next) {
+        if (a->gpa == gpa) {
+            /* Its add is still to come: the listener unmaps it as usual. */
+            qemu_mutex_unlock(&whpx_mapped_ahead_lock);
+            g_free(m);
+            return false;
+        }
+    }
+    /* Recorded first: a removal the listener meets meanwhile unmaps nothing. */
+    QSLIST_INSERT_HEAD(&whpx_unmapped_ahead, m, next);
+    qemu_mutex_unlock(&whpx_mapped_ahead_lock);
+    hr = whp_dispatch.WHvUnmapGpaRange(whpx->partition, gpa, size);
+    if (FAILED(hr)) {
+        whpx_take_unmapped_ahead(gpa, size);
+        return false;
+    }
+    return true;
+}
+
 static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -389,6 +444,10 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
     }
 
     if (!add) {
+        /* A device unmapped it ahead, outside the BQL: the unmap is done. */
+        if (whpx_take_unmapped_ahead(gva, size)) {
+            return;
+        }
         hr = whp_dispatch.WHvUnmapGpaRange(whpx->partition,
                 gva, size);
         if (FAILED(hr)) {

@@ -25,3 +25,8 @@ bool whpx_map_ahead(void *host, uint64_t gpa, uint64_t size)
 void whpx_unmap_ahead(uint64_t gpa, uint64_t size, void *host)
 {
 }
+
+bool whpx_unmap_before_del(uint64_t gpa, uint64_t size)
+{
+    return false;
+}
