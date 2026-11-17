@@ -1215,7 +1215,8 @@ static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
  * by an object of its own, a ReimsGraphicsPoolPiece. The library asks on its
  * threads (pool_add, pool_remove); the asks are queued and carried out on the
  * main loop, under the BQL, in order. Under WHPX the add's hypervisor map runs
- * on the asking thread first, outside the BQL (whpx_map_ahead).
+ * on the asking thread first, outside the BQL (whpx_map_ahead), and so does a
+ * removal's unmap (whpx_unmap_before_del).
  *
  * A piece leaves the guest's address space at its removal, under the BQL, but
  * a flat view of an older generation or a device's DMA map
@@ -1242,9 +1243,10 @@ struct ReimsGraphicsPoolAsk {
     hwaddr gpa;
     uint64_t size;
     void *host;
-    bool mapped_ahead; /* whpx_map_ahead took it */
+    bool mapped_ahead; /* whpx_map_ahead took it, or for a removal */
+                       /* whpx_unmap_before_del */
     int64_t asked;     /* QEMU_CLOCK_REALTIME ns, at the ask */
-    int64_t map_ns;    /* the map ahead's time */
+    int64_t map_ns;    /* the map or unmap ahead's time */
     QSIMPLEQ_ENTRY(ReimsGraphicsPoolAsk) next;
 };
 
@@ -1358,7 +1360,8 @@ static void reims_graphics_pool_remove(ReimsGraphicsPCIState *s,
     memory_region_transaction_begin();
     reims_graphics_pool_take(s, i);
     memory_region_transaction_commit();
-    trace_reims_graphics_pool_remove(ask->gpa, ask->size, get_clock() - t0);
+    trace_reims_graphics_pool_remove(ask->gpa, ask->size, ask->mapped_ahead,
+                                     ask->map_ns, get_clock() - t0);
 }
 
 /* The library's asks, carried out in order under the BQL. */
@@ -1430,15 +1433,32 @@ static void reims_graphics_pool_add_cb(void *ctx, uint64_t physical_address,
     }
 }
 
-/* The library's pool_remove, on the thread freeing the block. */
+/*
+ * The library's pool_remove, on the thread freeing the block, the BQL not
+ * held: under WHPX the hypervisor's unmap runs here, then the removal is
+ * queued for the main loop. The guest holds no mapping of the piece by now.
+ */
 static void reims_graphics_pool_remove_cb(void *ctx, uint64_t physical_address,
                                           uint64_t length)
 {
     ReimsGraphicsPCIState *s = ctx;
     ReimsGraphicsPoolAsk *ask = g_new0(ReimsGraphicsPoolAsk, 1);
+    bool closed = false;
+    int64_t t0;
 
     ask->gpa = physical_address;
     ask->size = length;
+    if (whpx_enabled()) {
+        WITH_QEMU_LOCK_GUARD(&s->pool_lock) {
+            closed = s->pool_closed;
+        }
+        /* Once closed, the teardown takes the piece out itself. */
+        if (!closed) {
+            t0 = get_clock();
+            ask->mapped_ahead = whpx_unmap_before_del(physical_address, length);
+            ask->map_ns = get_clock() - t0;
+        }
+    }
     if (!reims_graphics_pool_queue(s, ask)) {
         /* The teardown takes the piece, and its end says so. */
         g_free(ask);
