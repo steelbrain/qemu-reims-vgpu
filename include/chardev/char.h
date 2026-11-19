@@ -158,6 +158,17 @@ void qemu_chr_change(QemuOpts *opts, Error **errp);
  */
 void qemu_chr_cleanup(void);
 
+#ifndef _WIN32
+/**
+ * qemu_chr_stdio_term_exit:
+ *
+ * Restores the terminal a stdio chardev took, as its atexit handler does:
+ * for a process that then ends with _exit, which runs no atexit handler.
+ * Nothing where no stdio chardev took it.
+ */
+void qemu_chr_stdio_term_exit(void);
+#endif
+
 /**
  * qemu_chr_new_noreplay:
  * @label: the name of the backend

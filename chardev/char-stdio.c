@@ -66,6 +66,11 @@ static void term_exit(void)
     }
 }
 
+void qemu_chr_stdio_term_exit(void)
+{
+    term_exit();
+}
+
 static void stdio_chr_set_echo(Chardev *chr, bool echo)
 {
     struct termios tty;

@@ -1103,7 +1103,7 @@ void qemu_add_cleanup_notifier(Notifier *notify)
     notifier_list_add(&cleanup_notifiers, notify);
 }
 
-static void qemu_run_exit_notifiers(void)
+void qemu_run_exit_notifiers(void)
 {
     BQL_LOCK_GUARD();
     notifier_list_notify(&exit_notifiers, NULL);

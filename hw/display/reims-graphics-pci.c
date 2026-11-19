@@ -91,12 +91,14 @@
  * the exit instead, so a GPU that stopped answering does not hold the quit.
  * Whether released or kept, the library is quiesced at the end of QEMU's
  * cleanup, before any exit handler runs (reims_graphics_pci_cleanup), and
- * QEMU ends with _exit where its GPU work did not stop in time.
+ * where it still holds a GPU device QEMU runs its own exit work and ends with
+ * _exit (reims_graphics_pci_end).
  *
  * The device has no default option ROM: romfile names one.
  */
 
 #include "qemu/osdep.h"
+#include "chardev/char.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/event_notifier.h"
@@ -162,7 +164,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsGraphicsPCIState, REIMS_GRAPHICS_PCI)
  * waits for the same threads and the same GPU work. At a quit the vCPUs are
  * paused, so the GPU holds only the guest's last work, done in milliseconds;
  * the bound is reached only by a GPU that stopped answering or a compile that
- * outlasts it, and QEMU then ends with _exit at once.
+ * outlasts it, and QEMU then ends with _exit (reims_graphics_pci_end).
  */
 #define REIMS_GRAPHICS_PCI_QUIESCE_MS 5000
 
@@ -2303,8 +2305,9 @@ static void reims_graphics_pci_check_low_ram(void)
  * handler hears it. The device then stays to the exit. So does it when a read
  * of a display under way still waits for the GPU 5 s into the teardown
  * (reims_graphics_pci_teardown). Either way the library's quiesce at the end
- * of QEMU's cleanup (reims_graphics_pci_cleanup) stops its GPU work before
- * the driver's exit handlers run.
+ * of QEMU's cleanup (reims_graphics_pci_cleanup) stops its GPU work, and QEMU
+ * then ends with _exit, so the driver's exit handlers never run with the GPU
+ * device live.
  */
 static void reims_graphics_pci_vm_state_change(void *opaque, bool running,
                                                RunState state)
@@ -2323,29 +2326,47 @@ static void reims_graphics_pci_vm_state_change(void *opaque, bool running,
  * Quiesces the library ahead of the process's exit, with the BQL let go where
  * this thread holds it, as around the release at quit: a device callback
  * waiting for the BQL inside a call of the library's would hold the quiesce
- * up to its bound. Whether it answered true: no thread of the library's or of
- * its runtime is left in the GPU's driver as the driver's exit handlers run.
+ * up to its bound. Whether QEMU may then exit(): the library holds no GPU
+ * device, and no thread of its own is left in the GPU's driver.
  */
 static bool reims_graphics_pci_quiesce(const char *where)
 {
     bool locked = bql_locked();
     int64_t t0 = get_clock();
-    bool quiesced;
+    bool may_exit;
 
     if (locked) {
         bql_unlock();
     }
-    quiesced = rvg_quiesce_for_exit(REIMS_GRAPHICS_PCI_QUIESCE_MS);
+    may_exit = rvg_quiesce_for_exit(REIMS_GRAPHICS_PCI_QUIESCE_MS);
     if (locked) {
         bql_lock();
     }
-    trace_reims_graphics_quiesce(where, quiesced, get_clock() - t0);
-    if (!quiesced) {
-        warn_report("%s: the GPU's work did not stop in %d ms ahead of the "
-                    "exit: QEMU ends without its exit handlers",
-                    TYPE_REIMS_GRAPHICS_PCI, REIMS_GRAPHICS_PCI_QUIESCE_MS);
-    }
-    return quiesced;
+    trace_reims_graphics_quiesce(where, may_exit, get_clock() - t0);
+    return may_exit;
+}
+
+/*
+ * Ends QEMU where the library still holds a GPU device after its quiesce:
+ * exit() would run the GPU driver's exit handlers with the device live, which
+ * the library's runtime supports on no driver (on NVIDIA's, 3 of 9 power-offs
+ * that exited that way ended in SIGSEGV inside the driver's exit handler). So
+ * it runs what exit() runs of QEMU's own first: its exit notifiers, with the
+ * BQL held (usb-host's return of host devices to their drivers, a tap's down
+ * script, the pidfile's removal), the restore of the terminal a stdio chardev
+ * took, and the flush of the C library's streams; the library wrote its
+ * counts in its quiesce. Then _exit, with status. Not run: the simple trace
+ * backend's flush, record and replay's finish and the plugins' exit
+ * callbacks, which QEMU as reims-ctl runs it does not use.
+ */
+static G_NORETURN void reims_graphics_pci_end(int status)
+{
+    qemu_run_exit_notifiers();
+#ifndef _WIN32
+    qemu_chr_stdio_term_exit();
+#endif
+    fflush(NULL);
+    _exit(status);
 }
 
 /*
@@ -2355,18 +2376,17 @@ static bool reims_graphics_pci_quiesce(const char *where)
  * display that kept it, reims_graphics_pci_vm_state_change). That is before
  * exit() runs any exit handler, so before the GPU driver's: QEMU's own exit
  * notifiers run after the driver's, from a handler registered before it
- * loaded. The library may keep a GPU device past the release of its last
- * graphics device, so the quiesce runs either way. Where it answers false a
- * thread may still be in the driver, whose exit handler it would then race
- * (on NVIDIA's driver, SIGSEGV inside it), so QEMU ends with _exit and the
- * cleanup's exit status.
+ * loaded. Where the release let go of the GPU device, the quiesce answers
+ * true and the exit goes on. Where the library still holds one, it answers
+ * false, and QEMU ends with _exit and the cleanup's exit status, after its
+ * own exit work (reims_graphics_pci_end).
  */
 static void reims_graphics_pci_cleanup(Notifier *notifier, void *data)
 {
     int status = *(int *)data;
 
     if (!reims_graphics_pci_quiesce("cleanup")) {
-        _exit(status);
+        reims_graphics_pci_end(status);
     }
 }
 
@@ -2383,12 +2403,14 @@ static bool reims_graphics_pci_exit_hooked;
  * made its GPU device, after the driver loaded, so it runs before the
  * driver's own exit handlers registered until then. After the cleanup's
  * quiesce it answers at once. Such an exit is a failure's, whose status this
- * does not know: on a false answer it ends with EXIT_FAILURE.
+ * does not know: on a false answer it ends with EXIT_FAILURE, after QEMU's
+ * own exit work (reims_graphics_pci_end), whose exit notifiers would run
+ * after this handler.
  */
 static void reims_graphics_pci_at_exit(void)
 {
     if (!reims_graphics_pci_quiesce("exit")) {
-        _exit(EXIT_FAILURE);
+        reims_graphics_pci_end(EXIT_FAILURE);
     }
 }
 

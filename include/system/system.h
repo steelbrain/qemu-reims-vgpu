@@ -28,6 +28,12 @@ void qemu_remove_exit_notifier(Notifier *notify);
  */
 void qemu_add_cleanup_notifier(Notifier *notify);
 
+/*
+ * Runs the exit notifiers now, with the BQL held: what exit() runs of them,
+ * for a process that then ends with _exit, which runs no atexit handler.
+ */
+void qemu_run_exit_notifiers(void);
+
 void qemu_add_machine_init_done_notifier(Notifier *notify);
 void qemu_remove_machine_init_done_notifier(Notifier *notify);
 
