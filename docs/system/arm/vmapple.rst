@@ -110,6 +110,11 @@ gigabyte there. Virtualization.framework's machine has its RAM at
 does not boot on this machine. A firmware for it gives macOS this layout in
 the device tree; Ambrosia is one.
 
+Under HVF the machine asks for 40 bits of guest physical address, or for the
+most the host gives where that is fewer, where HVF's default is 36 bits:
+macOS's kernel maps physical addresses of up to 40 bits. HVF gives the guest
+that size as its ``ID_AA64MMFR0_EL1.PARange``. RAM must end within it.
+
 The firmware also makes one change that macOS needs on this machine before
 it enters the kernel. The machine makes no change to the guest itself.
 

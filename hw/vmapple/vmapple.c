@@ -82,6 +82,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(VMAppleMachineState, VMAPPLE_MACHINE)
 /* Number of external interrupt lines to configure the GIC with */
 #define NUM_IRQS 256
 
+/* The most guest physical address bits the machine asks of HVF */
+#define VMAPPLE_PHYS_BITS 40
+
 enum {
     VMAPPLE_FIRMWARE,
     VMAPPLE_CONFIG,
@@ -663,6 +666,31 @@ static const CPUArchIdList *vmapple_possible_cpu_arch_ids(MachineState *ms)
     return ms->possible_cpus;
 }
 
+/*
+ * The guest's physical address bits under HVF: VMAPPLE_PHYS_BITS, or the
+ * most the hypervisor gives where that is fewer. HVF's default is 36 bits,
+ * 64 GiB, which RAM from 4 GiB fills quickly; macOS's kernel maps physical
+ * addresses of up to 40 bits (its TCR_EL1.IPS), so the guest reaches all of
+ * a 40-bit space. HVF gives the guest the size chosen as its
+ * ID_AA64MMFR0_EL1.PARange. Fails, as virt's does, where RAM ends past the
+ * bits the hypervisor gives.
+ */
+static int vmapple_get_physical_address_range(MachineState *ms,
+                                              int default_ipa_size,
+                                              int max_ipa_size)
+{
+    hwaddr ram_end = memmap[VMAPPLE_MEM].base + ms->ram_size;
+    int bits = MIN(VMAPPLE_PHYS_BITS, max_ipa_size);
+
+    if (ram_end > 1ULL << bits) {
+        error_report("vmapple: RAM ending at 0x%" HWADDR_PRIx " needs more "
+                     "than the %d bits of guest physical address the "
+                     "hypervisor gives", ram_end, bits);
+        return -1;
+    }
+    return bits;
+}
+
 static bool vmapple_get_vgic_bases(const MachineState *ms,
                                    uint64_t *dist_base, uint64_t *redist_base)
 {
@@ -747,6 +775,7 @@ static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("max");
     mc->get_default_cpu_node_id = vmapple_get_default_cpu_node_id;
     mc->get_vgic_bases = vmapple_get_vgic_bases;
+    mc->get_physical_address_range = vmapple_get_physical_address_range;
     mc->default_ram_id = "mach-vmapple.ram";
     mc->desc = "Apple aarch64 Virtual Machine";
 
