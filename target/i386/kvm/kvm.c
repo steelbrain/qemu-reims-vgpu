@@ -7151,7 +7151,17 @@ void kvm_arch_accel_class_init(ObjectClass *oc)
                                           "memory type settings (default: auto)");
 }
 
+/*
+ * KVM refuses a vCPU whose id is at or past this cap, and every guest
+ * CPU's APIC id is below @max_apic_id (x86ms->apic_id_limit). The cap is
+ * one higher, so that a device can make a vCPU of its own at
+ * @max_apic_id that the guest is never told of: reims-graphics-pci's
+ * pre-fault helper (reims-graphics-pci-kvm.c), which never runs. KVM
+ * reads the cap only to refuse ids and to size the AVIC and IPI
+ * virtualisation id tables; what the guest is told of its CPUs
+ * (FW_CFG_MAX_CPUS, the MADT, CPUID) keeps apic_id_limit.
+ */
 void kvm_set_max_apic_id(uint32_t max_apic_id)
 {
-    kvm_vm_enable_cap(kvm_state, KVM_CAP_MAX_VCPU_ID, 0, max_apic_id);
+    kvm_vm_enable_cap(kvm_state, KVM_CAP_MAX_VCPU_ID, 0, max_apic_id + 1);
 }
