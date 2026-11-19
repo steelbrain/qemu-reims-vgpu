@@ -11,3 +11,8 @@ bool reims_graphics_kvm_disable_slot_zap_all(void)
 {
     return true;
 }
+
+const ReimsGraphicsPrefaultOps *reims_graphics_kvm_prefault_ops(void)
+{
+    return NULL;
+}

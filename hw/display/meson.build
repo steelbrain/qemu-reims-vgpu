@@ -68,7 +68,8 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
 # The reims-graphics device's transport; reims-vgpu's graphics device is its
 # host side.
 reims_graphics_ss = ss.source_set()
-reims_graphics_ss.add(files('reims-graphics-pci.c'))
+reims_graphics_ss.add(files('reims-graphics-pci.c',
+                             'reims-graphics-pci-prefault.c'))
 # Its calls into KVM. system_ss builds the device once for every target, and a
 # target without KVM links no KVM function, so those targets take the stub.
 if host_os == 'linux'

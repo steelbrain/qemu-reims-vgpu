@@ -14,10 +14,19 @@
 #ifndef HW_DISPLAY_REIMS_GRAPHICS_PCI_KVM_H
 #define HW_DISPLAY_REIMS_GRAPHICS_PCI_KVM_H
 
+#include "reims-graphics-pci-prefault.h"
+
 /*
  * Turns KVM's KVM_X86_QUIRK_SLOT_ZAP_ALL off for the VM, where KVM runs it
  * and has the quirk. False only where KVM refused to turn it off.
  */
 bool reims_graphics_kvm_disable_slot_zap_all(void);
+
+/*
+ * The pool's populate on KVM (reims-graphics-pci-prefault.h), under the
+ * BQL at realize, once the VM's vCPUs are made: NULL where KVM has no
+ * KVM_CAP_PRE_FAULT_MEMORY or the host is not x86-64.
+ */
+const ReimsGraphicsPrefaultOps *reims_graphics_kvm_prefault_ops(void);
 
 #endif

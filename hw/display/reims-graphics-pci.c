@@ -131,6 +131,7 @@
 #ifdef CONFIG_LINUX
 #include "reims-graphics-pci-kvm.h"
 #endif
+#include "reims-graphics-pci-prefault.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include <reims_vgpu.h>
@@ -259,6 +260,8 @@ struct ReimsGraphicsPCIState {
     GPtrArray *pool_pieces; /* BQL protected: the pieces in the guest, */
                             /* sorted by address */
     int pool_alive;         /* BQL protected: pieces not yet finalized */
+    /* The populate of the pieces, set at realize: NULL where there is none. */
+    ReimsGraphicsPrefault *prefault;
 };
 
 QEMU_BUILD_BUG_ON(RVG_GRAPHICS_MSIX_VECTORS != 1);
@@ -1230,6 +1233,11 @@ static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
  * (address_space_map) may still hold it: those hold its owner, so the piece's
  * end, where it tells the library that the memory is free to go
  * (rvg_graphics_device_pool_removed), comes once the last of them goes.
+ *
+ * Under KVM, each piece is populated once its add is answered
+ * (reims-graphics-pci-prefault.h), so the guest's first touch of it takes
+ * no fault; the piece's removal stops its populate, and each run of adds
+ * or removals pauses the populate for its memory transaction.
  */
 
 #define TYPE_REIMS_GRAPHICS_POOL_PIECE "reims-graphics-pool-piece"
@@ -1380,6 +1388,10 @@ static void reims_graphics_pool_take(ReimsGraphicsPCIState *s, guint i)
 {
     ReimsGraphicsPoolPiece *piece = g_ptr_array_steal_index(s->pool_pieces, i);
 
+    if (s->prefault) {
+        reims_graphics_prefault_stop(s->prefault, piece->gpa,
+                                     memory_region_size(&piece->mr));
+    }
     memory_region_del_subregion(get_system_memory(), &piece->mr);
     /* Its end, and the library's word, wait for its last holder. */
     object_unref(OBJECT(piece));
@@ -1438,12 +1450,19 @@ static void reims_graphics_pool_bh(void *opaque)
             return;
         }
         t0 = get_clock();
+        /* The slot changes wait for no populate call. */
+        if (s->prefault) {
+            reims_graphics_prefault_pause(s->prefault);
+        }
         memory_region_transaction_begin();
         QSIMPLEQ_FOREACH(ask, &run, next) {
             ask->done = add ? reims_graphics_pool_add(s, ask)
                             : reims_graphics_pool_remove(s, ask);
         }
         memory_region_transaction_commit();
+        if (s->prefault) {
+            reims_graphics_prefault_resume(s->prefault);
+        }
         held = get_clock() - t0;
         while ((ask = QSIMPLEQ_FIRST(&run)) != NULL) {
             QSIMPLEQ_REMOVE_HEAD(&run, next);
@@ -1455,6 +1474,11 @@ static void reims_graphics_pool_bh(void *opaque)
                                               ask->asked, ask->map_ns, n,
                                               held);
                 rvg_graphics_device_pool_added(s->device, ask->gpa);
+                /* Answered first: the populate runs behind the guest. */
+                if (s->prefault) {
+                    reims_graphics_prefault_add(s->prefault, ask->gpa,
+                                                ask->size);
+                }
             } else if (ask->done) {
                 trace_reims_graphics_pool_remove(ask->gpa, ask->size,
                                                  ask->mapped_ahead,
@@ -1519,9 +1543,14 @@ static void reims_graphics_pool_remove_cb(void *ctx, uint64_t physical_address,
 {
     ReimsGraphicsPCIState *s = ctx;
     ReimsGraphicsPoolAsk *ask = g_new0(ReimsGraphicsPoolAsk, 1);
+    ReimsGraphicsPrefault *prefault = qatomic_read(&s->prefault);
     bool closed = false;
     int64_t t0;
 
+    /* Its populate stops now, not at its turn in the queue. */
+    if (prefault) {
+        reims_graphics_prefault_stop(prefault, physical_address, length);
+    }
     ask->gpa = physical_address;
     ask->size = length;
     if (whpx_enabled()) {
@@ -1566,11 +1595,17 @@ static void reims_graphics_pool_close(ReimsGraphicsPCIState *s)
         }
     }
     if (s->pool_pieces->len > 0) {
+        if (s->prefault) {
+            reims_graphics_prefault_pause(s->prefault);
+        }
         memory_region_transaction_begin();
         while (s->pool_pieces->len > 0) {
             reims_graphics_pool_take(s, s->pool_pieces->len - 1);
         }
         memory_region_transaction_commit();
+        if (s->prefault) {
+            reims_graphics_prefault_resume(s->prefault);
+        }
     }
     if (s->pool_alive > 0) {
         drain_call_rcu();
@@ -1579,6 +1614,9 @@ static void reims_graphics_pool_close(ReimsGraphicsPCIState *s)
         warn_report("%s: %d pool pieces are still held past their removal: "
                     "their memory goes at the release all the same",
                     TYPE_REIMS_GRAPHICS_PCI, s->pool_alive);
+    }
+    if (s->prefault) {
+        reims_graphics_prefault_report(s->prefault);
     }
 }
 
@@ -2416,6 +2454,9 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         goto fail;
     }
     reims_graphics_pool_reserve(s);
+    if (s->pool_length) {
+        qatomic_set(&s->prefault, reims_graphics_prefault_get());
+    }
 
     if (msix_init(dev, RVG_GRAPHICS_MSIX_VECTORS, &s->bar0,
                   RVG_GRAPHICS_PCI_BAR_REGISTERS, RVG_GRAPHICS_MSIX_OFFSET,
