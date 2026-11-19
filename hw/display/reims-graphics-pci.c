@@ -250,7 +250,8 @@ struct ReimsGraphicsPCIState {
     QSIMPLEQ_HEAD(, ReimsGraphicsPoolAsk) pool_asks; /* pool_lock protected */
     bool pool_closed;   /* pool_lock protected: the teardown took the pieces */
     QEMUBH *pool_bh;
-    GPtrArray *pool_pieces; /* BQL protected: the pieces in the guest */
+    GPtrArray *pool_pieces; /* BQL protected: the pieces in the guest, */
+                            /* sorted by address */
     int pool_alive;         /* BQL protected: pieces not yet finalized */
 };
 
@@ -1261,14 +1262,35 @@ static void reims_graphics_pool_piece_finalize(Object *obj)
     }
 }
 
+/*
+ * The index in s->pool_pieces, which is sorted by address, of the first
+ * piece at @gpa or above it.
+ */
+static guint reims_graphics_pool_index(ReimsGraphicsPCIState *s, hwaddr gpa)
+{
+    guint lo = 0, hi = s->pool_pieces->len;
+
+    while (lo < hi) {
+        guint mid = lo + (hi - lo) / 2;
+        ReimsGraphicsPoolPiece *p = g_ptr_array_index(s->pool_pieces, mid);
+
+        if (p->gpa < gpa) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 /* The added piece at @gpa, or -1. */
 static int reims_graphics_pool_find(ReimsGraphicsPCIState *s, hwaddr gpa)
 {
-    guint i;
+    guint i = reims_graphics_pool_index(s, gpa);
+    ReimsGraphicsPoolPiece *p;
 
-    for (i = 0; i < s->pool_pieces->len; i++) {
-        ReimsGraphicsPoolPiece *p = g_ptr_array_index(s->pool_pieces, i);
-
+    if (i < s->pool_pieces->len) {
+        p = g_ptr_array_index(s->pool_pieces, i);
         if (p->gpa == gpa) {
             return i;
         }
@@ -1276,21 +1298,31 @@ static int reims_graphics_pool_find(ReimsGraphicsPCIState *s, hwaddr gpa)
     return -1;
 }
 
-/* Whether @gpa and @size lie in the range and overlap no added piece. */
+/*
+ * Whether @gpa and @size lie in the range and overlap no added piece. The
+ * pieces are disjoint, so only the last one below @gpa and the first one at
+ * or above it can overlap.
+ */
 static bool reims_graphics_pool_free(ReimsGraphicsPCIState *s, hwaddr gpa,
                                      uint64_t size)
 {
     guint i;
+    ReimsGraphicsPoolPiece *p;
 
     if (gpa < s->pool_base || size > s->pool_length ||
         gpa - s->pool_base > s->pool_length - size) {
         return false;
     }
-    for (i = 0; i < s->pool_pieces->len; i++) {
-        ReimsGraphicsPoolPiece *p = g_ptr_array_index(s->pool_pieces, i);
-        uint64_t len = memory_region_size(&p->mr);
-
-        if (gpa < p->gpa + len && p->gpa < gpa + size) {
+    i = reims_graphics_pool_index(s, gpa);
+    if (i < s->pool_pieces->len) {
+        p = g_ptr_array_index(s->pool_pieces, i);
+        if (p->gpa < gpa + size) {
+            return false;
+        }
+    }
+    if (i > 0) {
+        p = g_ptr_array_index(s->pool_pieces, i - 1);
+        if (gpa < p->gpa + memory_region_size(&p->mr)) {
             return false;
         }
     }
@@ -1331,7 +1363,8 @@ static bool reims_graphics_pool_add(ReimsGraphicsPCIState *s,
     memory_region_set_unmergeable(&piece->mr, true);
     memory_region_add_subregion(get_system_memory(), ask->gpa, &piece->mr);
     memory_region_transaction_commit();
-    g_ptr_array_add(s->pool_pieces, piece);
+    g_ptr_array_insert(s->pool_pieces,
+                       reims_graphics_pool_index(s, piece->gpa), piece);
     s->pool_alive++;
     return true;
 }
