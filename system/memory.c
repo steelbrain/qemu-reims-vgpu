@@ -273,21 +273,86 @@ static FlatView *flatview_new(MemoryRegion *mr_root)
     return view;
 }
 
+/*
+ * A flat view while render_memory_region builds it. Its view->nr ranges are
+ * in order in view->ranges, with the array's unused slots, a gap, after the
+ * first @gap of them: the ranges from @gap on are at the array's end. An
+ * insert moves the gap to its place, moving the ranges between, and leaves
+ * it just after the new range. A container's disjoint subregions in address
+ * order, either way, then insert with almost nothing moved, where moving
+ * every later range on each insert made their render quadratic.
+ */
+typedef struct FlatRender {
+    FlatView *view;
+    unsigned gap;
+} FlatRender;
+
+/* The range at position @i of @r's view. */
+static FlatRange *flatrender_range(FlatRender *r, unsigned i)
+{
+    FlatView *view = r->view;
+
+    return &view->ranges[i < r->gap ? i : i + view->nr_allocated - view->nr];
+}
+
+/* The position of the first range of @r's view that ends past @addr. */
+static unsigned flatrender_find(FlatRender *r, Int128 addr)
+{
+    unsigned lo = 0, hi = r->view->nr;
+
+    while (lo < hi) {
+        unsigned mid = lo + (hi - lo) / 2;
+
+        if (int128_ge(addr, addrrange_end(flatrender_range(r, mid)->addr))) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 /* Insert a range into a given position.  Caller is responsible for maintaining
  * sorting order.
  */
-static void flatview_insert(FlatView *view, unsigned pos, FlatRange *range)
+static void flatrender_insert(FlatRender *r, unsigned pos, FlatRange *range)
 {
-    if (view->nr == view->nr_allocated) {
+    FlatView *view = r->view;
+    unsigned gap_len = view->nr_allocated - view->nr;
+
+    if (!gap_len) {
+        unsigned old = view->nr_allocated;
+
         view->nr_allocated = MAX(2 * view->nr, 10);
-        view->ranges = g_realloc(view->ranges,
-                                    view->nr_allocated * sizeof(*view->ranges));
+        view->ranges = g_renew(FlatRange, view->ranges, view->nr_allocated);
+        gap_len = view->nr_allocated - view->nr;
+        memmove(view->ranges + r->gap + gap_len, view->ranges + r->gap,
+                (old - r->gap) * sizeof(FlatRange));
     }
-    memmove(view->ranges + pos + 1, view->ranges + pos,
-            (view->nr - pos) * sizeof(FlatRange));
+    if (pos < r->gap) {
+        memmove(view->ranges + pos + gap_len, view->ranges + pos,
+                (r->gap - pos) * sizeof(FlatRange));
+    } else if (pos > r->gap) {
+        memmove(view->ranges + r->gap, view->ranges + r->gap + gap_len,
+                (pos - r->gap) * sizeof(FlatRange));
+    }
     view->ranges[pos] = *range;
     memory_region_ref(range->mr);
     ++view->nr;
+    r->gap = pos + 1;
+}
+
+/* Closes @r's gap: the view's ranges are then its array's first view->nr. */
+static void flatrender_close(FlatRender *r)
+{
+    FlatView *view = r->view;
+
+    if (r->gap < view->nr) {
+        memmove(view->ranges + r->gap,
+                view->ranges + r->gap + view->nr_allocated - view->nr,
+                (view->nr - r->gap) * sizeof(FlatRange));
+    }
+    r->gap = view->nr;
 }
 
 static void flatview_destroy(FlatView *view)
@@ -591,10 +656,10 @@ static AddressSpace *memory_region_to_address_space(MemoryRegion *mr)
     return NULL;
 }
 
-/* Render a memory region into the global view.  Ranges in @view obscure
+/* Render a memory region into the global view.  Ranges in @r's view obscure
  * ranges in @mr.
  */
-static void render_memory_region(FlatView *view,
+static void render_memory_region(FlatRender *r,
                                  MemoryRegion *mr,
                                  Int128 base,
                                  AddrRange clip,
@@ -630,14 +695,14 @@ static void render_memory_region(FlatView *view,
     if (mr->alias) {
         int128_subfrom(&base, int128_make64(mr->alias->addr));
         int128_subfrom(&base, int128_make64(mr->alias_offset));
-        render_memory_region(view, mr->alias, base, clip,
+        render_memory_region(r, mr->alias, base, clip,
                              readonly, nonvolatile, unmergeable);
         return;
     }
 
     /* Render subregions in priority order. */
     QTAILQ_FOREACH(subregion, &mr->subregions, subregions_link) {
-        render_memory_region(view, subregion, base, clip,
+        render_memory_region(r, subregion, base, clip,
                              readonly, nonvolatile, unmergeable);
     }
 
@@ -657,23 +722,27 @@ static void render_memory_region(FlatView *view,
     fr.unmergeable = unmergeable;
 
     /* Render the region itself into any gaps left by the current view. */
-    for (i = 0; i < view->nr && int128_nz(remain); ++i) {
-        if (int128_ge(base, addrrange_end(view->ranges[i].addr))) {
+    for (i = flatrender_find(r, base); i < r->view->nr && int128_nz(remain);
+         ++i) {
+        FlatRange *next = flatrender_range(r, i);
+
+        if (int128_ge(base, addrrange_end(next->addr))) {
             continue;
         }
-        if (int128_lt(base, view->ranges[i].addr.start)) {
-            now = int128_min(remain,
-                             int128_sub(view->ranges[i].addr.start, base));
+        if (int128_lt(base, next->addr.start)) {
+            now = int128_min(remain, int128_sub(next->addr.start, base));
             fr.offset_in_region = offset_in_region;
             fr.addr = addrrange_make(base, now);
-            flatview_insert(view, i, &fr);
+            flatrender_insert(r, i, &fr);
             ++i;
             int128_addto(&base, now);
             offset_in_region += int128_get64(now);
             int128_subfrom(&remain, now);
+            /* The insert moved it. */
+            next = flatrender_range(r, i);
         }
         now = int128_sub(int128_min(int128_add(base, remain),
-                                    addrrange_end(view->ranges[i].addr)),
+                                    addrrange_end(next->addr)),
                          base);
         int128_addto(&base, now);
         offset_in_region += int128_get64(now);
@@ -682,7 +751,7 @@ static void render_memory_region(FlatView *view,
     if (int128_nz(remain)) {
         fr.offset_in_region = offset_in_region;
         fr.addr = addrrange_make(base, remain);
-        flatview_insert(view, i, &fr);
+        flatrender_insert(r, i, &fr);
     }
 }
 
@@ -754,9 +823,12 @@ static FlatView *generate_memory_topology(MemoryRegion *mr)
     view = flatview_new(mr);
 
     if (mr) {
-        render_memory_region(view, mr, int128_zero(),
+        FlatRender r = { .view = view };
+
+        render_memory_region(&r, mr, int128_zero(),
                              addrrange_make(int128_zero(), int128_2_64()),
                              false, false, false);
+        flatrender_close(&r);
     }
     flatview_simplify(view);
 
