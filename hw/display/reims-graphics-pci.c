@@ -1244,6 +1244,7 @@ struct ReimsGraphicsPoolAsk {
                        /* whpx_unmap_before_del */
     int64_t asked;     /* QEMU_CLOCK_REALTIME ns, at the ask */
     int64_t map_ns;    /* the map or unmap ahead's time */
+    bool done;         /* its run added or took out its piece */
     QSIMPLEQ_ENTRY(ReimsGraphicsPoolAsk) next;
 };
 
@@ -1296,11 +1297,15 @@ static bool reims_graphics_pool_free(ReimsGraphicsPCIState *s, hwaddr gpa,
     return true;
 }
 
-static void reims_graphics_pool_add(ReimsGraphicsPCIState *s,
+/*
+ * Adds @ask's piece to the guest's address space, inside the run's memory
+ * transaction (reims_graphics_pool_bh); false, with nothing added, where it
+ * lies outside the pool's free range.
+ */
+static bool reims_graphics_pool_add(ReimsGraphicsPCIState *s,
                                     ReimsGraphicsPoolAsk *ask)
 {
     ReimsGraphicsPoolPiece *piece;
-    int64_t t0, t1;
 
     if (!reims_graphics_pool_free(s, ask->gpa, ask->size)) {
         error_report_once("%s: the library asked a pool piece of 0x%" PRIx64
@@ -1310,9 +1315,8 @@ static void reims_graphics_pool_add(ReimsGraphicsPCIState *s,
         if (ask->mapped_ahead) {
             whpx_unmap_ahead(ask->gpa, ask->size, ask->host);
         }
-        return;
+        return false;
     }
-    t0 = get_clock();
     piece = REIMS_GRAPHICS_POOL_PIECE(object_new(TYPE_REIMS_GRAPHICS_POOL_PIECE));
     piece->s = s;
     piece->gpa = ask->gpa;
@@ -1327,13 +1331,9 @@ static void reims_graphics_pool_add(ReimsGraphicsPCIState *s,
     memory_region_set_unmergeable(&piece->mr, true);
     memory_region_add_subregion(get_system_memory(), ask->gpa, &piece->mr);
     memory_region_transaction_commit();
-    t1 = get_clock();
     g_ptr_array_add(s->pool_pieces, piece);
     s->pool_alive++;
-    trace_reims_graphics_pool_add(ask->gpa, ask->size, ask->mapped_ahead,
-                                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
-                                  ask->asked, ask->map_ns, t1 - t0);
-    rvg_graphics_device_pool_added(s->device, ask->gpa);
+    return true;
 }
 
 /* Takes the piece at index @i out of the guest's address space. */
@@ -1346,47 +1346,83 @@ static void reims_graphics_pool_take(ReimsGraphicsPCIState *s, guint i)
     object_unref(OBJECT(piece));
 }
 
-static void reims_graphics_pool_remove(ReimsGraphicsPCIState *s,
+/*
+ * Takes @ask's piece out of the guest's address space, inside the run's
+ * memory transaction (reims_graphics_pool_bh); false where there was none.
+ */
+static bool reims_graphics_pool_remove(ReimsGraphicsPCIState *s,
                                        ReimsGraphicsPoolAsk *ask)
 {
     int i = reims_graphics_pool_find(s, ask->gpa);
-    int64_t t0;
 
     if (i < 0) {
         /* Its add was refused: nothing of it is in the guest. */
         rvg_graphics_device_pool_removed(s->device, ask->gpa);
-        return;
+        return false;
     }
-    t0 = get_clock();
-    memory_region_transaction_begin();
     reims_graphics_pool_take(s, i);
-    memory_region_transaction_commit();
-    trace_reims_graphics_pool_remove(ask->gpa, ask->size, ask->mapped_ahead,
-                                     ask->map_ns, get_clock() - t0);
+    return true;
 }
 
-/* The library's asks, carried out in order under the BQL. */
+/*
+ * The library's asks, carried out in order under the BQL. The asks queued
+ * at the head of the queue that are of one kind, adds or removals, are a
+ * run, carried out in one memory transaction, so the flat views are
+ * rendered once for the run, not once an ask. Each add of a run is answered
+ * once that transaction has committed and the guest's address space has
+ * its piece; a removal's answer comes at its piece's end, as before. An ask
+ * of the other kind starts the next run, once this one has committed.
+ */
 static void reims_graphics_pool_bh(void *opaque)
 {
     ReimsGraphicsPCIState *s = opaque;
+    QSIMPLEQ_HEAD(, ReimsGraphicsPoolAsk) run =
+        QSIMPLEQ_HEAD_INITIALIZER(run);
     ReimsGraphicsPoolAsk *ask;
+    unsigned n;
+    bool add;
+    int64_t t0, held;
 
     for (;;) {
+        n = 0;
         WITH_QEMU_LOCK_GUARD(&s->pool_lock) {
             ask = QSIMPLEQ_FIRST(&s->pool_asks);
-            if (ask) {
+            add = ask && ask->add;
+            while (ask && ask->add == add) {
                 QSIMPLEQ_REMOVE_HEAD(&s->pool_asks, next);
+                QSIMPLEQ_INSERT_TAIL(&run, ask, next);
+                n++;
+                ask = QSIMPLEQ_FIRST(&s->pool_asks);
             }
         }
-        if (!ask) {
+        if (!n) {
             return;
         }
-        if (ask->add) {
-            reims_graphics_pool_add(s, ask);
-        } else {
-            reims_graphics_pool_remove(s, ask);
+        t0 = get_clock();
+        memory_region_transaction_begin();
+        QSIMPLEQ_FOREACH(ask, &run, next) {
+            ask->done = add ? reims_graphics_pool_add(s, ask)
+                            : reims_graphics_pool_remove(s, ask);
         }
-        g_free(ask);
+        memory_region_transaction_commit();
+        held = get_clock() - t0;
+        while ((ask = QSIMPLEQ_FIRST(&run)) != NULL) {
+            QSIMPLEQ_REMOVE_HEAD(&run, next);
+            if (ask->done && add) {
+                trace_reims_graphics_pool_add(ask->gpa, ask->size,
+                                              ask->mapped_ahead,
+                                              qemu_clock_get_ns(
+                                                  QEMU_CLOCK_REALTIME) -
+                                              ask->asked, ask->map_ns, n,
+                                              held);
+                rvg_graphics_device_pool_added(s->device, ask->gpa);
+            } else if (ask->done) {
+                trace_reims_graphics_pool_remove(ask->gpa, ask->size,
+                                                 ask->mapped_ahead,
+                                                 ask->map_ns, n, held);
+            }
+            g_free(ask);
+        }
     }
 }
 

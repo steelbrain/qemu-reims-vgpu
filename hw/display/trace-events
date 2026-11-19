@@ -200,6 +200,6 @@ dm163_refresh_rate(uint32_t rr) "refresh rate %d"
 
 # reims-graphics-pci.c
 reims_graphics_pool_reserved(uint64_t gpa, uint64_t size, uint64_t end) "the pool's range at 0x%"PRIx64", 0x%"PRIx64" bytes, reserved to 0x%"PRIx64
-reims_graphics_pool_add(uint64_t gpa, uint64_t size, bool ahead, int64_t ask_ns, int64_t map_ahead_ns, int64_t held_ns) "piece at 0x%"PRIx64", 0x%"PRIx64" bytes, mapped ahead %d: %"PRId64" ns from the ask, map ahead %"PRId64" ns, BQL part %"PRId64" ns"
-reims_graphics_pool_remove(uint64_t gpa, uint64_t size, bool ahead, int64_t unmap_ahead_ns, int64_t held_ns) "piece at 0x%"PRIx64", 0x%"PRIx64" bytes taken out, unmapped ahead %d: unmap ahead %"PRId64" ns, BQL part %"PRId64" ns"
+reims_graphics_pool_add(uint64_t gpa, uint64_t size, bool ahead, int64_t ask_ns, int64_t map_ahead_ns, unsigned run, int64_t held_ns) "piece at 0x%"PRIx64", 0x%"PRIx64" bytes, mapped ahead %d: %"PRId64" ns from the ask, map ahead %"PRId64" ns, BQL part of its run of %u %"PRId64" ns"
+reims_graphics_pool_remove(uint64_t gpa, uint64_t size, bool ahead, int64_t unmap_ahead_ns, unsigned run, int64_t held_ns) "piece at 0x%"PRIx64", 0x%"PRIx64" bytes taken out, unmapped ahead %d: unmap ahead %"PRId64" ns, BQL part of its run of %u %"PRId64" ns"
 reims_graphics_pool_removed(uint64_t gpa) "piece at 0x%"PRIx64" ended"
