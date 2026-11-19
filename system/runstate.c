@@ -1095,6 +1095,14 @@ void qemu_remove_exit_notifier(Notifier *notify)
     notifier_remove(notify);
 }
 
+static NotifierList cleanup_notifiers =
+    NOTIFIER_LIST_INITIALIZER(cleanup_notifiers);
+
+void qemu_add_cleanup_notifier(Notifier *notify)
+{
+    notifier_list_add(&cleanup_notifiers, notify);
+}
+
 static void qemu_run_exit_notifiers(void)
 {
     BQL_LOCK_GUARD();
@@ -1180,4 +1188,5 @@ void qemu_cleanup(int status)
     qemu_display_cleanup();
     user_creatable_cleanup();
     /* TODO: unref root container, check all devices are ok */
+    notifier_list_notify(&cleanup_notifiers, &status);
 }

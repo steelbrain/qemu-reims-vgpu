@@ -89,6 +89,9 @@
  * the GPU device before the process exits. A read of a
  * display still waiting for the GPU 5 s into the teardown keeps the device to
  * the exit instead, so a GPU that stopped answering does not hold the quit.
+ * Whether released or kept, the library is quiesced at the end of QEMU's
+ * cleanup, before any exit handler runs (reims_graphics_pci_cleanup), and
+ * QEMU ends with _exit where its GPU work did not stop in time.
  *
  * The device has no default option ROM: romfile names one.
  */
@@ -120,6 +123,7 @@
 #include "system/ramblock.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
+#include "system/system.h"
 #include "system/whpx.h"
 #include "block/thread-pool.h"
 #include "hw/nvram/fw_cfg.h"
@@ -151,6 +155,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsGraphicsPCIState, REIMS_GRAPHICS_PCI)
  * own threads.
  */
 #define REIMS_GRAPHICS_PCI_READ_END_MS 5000
+
+/*
+ * How long the library's quiesce ahead of the exit may take
+ * (rvg_quiesce_for_exit): the bound of the release of its last device, which
+ * waits for the same threads and the same GPU work. At a quit the vCPUs are
+ * paused, so the GPU holds only the guest's last work, done in milliseconds;
+ * the bound is reached only by a GPU that stopped answering or a compile that
+ * outlasts it, and QEMU then ends with _exit at once.
+ */
+#define REIMS_GRAPHICS_PCI_QUIESCE_MS 5000
 
 /*
  * How long after its start a read of a display under way is late: an update
@@ -2286,9 +2300,11 @@ static void reims_graphics_pci_check_low_ram(void)
  * A shutdown whose action pauses the VM (-action shutdown=pause,
  * -no-shutdown) keeps the device, which the guest uses again after a reset,
  * and then so does its quit, as does a quit of a VM stopped before it: no
- * handler hears it. The device then stays to the exit, as before. So does it
- * when a read of a display under way still waits for the GPU 5 s into the
- * teardown (reims_graphics_pci_teardown).
+ * handler hears it. The device then stays to the exit. So does it when a read
+ * of a display under way still waits for the GPU 5 s into the teardown
+ * (reims_graphics_pci_teardown). Either way the library's quiesce at the end
+ * of QEMU's cleanup (reims_graphics_pci_cleanup) stops its GPU work before
+ * the driver's exit handlers run.
  */
 static void reims_graphics_pci_vm_state_change(void *opaque, bool running,
                                                RunState state)
@@ -2301,6 +2317,79 @@ static void reims_graphics_pci_vm_state_change(void *opaque, bool running,
     }
     memory_region_set_enabled(&s->region, false);
     reims_graphics_pci_teardown(s, true);
+}
+
+/*
+ * Quiesces the library ahead of the process's exit, with the BQL let go where
+ * this thread holds it, as around the release at quit: a device callback
+ * waiting for the BQL inside a call of the library's would hold the quiesce
+ * up to its bound. Whether it answered true: no thread of the library's or of
+ * its runtime is left in the GPU's driver as the driver's exit handlers run.
+ */
+static bool reims_graphics_pci_quiesce(const char *where)
+{
+    bool locked = bql_locked();
+    int64_t t0 = get_clock();
+    bool quiesced;
+
+    if (locked) {
+        bql_unlock();
+    }
+    quiesced = rvg_quiesce_for_exit(REIMS_GRAPHICS_PCI_QUIESCE_MS);
+    if (locked) {
+        bql_lock();
+    }
+    trace_reims_graphics_quiesce(where, quiesced, get_clock() - t0);
+    if (!quiesced) {
+        warn_report("%s: the GPU's work did not stop in %d ms ahead of the "
+                    "exit: QEMU ends without its exit handlers",
+                    TYPE_REIMS_GRAPHICS_PCI, REIMS_GRAPHICS_PCI_QUIESCE_MS);
+    }
+    return quiesced;
+}
+
+/*
+ * At the end of QEMU's cleanup (qemu_add_cleanup_notifier), on every quit
+ * that reaches it: once the device was released, and where it stays to the
+ * exit (a shutdown action that pauses, a quit of a stopped VM, a read of a
+ * display that kept it, reims_graphics_pci_vm_state_change). That is before
+ * exit() runs any exit handler, so before the GPU driver's: QEMU's own exit
+ * notifiers run after the driver's, from a handler registered before it
+ * loaded. The library may keep a GPU device past the release of its last
+ * graphics device, so the quiesce runs either way. Where it answers false a
+ * thread may still be in the driver, whose exit handler it would then race
+ * (on NVIDIA's driver, SIGSEGV inside it), so QEMU ends with _exit and the
+ * cleanup's exit status.
+ */
+static void reims_graphics_pci_cleanup(Notifier *notifier, void *data)
+{
+    int status = *(int *)data;
+
+    if (!reims_graphics_pci_quiesce("cleanup")) {
+        _exit(status);
+    }
+}
+
+static Notifier reims_graphics_pci_cleanup_notifier = {
+    .notify = reims_graphics_pci_cleanup,
+};
+
+/* Whether a device registered the hooks: once per process, for every device. */
+static bool reims_graphics_pci_exit_hooked;
+
+/*
+ * The exit handler for an exit() that skips QEMU's cleanup (a later device's
+ * refused realize, a failed incoming migration): registered once the library
+ * made its GPU device, after the driver loaded, so it runs before the
+ * driver's own exit handlers registered until then. After the cleanup's
+ * quiesce it answers at once. Such an exit is a failure's, whose status this
+ * does not know: on a false answer it ends with EXIT_FAILURE.
+ */
+static void reims_graphics_pci_at_exit(void)
+{
+    if (!reims_graphics_pci_quiesce("exit")) {
+        _exit(EXIT_FAILURE);
+    }
 }
 
 static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
@@ -2467,6 +2556,11 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         error_setg(errp, "%s: rvg_graphics_device_create: %s",
                    TYPE_REIMS_GRAPHICS_PCI, rvg_status_message(status));
         goto fail;
+    }
+    if (!reims_graphics_pci_exit_hooked) {
+        reims_graphics_pci_exit_hooked = true;
+        qemu_add_cleanup_notifier(&reims_graphics_pci_cleanup_notifier);
+        atexit(reims_graphics_pci_at_exit);
     }
     reims_graphics_pool_reserve(s);
     if (s->pool_length) {

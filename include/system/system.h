@@ -19,6 +19,15 @@ const char *qemu_get_vm_name(void);
 void qemu_add_exit_notifier(Notifier *notify);
 void qemu_remove_exit_notifier(Notifier *notify);
 
+/*
+ * Cleanup notifiers run at the end of qemu_cleanup(), with the BQL held and
+ * the exit status (an int *) as their data: before exit() itself, so before
+ * every atexit handler. Exit notifiers run from an atexit handler registered
+ * at QEMU's start, so after every handler registered later, a driver's among
+ * them.
+ */
+void qemu_add_cleanup_notifier(Notifier *notify);
+
 void qemu_add_machine_init_done_notifier(Notifier *notify);
 void qemu_remove_machine_init_done_notifier(Notifier *notify);
 
