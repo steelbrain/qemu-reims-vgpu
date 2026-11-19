@@ -39,7 +39,7 @@
  *    display's refreshes while it shows no presented surface.
  *  - The guest's Shared pool: guest physical addresses with no RAM under
  *    them, from the host bridge's pci-hole64-end, as many as the library
- *    takes for the host GPU's Shared memory heap
+ *    takes for the host GPU's memory heaps, every heap summed
  *    (rvg_graphics_device_pool_range), which the device reserves at realize;
  *    the firmware places its 64-bit PCI window past them
  *    (etc/reserved-memory-end). The library maps its blocks of host memory
@@ -1208,7 +1208,7 @@ static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
 
 /*
  * The guest's Shared pool is a range of guest physical addresses with no RAM
- * under it, sized by the library for the host GPU's Shared memory heap and
+ * under it, sized by the library for the host GPU's memory heaps, summed, and
  * reserved at realize (reims_graphics_pool_room, reims_graphics_pool_reserve),
  * which the library fills with blocks of host memory as the pool grows: one
  * piece a block, each its own RAM region (so the flat view never merges two,
@@ -1583,8 +1583,8 @@ static void reims_graphics_pool_close(ReimsGraphicsPCIState *s)
  * the bridge's default 64-bit window, which ends 32 GiB past the RAM before
  * any BAR is placed, to the top quarter of the guest's physical addresses,
  * where OVMF puts its own 64-bit window when it sizes it from them, in whole
- * GiB. The library takes as much of it as the host GPU's Shared memory heap
- * holds (rvg_graphics_device_pool_range), and reims_graphics_pool_reserve
+ * GiB. The library takes as much of it as the host GPU's memory heaps hold,
+ * summed (rvg_graphics_device_pool_range), and reims_graphics_pool_reserve
  * then reserves that. False, with no pool, on any other machine or where
  * nothing fits.
  */
@@ -2336,8 +2336,8 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
 
     /*
      * The guest's Shared pool, where the machine has room for it: the library
-     * takes as much of the room as the host GPU's Shared heap holds, and the
-     * range is reserved once it answers (reims_graphics_pool_reserve).
+     * takes as much of the room as the host GPU's memory heaps hold, summed,
+     * and the range is reserved once it answers (reims_graphics_pool_reserve).
      */
     if (reims_graphics_pool_room(dev, &pool_base, &pool_room)) {
         config.pool_physical_address = pool_base;
