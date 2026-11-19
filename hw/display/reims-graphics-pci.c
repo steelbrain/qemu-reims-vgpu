@@ -102,6 +102,9 @@
 #include "qemu/target-info.h"
 #include "qemu/timer.h"
 #include "qemu/units.h"
+#ifdef CONFIG_CPUID_H
+#include "qemu/cpuid.h"
+#endif
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
 #include "migration/blocker.h"
@@ -110,6 +113,7 @@
 #include "hw/pci/msix.h"
 #include "system/accel-irq.h"
 #include "system/address-spaces.h"
+#include "system/kvm.h"
 #include "system/memory.h"
 #include "system/ramblock.h"
 #include "system/runstate.h"
@@ -1577,22 +1581,45 @@ static void reims_graphics_pool_close(ReimsGraphicsPCIState *s)
 }
 
 /*
+ * The host's physical address bits, as KVM and WHPX bound a guest physical
+ * address they map by them: CPUID leaf 0x80000008's EAX[7:0], or 36 where the
+ * host has no such leaf, as QEMU's host_cpu_phys_bits answers, which only the
+ * x86 targets link. 0 on a host that is not x86.
+ */
+static unsigned reims_graphics_host_phys_bits(void)
+{
+#ifdef CONFIG_CPUID_H
+    unsigned eax, ebx, ecx, edx;
+
+    if (__get_cpuid(0x80000008, &eax, &ebx, &ecx, &edx)) {
+        return eax & 0xff;
+    }
+    return 36;
+#else
+    return 0;
+#endif
+}
+
+/*
  * The guest physical addresses the machine can give the pool, *@room bytes
  * from *@base: on a PC machine (one whose PCI host bridge answers
  * pci-hole64-end, q35's and i440fx's), from the first 1 GiB past the RAM and
  * the bridge's default 64-bit window, which ends 32 GiB past the RAM before
  * any BAR is placed, to the top quarter of the guest's physical addresses,
- * where OVMF puts its own 64-bit window when it sizes it from them, in whole
- * GiB. The library takes as much of it as the host GPU's memory heaps hold,
- * summed (rvg_graphics_device_pool_range), and reims_graphics_pool_reserve
- * then reserves that. False, with no pool, on any other machine or where
- * nothing fits.
+ * where OVMF puts its own 64-bit window when it sizes it from them, and under
+ * KVM and WHPX at most to the end of the host's physical addresses, which
+ * they refuse to map past (a guest may have more bits than its host, with
+ * QEMU's warning), in whole GiB. The library takes as much of it as the host
+ * GPU's memory heaps hold, summed (rvg_graphics_device_pool_range), and
+ * reims_graphics_pool_reserve then reserves that. False, with no pool, on any
+ * other machine or where nothing fits.
  */
 static bool reims_graphics_pool_room(PCIDevice *dev, hwaddr *base,
                                      uint64_t *room)
 {
     Object *host = OBJECT(BUS(pci_device_root_bus(dev))->parent);
-    uint64_t start, limit, bits = 0;
+    uint64_t start, limit, bits = 0, host_bits = 0;
+    const char *whose = "guest's";
 
     if (target_aarch64() || !fw_cfg_find() ||
         !object_property_find(host, "pci-hole64-end")) {
@@ -1604,10 +1631,18 @@ static bool reims_graphics_pool_room(PCIDevice *dev, hwaddr *base,
         bits = object_property_get_uint(OBJECT(first_cpu), "phys-bits", NULL);
     }
     limit = bits >= 32 && bits < 64 ? (1ULL << bits) / 4 * 3 : UINT64_MAX;
+    if (kvm_enabled() || whpx_enabled()) {
+        host_bits = reims_graphics_host_phys_bits();
+    }
+    if (host_bits >= 32 && host_bits < 64 && (1ULL << host_bits) < limit) {
+        limit = 1ULL << host_bits;
+        bits = host_bits;
+        whose = "host's";
+    }
     if (start >= limit) {
-        warn_report("%s: the guest's %" PRIu64 " physical address bits leave "
-                    "no room for its pool past 0x%" PRIx64,
-                    TYPE_REIMS_GRAPHICS_PCI, bits, start);
+        warn_report("%s: the %s %" PRIu64 " physical address bits leave no "
+                    "room for the guest's pool past 0x%" PRIx64,
+                    TYPE_REIMS_GRAPHICS_PCI, whose, bits, start);
         return false;
     }
     *base = start;
