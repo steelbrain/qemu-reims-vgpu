@@ -37,10 +37,11 @@
  *    from there. It is one RAM region over the mapping, with no dirty log:
  *    the library's window shows the guest's scanout again at each of the
  *    display's refreshes while it shows no presented surface.
- *  - The guest's Shared pool: x-pool-size bytes of guest physical addresses
- *    (64 GiB by default, whole GiB) with no RAM under them, from the host
- *    bridge's pci-hole64-end, which the device reserves at realize; the
- *    firmware places its 64-bit PCI window past them
+ *  - The guest's Shared pool: guest physical addresses with no RAM under
+ *    them, from the host bridge's pci-hole64-end, as many as the library
+ *    takes for the host GPU's Shared memory heap
+ *    (rvg_graphics_device_pool_range), which the device reserves at realize;
+ *    the firmware places its 64-bit PCI window past them
  *    (etc/reserved-memory-end). The library maps its blocks of host memory
  *    into the range as the guest's pool grows and takes them out as it
  *    shrinks, each its own RAM region, added and removed on the main loop
@@ -243,7 +244,6 @@ struct ReimsGraphicsPCIState {
      * library's asks to map and unmap its pieces, queued on its threads and
      * carried out under the BQL (reims_graphics_pool_bh).
      */
-    uint64_t pool_size;  /* the property x-pool-size: 0 for no pool */
     hwaddr pool_base;    /* where the range starts, once reserved */
     uint64_t pool_length; /* its length: 0 where the device has no pool */
     QemuMutex pool_lock;
@@ -1207,15 +1207,16 @@ static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
 
 /*
  * The guest's Shared pool is a range of guest physical addresses with no RAM
- * under it, reserved at realize (reims_graphics_pool_reserve), which the
- * library fills with blocks of host memory as the pool grows: one piece a
- * block, each its own RAM region (so the flat view never merges two, and an
- * add or a removal touches no other piece's KVM slot or WHPX mapping), owned
- * by an object of its own, a ReimsGraphicsPoolPiece. The library asks on its
- * threads (pool_add, pool_remove); the asks are queued and carried out on the
- * main loop, under the BQL, in order. Under WHPX the add's hypervisor map runs
- * on the asking thread first, outside the BQL (whpx_map_ahead), and so does a
- * removal's unmap (whpx_unmap_before_del).
+ * under it, sized by the library for the host GPU's Shared memory heap and
+ * reserved at realize (reims_graphics_pool_room, reims_graphics_pool_reserve),
+ * which the library fills with blocks of host memory as the pool grows: one
+ * piece a block, each its own RAM region (so the flat view never merges two,
+ * and an add or a removal touches no other piece's KVM slot or WHPX mapping),
+ * owned by an object of its own, a ReimsGraphicsPoolPiece. The library asks
+ * on its threads (pool_add, pool_remove); the asks are queued and carried out
+ * on the main loop, under the BQL, in order. Under WHPX the add's hypervisor
+ * map runs on the asking thread first, outside the BQL (whpx_map_ahead), and
+ * so does a removal's unmap (whpx_unmap_before_del).
  *
  * A piece leaves the guest's address space at its removal, under the BQL, but
  * a flat view of an older generation or a device's DMA map
@@ -1226,9 +1227,6 @@ static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
 
 #define TYPE_REIMS_GRAPHICS_POOL_PIECE "reims-graphics-pool-piece"
 OBJECT_DECLARE_SIMPLE_TYPE(ReimsGraphicsPoolPiece, REIMS_GRAPHICS_POOL_PIECE)
-
-/* The default length of the pool's range: 64 GiB of guest physical addresses. */
-#define REIMS_GRAPHICS_POOL_SIZE (64 * GiB)
 
 struct ReimsGraphicsPoolPiece {
     Object parent_obj;
@@ -1506,46 +1504,63 @@ static void reims_graphics_pool_close(ReimsGraphicsPCIState *s)
 }
 
 /*
- * Reserves the pool's range, @size bytes rounded down to 1 GiB, where the
- * machine has room for it: on a PC machine (one whose PCI host bridge answers
- * pci-hole64-end, q35's and i440fx's), at the first 1 GiB past the RAM and the
- * bridge's default 64-bit window, which ends 32 GiB past the RAM before any
- * BAR is placed, and below the top quarter of the guest's physical addresses,
- * where OVMF puts its own 64-bit window when it sizes it from them. The
- * firmware gets etc/reserved-memory-end past the range, so OVMF puts its
- * 64-bit window above it otherwise, as above memory hotplug's. Nothing lies
- * under the range: a piece's add is a pure add. False, with no pool, on any
- * other machine or where nothing fits.
+ * The guest physical addresses the machine can give the pool, *@room bytes
+ * from *@base: on a PC machine (one whose PCI host bridge answers
+ * pci-hole64-end, q35's and i440fx's), from the first 1 GiB past the RAM and
+ * the bridge's default 64-bit window, which ends 32 GiB past the RAM before
+ * any BAR is placed, to the top quarter of the guest's physical addresses,
+ * where OVMF puts its own 64-bit window when it sizes it from them, in whole
+ * GiB. The library takes as much of it as the host GPU's Shared memory heap
+ * holds (rvg_graphics_device_pool_range), and reims_graphics_pool_reserve
+ * then reserves that. False, with no pool, on any other machine or where
+ * nothing fits.
  */
-static bool reims_graphics_pool_reserve(ReimsGraphicsPCIState *s,
-                                        uint64_t size)
+static bool reims_graphics_pool_room(PCIDevice *dev, hwaddr *base,
+                                     uint64_t *room)
 {
-    PCIDevice *dev = PCI_DEVICE(s);
     Object *host = OBJECT(BUS(pci_device_root_bus(dev))->parent);
-    FWCfgState *fw_cfg = fw_cfg_find();
-    uint64_t base, end, limit, bits = 0, *val, *old;
+    uint64_t start, limit, bits = 0;
 
-    if (!size || target_aarch64() || !fw_cfg ||
+    if (target_aarch64() || !fw_cfg_find() ||
         !object_property_find(host, "pci-hole64-end")) {
         return false;
     }
-    base = ROUND_UP(object_property_get_uint(host, "pci-hole64-end", NULL),
-                    GiB);
+    start = ROUND_UP(object_property_get_uint(host, "pci-hole64-end", NULL),
+                     GiB);
     if (first_cpu && object_property_find(OBJECT(first_cpu), "phys-bits")) {
         bits = object_property_get_uint(OBJECT(first_cpu), "phys-bits", NULL);
     }
     limit = bits >= 32 && bits < 64 ? (1ULL << bits) / 4 * 3 : UINT64_MAX;
-    if (base >= limit) {
+    if (start >= limit) {
         warn_report("%s: the guest's %" PRIu64 " physical address bits leave "
                     "no room for its pool past 0x%" PRIx64,
-                    TYPE_REIMS_GRAPHICS_PCI, bits, base);
+                    TYPE_REIMS_GRAPHICS_PCI, bits, start);
         return false;
     }
-    size = QEMU_ALIGN_DOWN(MIN(size, limit - base), GiB);
-    if (!size) {
-        return false;
+    *base = start;
+    *room = QEMU_ALIGN_DOWN(limit - start, GiB);
+    return *room != 0;
+}
+
+/*
+ * Reserves the range the library took of the pool's room
+ * (rvg_graphics_device_pool_range), once the device is made: the firmware gets
+ * etc/reserved-memory-end past it, rounded up to 1 GiB within the room, so
+ * OVMF puts its 64-bit window above it otherwise, as above memory hotplug's.
+ * Nothing lies under the range: a piece's add is a pure add. No pool where the
+ * library took none (the host GPU has no Shared memory).
+ */
+static void reims_graphics_pool_reserve(ReimsGraphicsPCIState *s)
+{
+    FWCfgState *fw_cfg = fw_cfg_find();
+    uint64_t length = 0, end, *val, *old;
+    hwaddr base;
+
+    base = rvg_graphics_device_pool_range(s->device, &length);
+    if (!length || !fw_cfg) {
+        return;
     }
-    end = base + size;
+    end = ROUND_UP(base + length, GiB);
     val = g_new(uint64_t, 1);
     *val = cpu_to_le64(end);
     old = fw_cfg_modify_file(fw_cfg, "etc/reserved-memory-end", val,
@@ -1556,8 +1571,8 @@ static bool reims_graphics_pool_reserve(ReimsGraphicsPCIState *s,
     }
     g_free(old);
     s->pool_base = base;
-    s->pool_length = size;
-    trace_reims_graphics_pool_reserved(base, size);
+    s->pool_length = length;
+    trace_reims_graphics_pool_reserved(base, length, end);
 
 #ifdef CONFIG_LINUX
     /*
@@ -1572,7 +1587,6 @@ static bool reims_graphics_pool_reserve(ReimsGraphicsPCIState *s,
                     TYPE_REIMS_GRAPHICS_PCI);
     }
 #endif
-    return true;
 }
 
 /* The x-pool-grow property: asks the library for that many more bytes. */
@@ -2155,6 +2169,8 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     uint16_t mode_height = 0;
     uint8_t *base;
     uint64_t size;
+    hwaddr pool_base = 0;
+    uint64_t pool_room = 0;
     uint32_t i;
 
     if (s->displays < 1 || s->displays > RVG_GRAPHICS_DISPLAYS_MAX) {
@@ -2245,10 +2261,14 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                     TYPE_REIMS_GRAPHICS_PCI);
     }
 
-    /* The guest's Shared pool, where the machine has room for it. */
-    if (reims_graphics_pool_reserve(s, s->pool_size)) {
-        config.pool_physical_address = s->pool_base;
-        config.pool_physical_length = s->pool_length;
+    /*
+     * The guest's Shared pool, where the machine has room for it: the library
+     * takes as much of the room as the host GPU's Shared heap holds, and the
+     * range is reserved once it answers (reims_graphics_pool_reserve).
+     */
+    if (reims_graphics_pool_room(dev, &pool_base, &pool_room)) {
+        config.pool_physical_address = pool_base;
+        config.pool_physical_length = pool_room;
     }
 
     /* The windows' input runs from here on; the callbacks need the BHs. */
@@ -2260,6 +2280,7 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                    TYPE_REIMS_GRAPHICS_PCI, rvg_status_message(status));
         goto fail;
     }
+    reims_graphics_pool_reserve(s);
 
     if (msix_init(dev, RVG_GRAPHICS_MSIX_VECTORS, &s->bar0,
                   RVG_GRAPHICS_PCI_BAR_REGISTERS, RVG_GRAPHICS_MSIX_OFFSET,
@@ -2391,8 +2412,6 @@ static void reims_graphics_pci_finalize(Object *obj)
 static const Property reims_graphics_pci_properties[] = {
     DEFINE_PROP_STRING("resolution", ReimsGraphicsPCIState, resolution),
     DEFINE_PROP_UINT32("displays", ReimsGraphicsPCIState, displays, 1),
-    DEFINE_PROP_SIZE("x-pool-size", ReimsGraphicsPCIState, pool_size,
-                     REIMS_GRAPHICS_POOL_SIZE),
 };
 
 static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
