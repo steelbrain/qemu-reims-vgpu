@@ -204,6 +204,7 @@ reims_graphics_pool_add(uint64_t gpa, uint64_t size, bool ahead, int64_t ask_ns,
 reims_graphics_pool_remove(uint64_t gpa, uint64_t size, bool ahead, int64_t unmap_ahead_ns, unsigned run, int64_t held_ns) "piece at 0x%"PRIx64", 0x%"PRIx64" bytes taken out, unmapped ahead %d: unmap ahead %"PRId64" ns, BQL part of its run of %u %"PRId64" ns"
 reims_graphics_pool_removed(uint64_t gpa) "piece at 0x%"PRIx64" ended"
 reims_graphics_quiesce(const char *where, bool may_exit, int64_t ns) "at the %s: answered %d in %"PRId64" ns"
+reims_graphics_end(const char *where, int status) "at the %s: ends with _exit(%d)"
 
 # reims-graphics-pci-prefault.c, reims-graphics-pci-kvm.c
 reims_graphics_prefault_helper(unsigned long id, unsigned cpuid_entries, int tsc_khz) "the populate's vCPU %lu made, with vCPU 0's %u CPUID entries and TSC kHz %d"

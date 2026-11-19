@@ -2347,20 +2347,22 @@ static bool reims_graphics_pci_quiesce(const char *where)
 }
 
 /*
- * Ends QEMU where the library still holds a GPU device after its quiesce:
- * exit() would run the GPU driver's exit handlers with the device live, which
- * the library's runtime supports on no driver (on NVIDIA's, 3 of 9 power-offs
- * that exited that way ended in SIGSEGV inside the driver's exit handler). So
- * it runs what exit() runs of QEMU's own first: its exit notifiers, with the
- * BQL held (usb-host's return of host devices to their drivers, a tap's down
- * script, the pidfile's removal), the restore of the terminal a stdio chardev
- * took, and the flush of the C library's streams; the library wrote its
- * counts in its quiesce. Then _exit, with status. Not run: the simple trace
+ * Ends QEMU where the library still holds a GPU device: exit() would run the
+ * GPU driver's exit handlers with the device live, which the library's
+ * runtime supports on no driver (on NVIDIA's, 3 of 9 power-offs that exited
+ * that way ended in SIGSEGV inside the driver's exit handler). So it runs
+ * what exit() runs of QEMU's own first: its exit notifiers (usb-host's return
+ * of host devices to their drivers, a tap's down script, the pidfile's
+ * removal), the restore of the terminal a stdio chardev took, and the flush
+ * of the C library's streams; the library wrote its counts in its quiesce,
+ * where one ran. Then _exit, with status. Not run: the simple trace
  * backend's flush, record and replay's finish and the plugins' exit
- * callbacks, which QEMU as reims-ctl runs it does not use.
+ * callbacks, which QEMU as reims-ctl runs it does not use. where names the
+ * caller for the trace.
  */
-static G_NORETURN void reims_graphics_pci_end(int status)
+static G_NORETURN void reims_graphics_pci_end(const char *where, int status)
 {
+    trace_reims_graphics_end(where, status);
     qemu_run_exit_notifiers();
 #ifndef _WIN32
     qemu_chr_stdio_term_exit();
@@ -2368,6 +2370,16 @@ static G_NORETURN void reims_graphics_pci_end(int status)
     fflush(NULL);
     _exit(status);
 }
+
+/* Whether a device registered the hooks: once per process, for every device. */
+static bool reims_graphics_pci_exit_hooked;
+
+/*
+ * Whether QEMU's cleanup quiesced the library and its answer let the exit go
+ * on (reims_graphics_pci_cleanup), so that the exit under way is the
+ * cleanup's.
+ */
+static bool reims_graphics_pci_cleaned_up;
 
 /*
  * At the end of QEMU's cleanup (qemu_add_cleanup_notifier), on every quit
@@ -2386,31 +2398,32 @@ static void reims_graphics_pci_cleanup(Notifier *notifier, void *data)
     int status = *(int *)data;
 
     if (!reims_graphics_pci_quiesce("cleanup")) {
-        reims_graphics_pci_end(status);
+        reims_graphics_pci_end("cleanup", status);
     }
+    reims_graphics_pci_cleaned_up = true;
 }
 
 static Notifier reims_graphics_pci_cleanup_notifier = {
     .notify = reims_graphics_pci_cleanup,
 };
 
-/* Whether a device registered the hooks: once per process, for every device. */
-static bool reims_graphics_pci_exit_hooked;
-
 /*
  * The exit handler for an exit() that skips QEMU's cleanup (a later device's
  * refused realize, a failed incoming migration): registered once the library
  * made its GPU device, after the driver loaded, so it runs before the
- * driver's own exit handlers registered until then. After the cleanup's
- * quiesce it answers at once. Such an exit is a failure's, whose status this
- * does not know: on a false answer it ends with EXIT_FAILURE, after QEMU's
- * own exit work (reims_graphics_pci_end), whose exit notifiers would run
- * after this handler.
+ * driver's own exit handlers registered until then. After the cleanup's true
+ * answer it does nothing. Otherwise the library still holds its GPU device,
+ * which no release let go of, so it ends QEMU with _exit and no quiesce, which
+ * the library's runtime does not support inside an exit handler, after QEMU's
+ * own exit work (reims_graphics_pci_end), whose exit notifiers would run after
+ * this handler. The library writes no degradation counts then: its quiesce or
+ * its exit handler writes them. Such an exit is a failure's, whose status
+ * this does not know: it ends with EXIT_FAILURE.
  */
 static void reims_graphics_pci_at_exit(void)
 {
-    if (!reims_graphics_pci_quiesce("exit")) {
-        reims_graphics_pci_end(EXIT_FAILURE);
+    if (!reims_graphics_pci_cleaned_up) {
+        reims_graphics_pci_end("exit", EXIT_FAILURE);
     }
 }
 
