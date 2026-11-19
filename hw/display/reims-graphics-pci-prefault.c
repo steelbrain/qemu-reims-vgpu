@@ -12,6 +12,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/lockable.h"
 #include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "system/kvm.h"
