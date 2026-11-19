@@ -205,7 +205,8 @@ reims_graphics_pool_remove(uint64_t gpa, uint64_t size, bool ahead, int64_t unma
 reims_graphics_pool_removed(uint64_t gpa) "piece at 0x%"PRIx64" ended"
 
 # reims-graphics-pci-prefault.c, reims-graphics-pci-kvm.c
-reims_graphics_prefault_helper(unsigned long id, unsigned cpuid_entries) "the populate's vCPU %lu made, with vCPU 0's %u CPUID entries"
+reims_graphics_prefault_helper(unsigned long id, unsigned cpuid_entries, int tsc_khz) "the populate's vCPU %lu made, with vCPU 0's %u CPUID entries and TSC kHz %d"
+reims_graphics_prefault_tsc_rejoin(int cpu_index, int ret) "after vCPU %d's TSC put, the populate's vCPU's TSC write answered %d"
 reims_graphics_prefault_region(uint64_t gpa, uint64_t size, uint64_t done, unsigned slices, unsigned kicks, int err, bool stopped) "piece at 0x%"PRIx64", 0x%"PRIx64" bytes: 0x%"PRIx64" populated in %u slices, %u cut by a pause; errno %d, stopped %d"
 reims_graphics_prefault_region_time(uint64_t gpa, int64_t queued_ns, int64_t wall_ns, int64_t cpu_ns, int64_t slice_max_ns) "piece at 0x%"PRIx64": queued %"PRId64" ns, wall %"PRId64" ns, thread CPU %"PRId64" ns, longest slice %"PRId64" ns"
 reims_graphics_prefault_dropped(uint64_t gpa, uint64_t size) "piece at 0x%"PRIx64", 0x%"PRIx64" bytes, removed before its populate started"

@@ -220,6 +220,13 @@ void kvm_irqchip_add_change_notifier(Notifier *n);
 void kvm_irqchip_remove_change_notifier(Notifier *n);
 void kvm_irqchip_change_notify(void);
 
+/*
+ * x86 targets only: @n runs on a vCPU's thread, with its CPUState as the
+ * data, each time kvm_arch_put_registers has put the vCPU's TSC, at a
+ * reset or a full put.
+ */
+void kvm_tsc_put_add_notifier(Notifier *n);
+
 #ifdef COMPILING_PER_TARGET
 #include "cpu.h"
 

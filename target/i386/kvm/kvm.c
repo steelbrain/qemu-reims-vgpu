@@ -5716,6 +5716,19 @@ static int kvm_get_nested_state(X86CPU *cpu)
     return ret;
 }
 
+static NotifierList kvm_tsc_put_notifiers =
+    NOTIFIER_LIST_INITIALIZER(kvm_tsc_put_notifiers);
+
+/*
+ * Added under the BQL, before the VM runs: a device's vCPU that never runs
+ * writes its own TSC after each put of a guest vCPU's, so that it stays in
+ * the TSC generation they are in (reims-graphics-pci-kvm.c).
+ */
+void kvm_tsc_put_add_notifier(Notifier *n)
+{
+    notifier_list_add(&kvm_tsc_put_notifiers, n);
+}
+
 int kvm_arch_put_registers(CPUState *cpu, KvmPutState level, Error **errp)
 {
     X86CPU *x86_cpu = X86_CPU(cpu);
@@ -5789,6 +5802,10 @@ int kvm_arch_put_registers(CPUState *cpu, KvmPutState level, Error **errp)
     if (ret < 0) {
         error_setg_errno(errp, -ret, "Failed to set MSRs");
         return ret;
+    }
+    if (level >= KVM_PUT_RESET_STATE) {
+        /* kvm_put_msrs put MSR_IA32_TSC. */
+        notifier_list_notify(&kvm_tsc_put_notifiers, cpu);
     }
     ret = kvm_put_kvm_regs(x86_cpu);
     if (ret < 0) {
