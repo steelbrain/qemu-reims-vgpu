@@ -139,6 +139,11 @@ bool kvm_hwpoisoned_mem(void)
     return false;
 }
 
+bool kvm_unmap_before_del(uint64_t gpa, uint64_t size)
+{
+    return false;
+}
+
 int kvm_create_guest_memfd(uint64_t size, uint64_t flags, Error **errp)
 {
     error_setg(errp, "KVM is not enabled");

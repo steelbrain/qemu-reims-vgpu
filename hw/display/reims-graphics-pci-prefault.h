@@ -18,13 +18,14 @@
  * thread's own that never runs (reims-graphics-pci-kvm.c), or WHPX's
  * WHvAdviseGpaRange populate (whpx_populate).
  *
- * On KVM a pool piece's add or removal changes a slot under the BQL, which
- * must not wait for a call: it pauses the populate first, which signals the
- * call in flight to end it at once, and resumes it once its slot change is
- * done. On WHPX the device maps and unmaps its pieces outside the BQL
- * (whpx_map_ahead, whpx_unmap_before_del), and a map or unmap under the
- * BQL waits for at most the slice in flight: the populate takes no pause
- * there.
+ * On KVM a pool piece's add changes a slot under the BQL, and its removal
+ * deletes its slot on the library's thread first (kvm_unmap_before_del),
+ * neither of which must wait for a call: each pauses the populate first,
+ * which signals the call in flight to end it at once, and resumes it once
+ * its slot change is done. On WHPX the device maps and unmaps its pieces
+ * outside the BQL (whpx_map_ahead, whpx_unmap_before_del), and a map or
+ * unmap under the BQL waits for at most the slice in flight: the populate
+ * takes no pause there.
  */
 
 #ifndef HW_DISPLAY_REIMS_GRAPHICS_PCI_PREFAULT_H
@@ -81,8 +82,9 @@ void reims_graphics_prefault_stop(ReimsGraphicsPrefault *pf, hwaddr gpa,
                                   uint64_t size);
 
 /*
- * Under the BQL, before a slot change: no call starts until the matching
- * resume, and the call in flight is ended; returns once none is.
+ * Any thread, before a slot change: no call starts until the matching
+ * resume, and the call in flight is ended; returns once none is. Pauses
+ * nest.
  */
 void reims_graphics_prefault_pause(ReimsGraphicsPrefault *pf);
 void reims_graphics_prefault_resume(ReimsGraphicsPrefault *pf);

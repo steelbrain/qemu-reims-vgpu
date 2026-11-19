@@ -1226,7 +1226,8 @@ static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
  * on its threads (pool_add, pool_remove); the asks are queued and carried out
  * on the main loop, under the BQL, in order. Under WHPX the add's hypervisor
  * map runs on the asking thread first, outside the BQL (whpx_map_ahead), and
- * so does a removal's unmap (whpx_unmap_before_del).
+ * so does a removal's unmap (whpx_unmap_before_del); under KVM, a removal's
+ * slot delete (kvm_unmap_before_del).
  *
  * A piece leaves the guest's address space at its removal, under the BQL, but
  * a flat view of an older generation or a device's DMA map
@@ -1237,7 +1238,8 @@ static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
  * Under KVM and WHPX, each piece is populated once its add is answered
  * (reims-graphics-pci-prefault.h), so the guest's first touch of it takes
  * no fault; the piece's removal stops its populate, and under KVM each run
- * of adds or removals pauses the populate for its memory transaction.
+ * of adds or removals, and each removal's slot delete ahead, pauses the
+ * populate for its slot change.
  */
 
 #define TYPE_REIMS_GRAPHICS_POOL_PIECE "reims-graphics-pool-piece"
@@ -1256,7 +1258,7 @@ struct ReimsGraphicsPoolAsk {
     uint64_t size;
     void *host;
     bool mapped_ahead; /* whpx_map_ahead took it, or for a removal */
-                       /* whpx_unmap_before_del */
+                       /* whpx_unmap_before_del or kvm_unmap_before_del */
     int64_t asked;     /* QEMU_CLOCK_REALTIME ns, at the ask */
     int64_t map_ns;    /* the map or unmap ahead's time */
     bool done;         /* its run added or took out its piece */
@@ -1535,8 +1537,10 @@ static void reims_graphics_pool_add_cb(void *ctx, uint64_t physical_address,
 
 /*
  * The library's pool_remove, on its pool thread before it gives the block
- * back, the BQL not held: under WHPX the hypervisor's unmap runs here, then the removal is
- * queued for the main loop. The guest holds no mapping of the piece by now.
+ * back, the BQL not held: the hypervisor's unmap under WHPX, or KVM's slot
+ * delete, which zaps what the populate mapped (3-8 ms a 256 MiB piece), runs
+ * here, then the removal is queued for the main loop. The guest holds no
+ * mapping of the piece by now.
  */
 static void reims_graphics_pool_remove_cb(void *ctx, uint64_t physical_address,
                                           uint64_t length)
@@ -1553,16 +1557,27 @@ static void reims_graphics_pool_remove_cb(void *ctx, uint64_t physical_address,
     }
     ask->gpa = physical_address;
     ask->size = length;
-    if (whpx_enabled()) {
+    if (whpx_enabled() || kvm_enabled()) {
         WITH_QEMU_LOCK_GUARD(&s->pool_lock) {
             closed = s->pool_closed;
         }
-        /* Once closed, the teardown takes the piece out itself. */
-        if (!closed) {
-            t0 = get_clock();
-            ask->mapped_ahead = whpx_unmap_before_del(physical_address, length);
-            ask->map_ns = get_clock() - t0;
+    }
+    /* Once closed, the teardown takes the piece out itself. */
+    if (whpx_enabled() && !closed) {
+        t0 = get_clock();
+        ask->mapped_ahead = whpx_unmap_before_del(physical_address, length);
+        ask->map_ns = get_clock() - t0;
+    } else if (kvm_enabled() && !closed) {
+        t0 = get_clock();
+        /* The delete waits for no populate call. */
+        if (prefault) {
+            reims_graphics_prefault_pause(prefault);
         }
+        ask->mapped_ahead = kvm_unmap_before_del(physical_address, length);
+        if (prefault) {
+            reims_graphics_prefault_resume(prefault);
+        }
+        ask->map_ns = get_clock() - t0;
     }
     if (!reims_graphics_pool_queue(s, ask)) {
         /* The teardown takes the piece, and its end says so. */
@@ -1588,7 +1603,7 @@ static void reims_graphics_pool_close(ReimsGraphicsPCIState *s)
         s->pool_closed = true;
         while ((ask = QSIMPLEQ_FIRST(&s->pool_asks)) != NULL) {
             QSIMPLEQ_REMOVE_HEAD(&s->pool_asks, next);
-            if (ask->mapped_ahead) {
+            if (ask->add && ask->mapped_ahead) {
                 whpx_unmap_ahead(ask->gpa, ask->size, ask->host);
             }
             g_free(ask);

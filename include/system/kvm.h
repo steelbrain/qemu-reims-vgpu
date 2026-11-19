@@ -227,6 +227,21 @@ void kvm_irqchip_change_notify(void);
  */
 void kvm_tsc_put_add_notifier(Notifier *n);
 
+/*
+ * Deletes the KVM slots of exactly [@gpa, @gpa + @size), in each address
+ * space that holds one, on any thread, without the BQL, ahead of the removal
+ * of the RAM region that made them: the listener's removal of that section
+ * then finds no slot and deletes nothing, so the delete, which zaps what of
+ * the slot is mapped (measured on a 256 MiB slot: 3-8 ms fully mapped,
+ * against about 1 ms for the whole removal of an untouched one), is not
+ * spent under the BQL. Until the removal a guest access there exits, and
+ * QEMU carries it out on the region's memory. False, with nothing deleted,
+ * where no address space holds such a slot (the region's add is still to
+ * come, or was never made); a slot with a dirty log or guest_memfd is left
+ * to the removal.
+ */
+bool kvm_unmap_before_del(uint64_t gpa, uint64_t size);
+
 #ifdef COMPILING_PER_TARGET
 #include "cpu.h"
 

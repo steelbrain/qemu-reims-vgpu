@@ -1972,6 +1972,43 @@ static void kvm_region_commit(MemoryListener *listener)
     kvm_slots_unlock();
 }
 
+bool kvm_unmap_before_del(uint64_t gpa, uint64_t size)
+{
+    KVMState *s = kvm_state;
+    KVMMemoryListener *kml;
+    KVMSlot *mem;
+    bool done = false;
+    int i, err;
+
+    if (!s || size > kvm_max_slot_size) {
+        return false;
+    }
+    kvm_slots_lock();
+    for (i = 0; i < s->nr_as; i++) {
+        kml = s->as[i].ml;
+        mem = kml ? kvm_lookup_matching_slot(kml, gpa, size) : NULL;
+        /* A dirty log, which the removal syncs first, stays the removal's. */
+        if (!mem || (mem->flags & KVM_MEM_LOG_DIRTY_PAGES) ||
+            mem->guest_memfd >= 0) {
+            continue;
+        }
+        g_free(mem->dirty_bmap);
+        mem->dirty_bmap = NULL;
+        mem->memory_size = 0;
+        mem->flags = 0;
+        err = kvm_set_user_memory_region(kml, mem, false);
+        if (err) {
+            fprintf(stderr, "%s: error unregistering slot: %s\n",
+                    __func__, strerror(-err));
+            abort();
+        }
+        kml->nr_slots_used--;
+        done = true;
+    }
+    kvm_slots_unlock();
+    return done;
+}
+
 static void kvm_log_sync(MemoryListener *listener,
                          MemoryRegionSection *section)
 {
