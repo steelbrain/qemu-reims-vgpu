@@ -21,6 +21,9 @@
 #endif
 #include "trace.h"
 
+/* Calls in a row cut with nothing done, after which a piece is let go. */
+#define REIMS_GRAPHICS_PREFAULT_CUTS 3
+
 typedef struct ReimsGraphicsPrefaultRange {
     hwaddr gpa;
     uint64_t size;
@@ -44,7 +47,7 @@ struct ReimsGraphicsPrefault {
     bool kicked;      /* lock: which a pause has signalled */
     QemuCond idle;    /* broadcast when a call a pause waits for ends */
     /* lock: the totals */
-    uint64_t regions, bytes, slices, kicks, errors, stopped, dropped;
+    uint64_t regions, bytes, slices, cuts, kicks, errors, stopped, dropped;
     int64_t cpu_ns;
 };
 
@@ -78,9 +81,9 @@ static void reims_graphics_prefault_region(ReimsGraphicsPrefault *pf,
     hwaddr gpa = r->gpa, end = r->gpa + r->size, next;
     int64_t t0 = get_clock(), c0 = reims_graphics_prefault_cpu_ns();
     int64_t s0, slice_ns, slice_max = 0, wall, cpu;
-    unsigned slices = 0, kicks = 0;
+    unsigned slices = 0, cuts = 0, kicks = 0, cut_run = 0;
     int64_t done;
-    bool kicked, stopped = false;
+    bool cut, kicked, stopped = false;
     int err = 0;
 
     while (gpa < end) {
@@ -97,8 +100,9 @@ static void reims_graphics_prefault_region(ReimsGraphicsPrefault *pf,
         }
         next = MIN(end, QEMU_ALIGN_DOWN(gpa, REIMS_GRAPHICS_PREFAULT_SLICE) +
                         REIMS_GRAPHICS_PREFAULT_SLICE);
+        cut = false;
         s0 = get_clock();
-        done = pf->ops->populate(gpa, next - gpa);
+        done = pf->ops->populate(gpa, next - gpa, &cut);
         slice_ns = get_clock() - s0;
         WITH_QEMU_LOCK_GUARD(&pf->lock) {
             pf->in_call = false;
@@ -109,11 +113,16 @@ static void reims_graphics_prefault_region(ReimsGraphicsPrefault *pf,
         }
         slice_max = MAX(slice_max, slice_ns);
         slices++;
+        cuts += cut;
         kicks += kicked;
         if (done > 0) {
             gpa += done;
+            cut_run = 0;
         } else if (done == -EINTR && kicked) {
             /* A pause ended it with nothing done: it starts afresh after. */
+        } else if (done == -EINTR &&
+                   ++cut_run < REIMS_GRAPHICS_PREFAULT_CUTS) {
+            /* Cut with nothing done: the next call starts afresh. */
         } else {
             err = -done;
             break;
@@ -122,13 +131,14 @@ static void reims_graphics_prefault_region(ReimsGraphicsPrefault *pf,
     wall = get_clock() - t0;
     cpu = reims_graphics_prefault_cpu_ns() - c0;
     trace_reims_graphics_prefault_region(r->gpa, r->size, gpa - r->gpa,
-                                         slices, kicks, err, stopped);
+                                         slices, cuts, kicks, err, stopped);
     trace_reims_graphics_prefault_region_time(r->gpa, t0 - r->queued, wall,
                                               cpu, slice_max);
     WITH_QEMU_LOCK_GUARD(&pf->lock) {
         pf->regions++;
         pf->bytes += gpa - r->gpa;
         pf->slices += slices;
+        pf->cuts += cuts;
         pf->kicks += kicks;
         pf->errors += err != 0;
         pf->stopped += stopped;
@@ -296,8 +306,8 @@ void reims_graphics_prefault_report(ReimsGraphicsPrefault *pf)
 {
     WITH_QEMU_LOCK_GUARD(&pf->lock) {
         trace_reims_graphics_prefault_totals(pf->regions, pf->bytes,
-                                             pf->slices, pf->kicks, pf->errors,
-                                             pf->stopped, pf->dropped,
-                                             pf->cpu_ns);
+                                             pf->slices, pf->cuts, pf->kicks,
+                                             pf->errors, pf->stopped,
+                                             pf->dropped, pf->cpu_ns);
     }
 }

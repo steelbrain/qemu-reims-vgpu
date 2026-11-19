@@ -68,12 +68,32 @@ bool reims_graphics_kvm_disable_slot_zap_all(void)
 #define REIMS_GRAPHICS_KVM_CPUID_MAX 4096
 #define REIMS_GRAPHICS_KVM_MSR_IA32_TSC 0x10
 
+/*
+ * The time a call runs before the thread is signalled, which ends it with
+ * its progress (-EINTR where it made none). A call retries a page with no
+ * reload of its vCPU's MMU for as long as the VM's TDP root is obsolete,
+ * until a signal (arch/x86/kvm/mmu/mmu.c:5063-5072, 4817-4843 in Linux
+ * 7.3.3), holding KVM's SRCU, which every slot change then waits for under
+ * the BQL. Roots go obsolete at a slot's delete where KVM zaps every slot
+ * (KVM_X86_QUIRK_SLOT_ZAP_ALL on, KVM's default, which the device turns off
+ * where KVM has it; mmu.c:7629-7650), at an MMIO generation wrap after many
+ * slot changes (mmu.c:7653-7678), or when nx_huge_pages is switched
+ * (mmu.c:7755-7766). The next call frees the obsolete root
+ * (arch/x86/kvm/mmu.h:195-198). A slice takes 0.3-0.6 ms.
+ */
+#define REIMS_GRAPHICS_KVM_CALL_LIMIT_NS (20 * 1000 * 1000)
+
+#ifndef sigev_notify_thread_id
+#define sigev_notify_thread_id _sigev_un._tid
+#endif
+
 static struct {
     unsigned long id;            /* the helper's vCPU id */
     struct kvm_cpuid2 *cpuid;    /* vCPU 0's, for the helper */
     int tsc_khz;                 /* vCPU 0's, or <= 0 where KVM did not say */
     int fd;                      /* the helper's vCPU fd, -1 until made */
     pthread_t thread;            /* the populate thread */
+    timer_t timer;               /* the populate thread's call limit */
     Notifier tsc_put;
 } reims_graphics_kvm_helper = { .fd = -1 };
 
@@ -125,22 +145,33 @@ static void reims_graphics_kvm_tsc_put(Notifier *n, void *data)
     }
 }
 
-/* On the populate thread: makes the helper. */
+/* On the populate thread: makes the helper and the call limit's timer. */
 static bool reims_graphics_kvm_prefault_start(Error **errp)
 {
+    struct sigevent sev = {
+        .sigev_notify = SIGEV_THREAD_ID,
+        .sigev_signo = SIG_IPI,
+    };
     sigset_t set;
     int fd, khz, ret;
 
     /*
-     * A pause's kick signals this thread with SIG_IPI, whose handler
-     * (kvm_ipi_signal, accel/kvm/kvm-all.c) does nothing on a thread that
-     * is no vCPU's; the signal only ends the call in flight
+     * The timer and a pause's kick signal this thread with SIG_IPI, whose
+     * handler (kvm_ipi_signal, accel/kvm/kvm-all.c) does nothing on a
+     * thread that is no vCPU's; the signal only ends the call in flight
      * (virt/kvm/kvm_main.c:4411-4415, arch/x86/kvm/mmu/mmu.c:5063-5065).
      */
     sigemptyset(&set);
     sigaddset(&set, SIG_IPI);
     pthread_sigmask(SIG_UNBLOCK, &set, NULL);
     reims_graphics_kvm_helper.thread = pthread_self();
+    sev.sigev_notify_thread_id = qemu_get_thread_id();
+    if (timer_create(CLOCK_MONOTONIC, &sev,
+                     &reims_graphics_kvm_helper.timer) < 0) {
+        error_setg_errno(errp, errno, "reims-graphics-pci: no pre-fault of "
+                         "the pool: timer_create");
+        return false;
+    }
 
     fd = kvm_vm_ioctl(kvm_state, KVM_CREATE_VCPU,
                       (void *)reims_graphics_kvm_helper.id);
@@ -181,17 +212,27 @@ static bool reims_graphics_kvm_prefault_start(Error **errp)
     return true;
 }
 
-static int64_t reims_graphics_kvm_prefault_populate(hwaddr gpa, uint64_t size)
+static int64_t reims_graphics_kvm_prefault_populate(hwaddr gpa, uint64_t size,
+                                                    bool *cut)
 {
     struct kvm_pre_fault_memory range = { .gpa = gpa, .size = size };
-    int ret;
+    struct itimerspec limit = {
+        .it_value.tv_nsec = REIMS_GRAPHICS_KVM_CALL_LIMIT_NS,
+    };
+    struct itimerspec off = { 0 }, left;
+    int ret, err;
 
+    timer_settime(reims_graphics_kvm_helper.timer, 0, &limit, NULL);
     ret = ioctl(reims_graphics_kvm_helper.fd, KVM_PRE_FAULT_MEMORY, &range);
+    err = errno;
+    timer_settime(reims_graphics_kvm_helper.timer, 0, &off, &left);
+    /* A one-shot timer with nothing left ran out: it signalled. */
+    *cut = left.it_value.tv_sec == 0 && left.it_value.tv_nsec == 0;
     if (ret == 0) {
         /* Progress: KVM gives the range left back. */
         return range.size < size ? size - range.size : -EIO;
     }
-    return -errno;
+    return -err;
 }
 
 static void reims_graphics_kvm_prefault_kick(void)

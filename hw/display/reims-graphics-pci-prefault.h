@@ -41,9 +41,9 @@ typedef struct ReimsGraphicsPrefaultOps {
     /*
      * On the populate thread: populates [@gpa, @gpa + @size), at most one
      * slice. The bytes done from @gpa (> 0), or a negative errno where
-     * none were.
+     * none were. *@cut is set where the call ran into its time limit.
      */
-    int64_t (*populate)(hwaddr gpa, uint64_t size);
+    int64_t (*populate)(hwaddr gpa, uint64_t size, bool *cut);
     /*
      * Any thread: signals the populate thread, so that the call it is in
      * ends with what it has done (-EINTR where it did nothing).
