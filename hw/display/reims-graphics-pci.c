@@ -1504,8 +1504,8 @@ static void reims_graphics_pool_add_cb(void *ctx, uint64_t physical_address,
 }
 
 /*
- * The library's pool_remove, on the thread freeing the block, the BQL not
- * held: under WHPX the hypervisor's unmap runs here, then the removal is
+ * The library's pool_remove, on its pool thread before it gives the block
+ * back, the BQL not held: under WHPX the hypervisor's unmap runs here, then the removal is
  * queued for the main loop. The guest holds no mapping of the piece by now.
  */
 static void reims_graphics_pool_remove_cb(void *ctx, uint64_t physical_address,
