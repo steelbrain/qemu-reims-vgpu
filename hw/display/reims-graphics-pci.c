@@ -38,11 +38,13 @@
  *    the library's window shows the guest's scanout again at each of the
  *    display's refreshes while it shows no presented surface.
  *  - The guest's Shared pool: guest physical addresses with no RAM under
- *    them, from the host bridge's pci-hole64-end, as many as the library
- *    takes for the host GPU's memory heaps, every heap summed
- *    (rvg_graphics_device_pool_range), which the device reserves at realize;
- *    the firmware places its 64-bit PCI window past them
- *    (etc/reserved-memory-end). The library maps its blocks of host memory
+ *    them, as many as the library takes for the host GPU's memory heaps,
+ *    every heap summed (rvg_graphics_device_pool_range), which the device
+ *    reserves at realize. On a PC machine they start at the host bridge's
+ *    pci-hole64-end, and the firmware places its 64-bit PCI window past them
+ *    (etc/reserved-memory-end); on vmapple they start at the room past RAM
+ *    the machine answers (x-pool-room-base and x-pool-room-size), where
+ *    nothing else is placed. The library maps its blocks of host memory
  *    into the range as the guest's pool grows and takes them out as it
  *    shrinks, each its own RAM region, added and removed on the main loop
  *    ("The guest's Shared pool", below).
@@ -1651,12 +1653,33 @@ static bool reims_graphics_pool_room(PCIDevice *dev, hwaddr *base,
 }
 
 /*
+ * The pool's room on a machine that answers it itself, vmapple: *@room bytes
+ * from *@base, its x-pool-room-base and x-pool-room-size, past RAM to the end
+ * of the guest's physical addresses, where the machine places nothing (the
+ * machine's own comment, vmapple_pool_room). False on any other machine, or
+ * where nothing fits.
+ */
+static bool reims_graphics_pool_room_machine(hwaddr *base, uint64_t *room)
+{
+    Object *machine = qdev_get_machine();
+
+    if (!object_property_find(machine, "x-pool-room-size")) {
+        return false;
+    }
+    *base = object_property_get_uint(machine, "x-pool-room-base", NULL);
+    *room = object_property_get_uint(machine, "x-pool-room-size", NULL);
+    return *room != 0;
+}
+
+/*
  * Reserves the range the library took of the pool's room
- * (rvg_graphics_device_pool_range), once the device is made: the firmware gets
- * etc/reserved-memory-end past it, rounded up to 1 GiB within the room, so
- * OVMF puts its 64-bit window above it otherwise, as above memory hotplug's.
- * Nothing lies under the range: a piece's add is a pure add. No pool where the
- * library took none (the host GPU has no Shared memory).
+ * (rvg_graphics_device_pool_range), once the device is made: on a PC machine
+ * the firmware gets etc/reserved-memory-end past it, rounded up to 1 GiB
+ * within the room, so OVMF puts its 64-bit window above it otherwise, as above
+ * memory hotplug's. A machine with no fw_cfg, vmapple, places nothing in its
+ * room, which needs no reservation. Nothing lies under the range: a piece's
+ * add is a pure add. No pool where the library took none (the host GPU has no
+ * Shared memory).
  */
 static void reims_graphics_pool_reserve(ReimsGraphicsPCIState *s)
 {
@@ -1665,19 +1688,21 @@ static void reims_graphics_pool_reserve(ReimsGraphicsPCIState *s)
     hwaddr base;
 
     base = rvg_graphics_device_pool_range(s->device, &length);
-    if (!length || !fw_cfg) {
+    if (!length) {
         return;
     }
     end = ROUND_UP(base + length, GiB);
-    val = g_new(uint64_t, 1);
-    *val = cpu_to_le64(end);
-    old = fw_cfg_modify_file(fw_cfg, "etc/reserved-memory-end", val,
-                             sizeof(*val));
-    if (old && le64_to_cpu(*old) > end) {
-        /* Memory hotplug's area ends past the pool: its end stays. */
-        *val = *old;
+    if (fw_cfg) {
+        val = g_new(uint64_t, 1);
+        *val = cpu_to_le64(end);
+        old = fw_cfg_modify_file(fw_cfg, "etc/reserved-memory-end", val,
+                                 sizeof(*val));
+        if (old && le64_to_cpu(*old) > end) {
+            /* Memory hotplug's area ends past the pool: its end stays. */
+            *val = *old;
+        }
+        g_free(old);
     }
-    g_free(old);
     s->pool_base = base;
     s->pool_length = length;
     trace_reims_graphics_pool_reserved(base, length, end);
@@ -2370,11 +2395,13 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     }
 
     /*
-     * The guest's Shared pool, where the machine has room for it: the library
-     * takes as much of the room as the host GPU's memory heaps hold, summed,
-     * and the range is reserved once it answers (reims_graphics_pool_reserve).
+     * The guest's Shared pool, where the machine has room for it, a PC
+     * machine's or the room vmapple answers: the library takes as much of the
+     * room as the host GPU's memory heaps hold, summed, and the range is
+     * reserved once it answers (reims_graphics_pool_reserve).
      */
-    if (reims_graphics_pool_room(dev, &pool_base, &pool_room)) {
+    if (reims_graphics_pool_room(dev, &pool_base, &pool_room) ||
+        reims_graphics_pool_room_machine(&pool_base, &pool_room)) {
         config.pool_physical_address = pool_base;
         config.pool_physical_length = pool_room;
     }

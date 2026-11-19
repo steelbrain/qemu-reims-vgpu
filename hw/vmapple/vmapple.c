@@ -56,6 +56,7 @@
 #include "system/tcg.h"
 #include "target/arm/gtimer.h"
 #include "target/arm/cpu.h"
+#include "target/arm/internals.h"
 #include "target/arm/kvm_arm.h"
 
 struct VMAppleMachineState {
@@ -74,6 +75,9 @@ struct VMAppleMachineState {
     MemoryRegion ecam_alias;
     uint64_t uuid;
     char *tablet;
+    /* The room past RAM (vmapple_pool_room) */
+    uint64_t pool_room_base;
+    uint64_t pool_room_size;
 };
 
 #define TYPE_VMAPPLE_MACHINE   MACHINE_TYPE_NAME("vmapple")
@@ -483,6 +487,32 @@ static void vmapple_reset(void *opaque)
     cpu_set_pc(first_cpu, base);
 }
 
+/*
+ * The room past RAM that a device may map memory into once the guest runs,
+ * reims-graphics-pci's Shared pool: from the end of RAM, rounded up to 1 GiB,
+ * to the end of the guest's physical addresses, in whole GiB. The machine
+ * places nothing past RAM, and the firmware tells macOS of RAM alone. The
+ * bits are the CPU's PARange, at most VMAPPLE_PHYS_BITS, which macOS's
+ * kernel maps; under HVF that is the VM's IPA size
+ * (vmapple_get_physical_address_range), and under KVM it is at most the
+ * VM's, KVM's maximum (the machine asks KVM for no other size).
+ */
+static void vmapple_pool_room(VMAppleMachineState *vms, MachineState *machine)
+{
+    hwaddr base = ROUND_UP(vms->memmap[VMAPPLE_MEM].base + machine->ram_size,
+                           GiB);
+    unsigned int bits = MIN(VMAPPLE_PHYS_BITS, arm_pamax(ARM_CPU(first_cpu)));
+    uint64_t end;
+    bool fixed_ipa;
+
+    if (kvm_enabled()) {
+        bits = MIN(bits, kvm_arm_get_max_vm_ipa_size(machine, &fixed_ipa));
+    }
+    end = 1ULL << bits;
+    vms->pool_room_base = base;
+    vms->pool_room_size = end > base ? QEMU_ALIGN_DOWN(end - base, GiB) : 0;
+}
+
 static void mach_vmapple_init(MachineState *machine)
 {
     VMAppleMachineState *vms = VMAPPLE_MACHINE(machine);
@@ -597,6 +627,7 @@ static void mach_vmapple_init(MachineState *machine)
 
     memory_region_add_subregion(sysmem, vms->memmap[VMAPPLE_MEM].base,
                                 machine->ram);
+    vmapple_pool_room(vms, machine);
 
     create_gic(vms, sysmem);
     create_gicv2m(vms);
@@ -805,6 +836,16 @@ static void vmapple_instance_init(Object *obj)
     object_property_add_uint64_ptr(obj, "uuid", &vms->uuid,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "uuid", "Machine UUID (SDOM)");
+    object_property_add_uint64_ptr(obj, "x-pool-room-base",
+                                   &vms->pool_room_base, OBJ_PROP_FLAG_READ);
+    object_property_set_description(obj, "x-pool-room-base",
+                                    "Where the room past RAM for a device's "
+                                    "pool starts (read-only)");
+    object_property_add_uint64_ptr(obj, "x-pool-room-size",
+                                   &vms->pool_room_size, OBJ_PROP_FLAG_READ);
+    object_property_set_description(obj, "x-pool-room-size",
+                                    "The size of the room past RAM for a "
+                                    "device's pool, 0 for none (read-only)");
 }
 
 static void vmapple_instance_finalize(Object *obj)

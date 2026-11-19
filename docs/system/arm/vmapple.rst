@@ -115,6 +115,13 @@ most the host gives where that is fewer, where HVF's default is 36 bits:
 macOS's kernel maps physical addresses of up to 40 bits. HVF gives the guest
 that size as its ``ID_AA64MMFR0_EL1.PARange``. RAM must end within it.
 
+The machine places nothing past RAM. From the end of RAM, rounded up to
+1 GiB, to the end of the guest's physical addresses, in whole GiB, is room
+that a device may map memory into once the guest runs; the read-only machine
+properties ``x-pool-room-base`` and ``x-pool-room-size`` give it, and
+``reims-graphics-pci`` puts its Shared pool there. Under KVM and TCG its end
+is the CPU's ``PARange``, at most 40 bits.
+
 The firmware also makes one change that macOS needs on this machine before
 it enters the kernel. The machine makes no change to the guest itself.
 
