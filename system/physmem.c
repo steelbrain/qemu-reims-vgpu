@@ -1788,37 +1788,100 @@ static void *file_ram_alloc(RAMBlock *block,
 }
 #endif
 
+/*
+ * The RAM blocks' ranges of ram_addr_t space, sorted by offset: what
+ * find_ram_offset reads. ram_block_add and qemu_ram_free keep it in step with
+ * ram_list.blocks, under the ramlist lock.
+ */
+typedef struct RAMRange {
+    ram_addr_t start;
+    ram_addr_t end;
+} RAMRange;
+
+static GArray *ram_ranges;
+
+/* The index of the first range starting at @start or past it. */
+static guint ram_ranges_index(ram_addr_t start)
+{
+    guint lo = 0, hi = ram_ranges ? ram_ranges->len : 0;
+
+    while (lo < hi) {
+        guint mid = lo + (hi - lo) / 2;
+
+        if (g_array_index(ram_ranges, RAMRange, mid).start < start) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/* Called with the ramlist lock held. */
+static void ram_ranges_insert(RAMBlock *block)
+{
+    RAMRange r = {
+        .start = block->offset,
+        .end = block->offset + block->max_length,
+    };
+
+    if (!ram_ranges) {
+        ram_ranges = g_array_new(false, false, sizeof(RAMRange));
+    }
+    g_array_insert_val(ram_ranges, ram_ranges_index(r.start), r);
+}
+
+/* Called with the ramlist lock held. */
+static void ram_ranges_remove(RAMBlock *block)
+{
+    guint i = ram_ranges_index(block->offset);
+
+    assert(i < ram_ranges->len &&
+           g_array_index(ram_ranges, RAMRange, i).start == block->offset);
+    g_array_remove_index(ram_ranges, i);
+}
+
 /* Allocate space within the ram_addr_t space that governs the
- * dirty bitmaps.
+ * dirty bitmaps: the smallest gap that fits, past the end of a block.
  * Called with the ramlist lock held.
+ *
+ * One pass over the blocks sorted by offset (ram_ranges): no block before
+ * a block starts at its rounded-up end or past it, so the closest block
+ * following each is the first one after it that does, the very next one
+ * where blocks start on the alignment below, as every block placed here
+ * does. Of gaps of one size, the lowest wins.
  */
 static ram_addr_t find_ram_offset(ram_addr_t size)
 {
-    RAMBlock *block, *next_block;
     ram_addr_t offset = RAM_ADDR_MAX, mingap = RAM_ADDR_MAX;
+    guint len = ram_ranges ? ram_ranges->len : 0;
+    guint i, j;
 
     assert(size != 0); /* it would hand out same offset multiple times */
 
-    if (QLIST_EMPTY_RCU(&ram_list.blocks)) {
+    if (!len) {
         return 0;
     }
 
-    RAMBLOCK_FOREACH(block) {
+    for (i = 0; i < len; i++) {
         ram_addr_t candidate, next = RAM_ADDR_MAX;
 
         /* Align blocks to start on a 'long' in the bitmap
          * which makes the bitmap sync'ing take the fast path.
          */
-        candidate = block->offset + block->max_length;
+        candidate = g_array_index(ram_ranges, RAMRange, i).end;
         candidate = ROUND_UP(candidate, BITS_PER_LONG << TARGET_PAGE_BITS);
 
         /* Search for the closest following block
          * and find the gap.
          */
-        RAMBLOCK_FOREACH(next_block) {
-            if (next_block->offset >= candidate) {
-                next = MIN(next, next_block->offset);
-            }
+        j = i + 1;
+        while (j < len &&
+               g_array_index(ram_ranges, RAMRange, j).start < candidate) {
+            j++;
+        }
+        if (j < len) {
+            next = g_array_index(ram_ranges, RAMRange, j).start;
         }
 
         /* If it fits remember our place and remember the size
@@ -2284,6 +2347,7 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
     } else { /* list is empty */
         QLIST_INSERT_HEAD_RCU(&ram_list.blocks, new_block, next);
     }
+    ram_ranges_insert(new_block);
     qatomic_set(&ram_list.mru_block, NULL);
 
     /* Write list before version */
@@ -2660,6 +2724,7 @@ void qemu_ram_free(RAMBlock *block)
     name = cpr_name(block->mr);
     cpr_delete_fd(name, 0);
     QLIST_REMOVE_RCU(block, next);
+    ram_ranges_remove(block);
     qatomic_set(&ram_list.mru_block, NULL);
     /* Write list before version */
     qatomic_store_release(&ram_list.version, ram_list.version + 1);
