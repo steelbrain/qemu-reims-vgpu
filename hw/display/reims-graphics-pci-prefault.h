@@ -4,23 +4,27 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * A pool piece's first touch by the guest takes one second-level fault a
- * 4 KiB page: 140,289 of them, about 180-260 ms, for a 548 MiB piece on
- * KVM. Once the piece is in the guest and its add answered, one thread of
- * the VM's fills the second-level tables for it ahead of the guest's
- * touch, so the guest's first touch takes no fault: the populate. The
- * answer never waits for it.
+ * 4 KiB page: 140,289 of them for a 548 MiB piece, about 180-260 ms on KVM
+ * and 1.3 s on WHPX. Once the piece is in the guest and its add answered,
+ * one thread of the VM's fills the second-level tables for it ahead of the
+ * guest's touch, so the guest's first touch takes no fault: the populate.
+ * The answer never waits for it.
  *
  * The thread takes the pieces lowest address first, each in 2 MiB slices,
  * one call a slice, and stops a piece between slices at its removal. Each
- * call holds what a slot change waits for (KVM's SRCU), so a slice bounds
- * that wait. The accelerator's part, the call, is a
+ * call holds what a slot change waits for (KVM's SRCU, WHPX's partition
+ * map), so a slice bounds that wait. The accelerator's part, the call, is a
  * ReimsGraphicsPrefaultOps: KVM's KVM_PRE_FAULT_MEMORY on a vCPU of the
- * thread's own that never runs (reims-graphics-pci-kvm.c).
+ * thread's own that never runs (reims-graphics-pci-kvm.c), or WHPX's
+ * WHvAdviseGpaRange populate (whpx_populate).
  *
- * A pool piece's add or removal changes a slot under the BQL, which must
- * not wait for a call: it pauses the populate first, which signals the
- * call in flight to end it at once, and resumes it once its slot change
- * is done.
+ * On KVM a pool piece's add or removal changes a slot under the BQL, which
+ * must not wait for a call: it pauses the populate first, which signals the
+ * call in flight to end it at once, and resumes it once its slot change is
+ * done. On WHPX the device maps and unmaps its pieces outside the BQL
+ * (whpx_map_ahead, whpx_unmap_before_del), and a map or unmap under the
+ * BQL waits for at most the slice in flight: the populate takes no pause
+ * there.
  */
 
 #ifndef HW_DISPLAY_REIMS_GRAPHICS_PCI_PREFAULT_H
@@ -46,7 +50,9 @@ typedef struct ReimsGraphicsPrefaultOps {
     int64_t (*populate)(hwaddr gpa, uint64_t size, bool *cut);
     /*
      * Any thread: signals the populate thread, so that the call it is in
-     * ends with what it has done (-EINTR where it did nothing).
+     * ends with what it has done (-EINTR where it did nothing). NULL where
+     * a slot change under the BQL waits for at most the slice in flight: a
+     * pause and its resume then do nothing.
      */
     void (*kick)(void);
 } ReimsGraphicsPrefaultOps;

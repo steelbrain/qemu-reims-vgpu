@@ -15,6 +15,7 @@
 #include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "system/kvm.h"
+#include "system/whpx.h"
 #include "reims-graphics-pci-prefault.h"
 #ifdef CONFIG_LINUX
 #include "reims-graphics-pci-kvm.h"
@@ -146,6 +147,38 @@ static void reims_graphics_prefault_region(ReimsGraphicsPrefault *pf,
     }
 }
 
+/*
+ * The populate on WHPX: one partition call a slice, which needs no vCPU.
+ * Measured 11-18 on the Windows mini (UHD 630, Windows 10.0.26300), with
+ * a 64 MiB map and unmap of another range looped beside a 548 MiB populate:
+ * the populate in one call took 54 ms and the map beside it waited 55 ms
+ * (p50), where in 2 MiB slices it took 218 ms and a map waited 1.25 / 1.64
+ * / 3.94 ms (p50 / p90 / max), against 1.60 / 1.76 / 2.25 ms with no
+ * populate.
+ */
+static bool reims_graphics_whpx_prefault_start(Error **errp)
+{
+    if (!whpx_can_populate()) {
+        error_setg(errp, "reims-graphics-pci: no pre-fault of the pool: "
+                   "the hypervisor has no WHvAdviseGpaRange");
+        return false;
+    }
+    return true;
+}
+
+static int64_t reims_graphics_whpx_prefault_populate(hwaddr gpa,
+                                                     uint64_t size, bool *cut)
+{
+    int ret = whpx_populate(gpa, size);
+
+    return ret < 0 ? ret : size;
+}
+
+static const ReimsGraphicsPrefaultOps reims_graphics_whpx_prefault = {
+    .start = reims_graphics_whpx_prefault_start,
+    .populate = reims_graphics_whpx_prefault_populate,
+};
+
 static void *reims_graphics_prefault_thread(void *opaque)
 {
     ReimsGraphicsPrefault *pf = opaque;
@@ -196,6 +229,9 @@ ReimsGraphicsPrefault *reims_graphics_prefault_get(void)
         ops = reims_graphics_kvm_prefault_ops();
     }
 #endif
+    if (whpx_enabled()) {
+        ops = &reims_graphics_whpx_prefault;
+    }
     if (!ops) {
         return NULL;
     }
@@ -275,6 +311,9 @@ void reims_graphics_prefault_pause(ReimsGraphicsPrefault *pf)
     unsigned kicks = 0;
     bool in_call;
 
+    if (!pf->ops->kick) {
+        return;
+    }
     WITH_QEMU_LOCK_GUARD(&pf->lock) {
         pf->paused++;
         in_call = pf->in_call;
@@ -294,6 +333,9 @@ void reims_graphics_prefault_pause(ReimsGraphicsPrefault *pf)
 
 void reims_graphics_prefault_resume(ReimsGraphicsPrefault *pf)
 {
+    if (!pf->ops->kick) {
+        return;
+    }
     WITH_QEMU_LOCK_GUARD(&pf->lock) {
         assert(pf->paused > 0);
         if (--pf->paused == 0) {

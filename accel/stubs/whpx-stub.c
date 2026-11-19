@@ -30,3 +30,13 @@ bool whpx_unmap_before_del(uint64_t gpa, uint64_t size)
 {
     return false;
 }
+
+bool whpx_can_populate(void)
+{
+    return false;
+}
+
+int whpx_populate(uint64_t gpa, uint64_t size)
+{
+    return -ENOTSUP;
+}

@@ -1234,10 +1234,10 @@ static void reims_graphics_routes_close(ReimsGraphicsPCIState *s)
  * end, where it tells the library that the memory is free to go
  * (rvg_graphics_device_pool_removed), comes once the last of them goes.
  *
- * Under KVM, each piece is populated once its add is answered
+ * Under KVM and WHPX, each piece is populated once its add is answered
  * (reims-graphics-pci-prefault.h), so the guest's first touch of it takes
- * no fault; the piece's removal stops its populate, and each run of adds
- * or removals pauses the populate for its memory transaction.
+ * no fault; the piece's removal stops its populate, and under KVM each run
+ * of adds or removals pauses the populate for its memory transaction.
  */
 
 #define TYPE_REIMS_GRAPHICS_POOL_PIECE "reims-graphics-pool-piece"

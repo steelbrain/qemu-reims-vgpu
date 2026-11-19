@@ -63,6 +63,16 @@ void whpx_unmap_ahead(uint64_t gpa, uint64_t size, void *host);
  * unmaps it as usual.
  */
 bool whpx_unmap_before_del(uint64_t gpa, uint64_t size);
+/* Whether the hypervisor has whpx_populate's call (WHvAdviseGpaRange). */
+bool whpx_can_populate(void);
+/*
+ * Fills the hypervisor's second-level tables for the @size bytes at @gpa,
+ * mapped in the guest, ahead of the guest's first touch, for reads and
+ * writes (WHvAdviseGpaRange's WHvAdviseGpaRangeCodePopulate), on any thread,
+ * without the BQL. The partition's maps and unmaps wait for the call. 0, or
+ * -EIO where the hypervisor refused, -ENOTSUP where it has no such call.
+ */
+int whpx_populate(uint64_t gpa, uint64_t size);
 #else /* !CONFIG_WHPX_IS_POSSIBLE */
 #define whpx_enabled() 0
 #define whpx_irqchip_in_kernel() (0)

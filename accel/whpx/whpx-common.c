@@ -417,6 +417,32 @@ bool whpx_unmap_before_del(uint64_t gpa, uint64_t size)
     return true;
 }
 
+bool whpx_can_populate(void)
+{
+    return whp_dispatch.WHvAdviseGpaRange != NULL;
+}
+
+int whpx_populate(uint64_t gpa, uint64_t size)
+{
+    struct whpx_state *whpx = &whpx_global;
+    WHV_MEMORY_RANGE_ENTRY range = {
+        .GuestAddress = gpa,
+        .SizeInBytes = size,
+    };
+    WHV_ADVISE_GPA_RANGE_POPULATE populate = {
+        .AccessType = WHvMemoryAccessWrite,
+    };
+    HRESULT hr;
+
+    if (!whp_dispatch.WHvAdviseGpaRange) {
+        return -ENOTSUP;
+    }
+    hr = whp_dispatch.WHvAdviseGpaRange(whpx->partition, &range, 1,
+                                        WHvAdviseGpaRangeCodePopulate,
+                                        &populate, sizeof(populate));
+    return FAILED(hr) ? -EIO : 0;
+}
+
 static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
 {
     struct whpx_state *whpx = &whpx_global;
