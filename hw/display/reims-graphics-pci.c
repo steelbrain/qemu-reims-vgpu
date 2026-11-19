@@ -1319,8 +1319,12 @@ static void reims_graphics_pool_add(ReimsGraphicsPCIState *s,
     memory_region_init_ram_ptr(&piece->mr, OBJECT(piece),
                                "reims-graphics-pci.pool-piece", ask->size,
                                ask->host);
-    memory_region_set_unmergeable(&piece->mr, true);
+    /*
+     * Inside the add's transaction: on its own, set_unmergeable commits
+     * (and renders every flat view) for a region that is in none yet.
+     */
     memory_region_transaction_begin();
+    memory_region_set_unmergeable(&piece->mr, true);
     memory_region_add_subregion(get_system_memory(), ask->gpa, &piece->mr);
     memory_region_transaction_commit();
     t1 = get_clock();
