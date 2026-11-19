@@ -1841,6 +1841,90 @@ static void ram_ranges_remove(RAMBlock *block)
     g_array_remove_index(ram_ranges, i);
 }
 
+/*
+ * The last block of each size in ram_list.blocks, largest size first, as
+ * the list keeps its blocks: where ram_block_add puts a new block, without
+ * walking the blocks ahead of it. Under the ramlist lock.
+ */
+typedef struct RAMSizeRun {
+    ram_addr_t size;
+    RAMBlock *last;
+} RAMSizeRun;
+
+static GArray *ram_size_runs;
+
+/* The index of the first run of blocks of @size or smaller. */
+static guint ram_size_runs_index(ram_addr_t size)
+{
+    guint lo = 0, hi = ram_size_runs ? ram_size_runs->len : 0;
+
+    while (lo < hi) {
+        guint mid = lo + (hi - lo) / 2;
+
+        if (g_array_index(ram_size_runs, RAMSizeRun, mid).size > size) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/*
+ * Puts @block in ram_list.blocks after the last block of its size or
+ * larger, or first where there is none: the list stays sorted from the
+ * largest block to the smallest, and of blocks of one size the newest is
+ * last. Called with the ramlist lock held.
+ */
+static void ram_block_list_insert(RAMBlock *block)
+{
+    guint i = ram_size_runs_index(block->max_length);
+    RAMSizeRun *run;
+
+    if (!ram_size_runs) {
+        ram_size_runs = g_array_new(false, false, sizeof(RAMSizeRun));
+    }
+    if (i < ram_size_runs->len) {
+        run = &g_array_index(ram_size_runs, RAMSizeRun, i);
+        if (run->size == block->max_length) {
+            QLIST_INSERT_AFTER_RCU(run->last, block, next);
+            run->last = block;
+            return;
+        }
+    }
+    if (i > 0) {
+        run = &g_array_index(ram_size_runs, RAMSizeRun, i - 1);
+        QLIST_INSERT_AFTER_RCU(run->last, block, next);
+    } else {
+        QLIST_INSERT_HEAD_RCU(&ram_list.blocks, block, next);
+    }
+    g_array_insert_val(ram_size_runs, i,
+                       ((RAMSizeRun) { block->max_length, block }));
+}
+
+/* Takes @block out of ram_list.blocks. Called with the ramlist lock held. */
+static void ram_block_list_remove(RAMBlock *block)
+{
+    guint i = ram_size_runs_index(block->max_length);
+    RAMSizeRun *run;
+
+    assert(i < ram_size_runs->len);
+    run = &g_array_index(ram_size_runs, RAMSizeRun, i);
+    assert(run->size == block->max_length);
+    if (run->last == block) {
+        /* The block before it in the list, if any. */
+        RAMBlock *prev = block->next.le_prev == &ram_list.blocks.lh_first ?
+            NULL : container_of(block->next.le_prev, RAMBlock, next.le_next);
+
+        if (prev && prev->max_length == block->max_length) {
+            run->last = prev;
+        } else {
+            g_array_remove_index(ram_size_runs, i);
+        }
+    }
+    QLIST_REMOVE_RCU(block, next);
+}
+
 /* Allocate space within the ram_addr_t space that governs the
  * dirty bitmaps: the smallest gap that fits, past the end of a block.
  * Called with the ramlist lock held.
@@ -2226,8 +2310,6 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
 {
     const bool noreserve = qemu_ram_is_noreserve(new_block);
     const bool shared = qemu_ram_is_shared(new_block);
-    RAMBlock *block;
-    RAMBlock *last_block = NULL;
     bool free_on_error = false;
     ram_addr_t ram_size;
     Error *err = NULL;
@@ -2330,23 +2412,8 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
 
     ram_size = (new_block->offset + new_block->max_length) >> TARGET_PAGE_BITS;
     dirty_memory_extend(ram_size);
-    /* Keep the list sorted from biggest to smallest block.  Unlike QTAILQ,
-     * QLIST (which has an RCU-friendly variant) does not have insertion at
-     * tail, so save the last element in last_block.
-     */
-    RAMBLOCK_FOREACH(block) {
-        last_block = block;
-        if (block->max_length < new_block->max_length) {
-            break;
-        }
-    }
-    if (block) {
-        QLIST_INSERT_BEFORE_RCU(block, new_block, next);
-    } else if (last_block) {
-        QLIST_INSERT_AFTER_RCU(last_block, new_block, next);
-    } else { /* list is empty */
-        QLIST_INSERT_HEAD_RCU(&ram_list.blocks, new_block, next);
-    }
+    /* Keep the list sorted from biggest to smallest block. */
+    ram_block_list_insert(new_block);
     ram_ranges_insert(new_block);
     qatomic_set(&ram_list.mru_block, NULL);
 
@@ -2723,7 +2790,7 @@ void qemu_ram_free(RAMBlock *block)
     qemu_mutex_lock_ramlist();
     name = cpr_name(block->mr);
     cpr_delete_fd(name, 0);
-    QLIST_REMOVE_RCU(block, next);
+    ram_block_list_remove(block);
     ram_ranges_remove(block);
     qatomic_set(&ram_list.mru_block, NULL);
     /* Write list before version */
