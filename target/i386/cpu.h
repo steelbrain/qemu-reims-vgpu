@@ -2395,6 +2395,12 @@ struct ArchCPU {
      * compatibility.
      */
     bool force_features;
+    /*
+     * x-avx512-xstate: list the AVX-512 state components (opmask, ZMM_Hi256,
+     * Hi16_ZMM) in CPUID leaf 0xD whether or not leaf 7 has avx512f, so the
+     * guest may set them in XCR0 while its feature bits say no AVX-512.
+     */
+    bool avx512_xstate;
     bool expose_kvm;
     bool expose_tcg;
     bool migratable;

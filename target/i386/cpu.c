@@ -9674,6 +9674,17 @@ static void x86_cpu_enable_xsave_components(X86CPU *cpu)
         }
     }
 
+    /*
+     * x-avx512-xstate: the AVX-512 components without leaf 7's avx512f. On a
+     * Zen 4 host the core delivers no ops from its op cache while the guest's
+     * XCR0 leaves these off; listing them lets the guest turn them on. The
+     * host filter below still drops them where the host lacks them.
+     */
+    if (cpu->avx512_xstate) {
+        mask |= XSTATE_OPMASK_MASK | XSTATE_ZMM_Hi256_MASK |
+                XSTATE_Hi16_ZMM_MASK;
+    }
+
     /* Only request permission for first vcpu */
     if (kvm_enabled() && !request_perm) {
         kvm_request_xsave_components(cpu, mask);
@@ -10851,6 +10862,7 @@ static const Property x86_cpu_properties[] = {
     DEFINE_PROP_BOOL("check", X86CPU, check_cpuid, true),
     DEFINE_PROP_BOOL("enforce", X86CPU, enforce_cpuid, false),
     DEFINE_PROP_BOOL("x-force-features", X86CPU, force_features, false),
+    DEFINE_PROP_BOOL("x-avx512-xstate", X86CPU, avx512_xstate, false),
     DEFINE_PROP_BOOL("kvm", X86CPU, expose_kvm, true),
     DEFINE_PROP_UINT32("phys-bits", X86CPU, phys_bits, 0),
     DEFINE_PROP_UINT32("guest-phys-bits", X86CPU, guest_phys_bits, -1),
