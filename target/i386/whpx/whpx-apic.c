@@ -261,7 +261,13 @@ static void whpx_send_msi(MSIMessage *msg)
     uint8_t trigger_mode = (data >> MSI_DATA_TRIGGER_SHIFT) & 0x1;
     uint8_t delivery = (data >> MSI_DATA_DELIVERY_MODE_SHIFT) & 0x7;
 
-    if (vector == 0) {
+    /*
+     * A vector of 0 is only invalid for fixed delivery. INIT IPIs (used by
+     * guest firmware and kernels to start secondary processors) legitimately
+     * carry vector 0 and must reach the target vCPU, otherwise the APs never
+     * start and the guest stalls or panics waiting for them.
+     */
+    if (vector == 0 && delivery == 0) {
         warn_report("Ignoring request for interrupt vector 0");
         return;
     }
