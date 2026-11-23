@@ -12,6 +12,7 @@
 #include "qom/object.h"
 #include "qapi/error.h"
 #include "hw/audio/model.h"
+#include "hw/pci/pci.h"
 #include "hw/virtio/virtio-pci.h"
 #include "hw/audio/virtio-snd.h"
 
@@ -25,12 +26,15 @@ struct VirtIOSoundPCI {
     VirtIOPCIProxy parent_obj;
 
     VirtIOSound vdev;
+    bool ascending_capabilities;
 };
 
 static const Property virtio_snd_pci_properties[] = {
     DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 2),
+    DEFINE_PROP_BOOL("x-ascending-capabilities", VirtIOSoundPCI,
+                     ascending_capabilities, false),
 };
 
 static void virtio_snd_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
@@ -40,6 +44,28 @@ static void virtio_snd_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 
     virtio_pci_force_virtio_1(vpci_dev);
     qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
+
+    if (dev->ascending_capabilities && qdev_is_realized(vdev)) {
+        uint8_t *config = vpci_dev->pci_dev.config;
+        bool capabilities[PCI_CONFIG_SPACE_SIZE] = { false };
+        unsigned offset, previous = PCI_CAPABILITY_LIST;
+
+        /* macOS 27's virtio PCI transport revisits PCI_CFG and NOTIFY
+         * forever on a descending list, as virtio-net-pci's does. Keep
+         * capability contents and offsets; only reorder the links. */
+        for (offset = config[PCI_CAPABILITY_LIST]; offset;
+             offset = config[offset + PCI_CAP_LIST_NEXT]) {
+            capabilities[offset] = true;
+        }
+        for (offset = PCI_CONFIG_HEADER_SIZE; offset < PCI_CONFIG_SPACE_SIZE;
+             offset++) {
+            if (capabilities[offset]) {
+                config[previous] = offset;
+                previous = offset + PCI_CAP_LIST_NEXT;
+            }
+        }
+        config[previous] = 0;
+    }
 }
 
 static void virtio_snd_pci_class_init(ObjectClass *klass, const void *data)

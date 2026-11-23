@@ -743,6 +743,7 @@ static GlobalProperty vmapple_compat_defaults[] = {
      * capabilities are linked from high offsets to low.
      */
     { "virtio-net-pci-base", "x-ascending-capabilities", "on" },
+    { "virtio-sound-pci", "x-ascending-capabilities", "on" },
     /*
      * macOS's virtio-net driver can miss the completion of its first control
      * command, which QEMU gives before the driver waits for it, and the
