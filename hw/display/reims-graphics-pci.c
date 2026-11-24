@@ -2634,6 +2634,13 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         reims_graphics_pool_room_machine(&pool_base, &pool_room)) {
         config.pool_physical_address = pool_base;
         config.pool_physical_length = pool_room;
+#ifdef CONFIG_LINUX
+        /*
+         * Blocks of host memory where KVM takes no cacheable mapping of the
+         * GPU's own memory as guest memory (reims_graphics_kvm_pool_host_memory).
+         */
+        config.pool_host_memory = reims_graphics_kvm_pool_host_memory();
+#endif
     }
 
     /* The windows' input runs from here on; the callbacks need the BHs. */

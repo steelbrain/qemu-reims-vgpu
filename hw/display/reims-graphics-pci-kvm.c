@@ -18,6 +18,21 @@
 #include "reims-graphics-pci-prefault.h"
 #include "trace.h"
 
+bool reims_graphics_kvm_pool_host_memory(void)
+{
+#if defined(__aarch64__)
+    /*
+     * The capability is the VM's (KVM_CHECK_EXTENSION on the VM's fd);
+     * kvm_vm_check_extension is declared for per-target builds alone.
+     */
+    return kvm_enabled() &&
+           kvm_vm_ioctl(kvm_state, KVM_CHECK_EXTENSION,
+                        KVM_CAP_ARM_CACHEABLE_PFNMAP_SUPPORTED) <= 0;
+#else
+    return false;
+#endif
+}
+
 bool reims_graphics_kvm_disable_slot_zap_all(void)
 {
 #ifdef KVM_X86_QUIRK_SLOT_ZAP_ALL
