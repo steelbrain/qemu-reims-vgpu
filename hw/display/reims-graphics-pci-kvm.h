@@ -29,4 +29,16 @@ bool reims_graphics_kvm_disable_slot_zap_all(void);
  */
 const ReimsGraphicsPrefaultOps *reims_graphics_kvm_prefault_ops(void);
 
+/*
+ * Whether the guest's Shared pool's blocks are to be write-combined: under KVM
+ * on an arm64 host whose VM does not answer
+ * KVM_CAP_ARM_CACHEABLE_PFNMAP_SUPPORTED. KVM takes a cacheable VM_PFNMAP
+ * mapping, as a GPU driver's mapping of its memory is, as guest memory only
+ * where the CPU has stage-2 forced write-back and CACHE_DIC, and a kernel
+ * that predates the capability answers none; elsewhere the pool's first
+ * piece's slot is refused, and QEMU exits. The uncached mapping of a
+ * write-combined block is taken. False elsewhere.
+ */
+bool reims_graphics_kvm_pool_write_combined(void);
+
 #endif

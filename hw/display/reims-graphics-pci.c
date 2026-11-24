@@ -2581,6 +2581,13 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
         reims_graphics_pool_room_machine(&pool_base, &pool_room)) {
         config.pool_physical_address = pool_base;
         config.pool_physical_length = pool_room;
+#ifdef CONFIG_LINUX
+        /*
+         * Write-combined blocks where KVM takes no cacheable mapping of the
+         * GPU's memory as guest memory (reims_graphics_kvm_pool_write_combined).
+         */
+        config.pool_write_combined = reims_graphics_kvm_pool_write_combined();
+#endif
     }
 
     /* The windows' input runs from here on; the callbacks need the BHs. */

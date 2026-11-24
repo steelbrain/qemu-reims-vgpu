@@ -16,3 +16,8 @@ const ReimsGraphicsPrefaultOps *reims_graphics_kvm_prefault_ops(void)
 {
     return NULL;
 }
+
+bool reims_graphics_kvm_pool_write_combined(void)
+{
+    return false;
+}
