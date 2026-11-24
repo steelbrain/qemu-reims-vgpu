@@ -32,6 +32,8 @@ dbus_audio_read(size_t len) "len = %zu"
 dsound_clear_sample(void *p1, uint32_t blen1, uint32_t len1, void *p2, uint32_t blen2, uint32_t len2) "p1=%p, blen1=%u, len1=%u, p2=%p, blen2=%u, len2=%u"
 dsound_wave_format(uint16_t wFormatTag, uint16_t nChannels, uint32_t nSamplesPerSec, uint32_t nAvgBytesPerSec, uint16_t nBlockAlign, uint16_t wBitsPerSample, uint16_t cbSize) "wFormatTag=%u, nChannels=%u, nSamplesPerSec=%u, nAvgBytesPerSec=%u, nBlockAlign=%u, wBitsPerSample=%u, cbSize=%u"
 dsound_buffer_bytes(uint32_t caps_bytes, uint32_t desc_bytes) "caps_bytes=%u, desc_bytes=%u"
+dsound_buffer_get_free(void *voice, uint32_t play, uint32_t write, uint32_t filled) "voice=%p, play=%u, write=%u, filled=%u"
+dsound_place_out(void *voice, uint32_t play, uint32_t write, uint32_t filled, uint32_t reserve, bool gap, uint32_t gaps) "voice=%p, play=%u, write=%u, filled=%u, reserve=%u, gap=%d, gaps=%u"
 
 # jackaudio.c
 jack_client_recover(void) "attempting to reconnect to server"

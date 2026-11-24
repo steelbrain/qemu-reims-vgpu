@@ -29,6 +29,7 @@
 #include "qemu/osdep.h"
 #include "qemu/audio.h"
 #include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include "audio_int.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
@@ -55,10 +56,32 @@ struct AudioDsound {
     struct audsettings settings;
 };
 
+/*
+ * A playback voice writes only past DirectSound's write cursor: the bytes
+ * between its play and write cursors DirectSound has mixed already, so what is
+ * written there is not heard, and the buffer's audio from one turn earlier
+ * plays in its place. The write position (hw.pos_emul) is placed half the
+ * buffer past the write cursor, with silence before it, when the voice
+ * starts, and again when the audio written runs out before the write cursor:
+ * a guest that hands its audio over in periods, late by up to some tens of
+ * milliseconds now and then, is played from that reserve without a gap. The
+ * reserve is latency: 92.88 ms at the default 185.76 ms buffer. What the play
+ * cursor has passed becomes silence, so a gap plays silence.
+ */
 typedef struct {
     HWVoiceOut hw;
     LPDIRECTSOUNDBUFFER dsound_buffer;
     bool first_time;
+    /* The bytes from the play cursor, at play_pos, to the write position. */
+    size_t filled;
+    DWORD play_pos;
+    /* When play_pos was read, and the buffer's length, in nanoseconds. */
+    int64_t play_ns;
+    int64_t buffer_ns;
+    /* Whether audio was written since the write position was placed. */
+    bool primed;
+    /* The times the audio written ran out before the write cursor. */
+    uint32_t gaps;
 } DSoundVoiceOut;
 
 typedef struct {
@@ -355,6 +378,8 @@ static void dsound_enable_out(HWVoiceOut *hw, bool enable)
         }
 
         dsound_clear_sample(hw, dsb, s);
+        /* The next read of the cursors places the write position. */
+        ds->first_time = true;
 
         hr = IDirectSoundBuffer_Play(dsb, 0, 0, DSBPLAY_LOOPING);
         if (FAILED(hr)) {
@@ -378,26 +403,106 @@ static void dsound_enable_out(HWVoiceOut *hw, bool enable)
     }
 }
 
+/* Fill @len bytes of the buffer from @pos with silence. */
+static void dsound_clear_out(HWVoiceOut *hw, DWORD pos, size_t len)
+{
+    DSoundVoiceOut *ds = (DSoundVoiceOut *)hw;
+    size_t bpf = hw->info.bytes_per_frame;
+    LPVOID p1, p2;
+    DWORD blen1, blen2;
+
+    if (!len ||
+        dsound_lock_out(ds->dsound_buffer, &hw->info, pos, len, &p1, &p2,
+                        &blen1, &blen2, 0, AUDIO_DSOUND(hw->s))) {
+        return;
+    }
+    if (p1 && blen1) {
+        audio_pcm_info_clear_buf(&hw->info, p1, blen1 / bpf);
+    }
+    if (p2 && blen2) {
+        audio_pcm_info_clear_buf(&hw->info, p2, blen2 / bpf);
+    }
+    dsound_unlock_out(ds->dsound_buffer, p1, p2, blen1, blen2);
+}
+
+/*
+ * Place the write position half the buffer past the write cursor @wpos, with
+ * silence from the write cursor to it. Where the write cursor leads the play
+ * cursor @ppos by more than half the buffer, the write position goes as far
+ * as the play cursor.
+ */
+static void dsound_place_out(HWVoiceOut *hw, DWORD ppos, DWORD wpos)
+{
+    DSoundVoiceOut *ds = (DSoundVoiceOut *)hw;
+    size_t bpf = hw->info.bytes_per_frame;
+    size_t lead = audio_ring_dist(wpos, ppos, hw->size_emul);
+    size_t reserve = MIN(hw->size_emul / 2, hw->size_emul - lead) / bpf * bpf;
+
+    if (ds->primed) {
+        ds->gaps++;
+    }
+    trace_dsound_place_out(hw, ppos, wpos, ds->filled, reserve, ds->primed,
+                           ds->gaps);
+    dsound_clear_out(hw, wpos, reserve);
+    hw->pos_emul = (wpos + reserve) % hw->size_emul;
+    ds->filled = lead + reserve;
+    ds->primed = false;
+}
+
 static size_t dsound_buffer_get_free(HWVoiceOut *hw)
 {
     DSoundVoiceOut *ds = (DSoundVoiceOut *) hw;
     LPDIRECTSOUNDBUFFER dsb = ds->dsound_buffer;
+    size_t bpf = hw->info.bytes_per_frame;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    size_t played;
     HRESULT hr;
     DWORD ppos, wpos;
 
-    hr = IDirectSoundBuffer_GetCurrentPosition(
-        dsb, &ppos, ds->first_time ? &wpos : NULL);
+    hr = IDirectSoundBuffer_GetCurrentPosition(dsb, &ppos, &wpos);
     if (FAILED(hr)) {
         dsound_logerr(hr, "Could not get playback buffer position");
         return 0;
     }
+    /* Whole frames: the play cursor's frame, and the first past the write's. */
+    ppos = ppos / bpf * bpf;
+    wpos = (wpos + bpf - 1) / bpf * bpf % hw->size_emul;
 
+    /*
+     * The play cursor's advance since the last read, which reads it more
+     * often than once a turn of the buffer, short of a stall of the main
+     * loop: after one of most of a turn, the audio written counts as played.
+     * What it played becomes silence, which a gap then plays rather than the
+     * audio of a turn earlier.
+     */
+    played = audio_ring_dist(ppos, ds->play_pos, hw->size_emul);
     if (ds->first_time) {
-        hw->pos_emul = wpos;
         ds->first_time = false;
+        ds->primed = false;
+    } else {
+        dsound_clear_out(hw, ds->play_pos, played);
+        if (played >= ds->filled ||
+            now - ds->play_ns >= ds->buffer_ns / 4 * 3) {
+            ds->filled = 0;
+        } else {
+            ds->filled -= played;
+        }
     }
+    ds->play_pos = ppos;
+    ds->play_ns = now;
 
-    return audio_ring_dist(ppos, hw->pos_emul, hw->size_emul);
+    /*
+     * Until audio comes, the write position keeps its place past the write
+     * cursor; once the audio written runs out before the write cursor, it
+     * takes it again, a gap of silence.
+     */
+    if (!ds->primed ||
+        ds->filled < audio_ring_dist(wpos, ppos, hw->size_emul)) {
+        dsound_place_out(hw, ppos, wpos);
+    }
+    trace_dsound_buffer_get_free(hw, ppos, wpos, ds->filled);
+
+    return hw->size_emul - ds->filled;
 }
 
 static void *dsound_get_buffer_out(HWVoiceOut *hw, size_t *size)
@@ -409,8 +514,13 @@ static void *dsound_get_buffer_out(HWVoiceOut *hw, size_t *size)
     int err;
     void *ret;
 
+    /* Never over audio not yet played. */
     req_size = MIN(*size, hw->size_emul - hw->pos_emul);
-    assert(req_size > 0);
+    req_size = MIN(req_size, hw->size_emul - ds->filled);
+    if (!req_size) {
+        *size = 0;
+        return NULL;
+    }
 
     err = dsound_lock_out(dsb, &hw->info, hw->pos_emul, req_size, &ret, NULL,
                           &act_size, NULL, false, AUDIO_DSOUND(hw->s));
@@ -435,6 +545,10 @@ static size_t dsound_put_buffer_out(HWVoiceOut *hw, void *buf, size_t len)
         return 0;
     }
     hw->pos_emul = (hw->pos_emul + len) % hw->size_emul;
+    ds->filled += len;
+    if (len) {
+        ds->primed = true;
+    }
 
     return len;
 }

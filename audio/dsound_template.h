@@ -195,7 +195,15 @@ static int dsound_init_out(HWVoiceOut *hw, struct audsettings *as)
     memset (&bd, 0, sizeof (bd));
     bd.dwSize = sizeof (bd);
     bd.lpwfxFormat = &wfx;
+#ifdef DSBTYPE_IN
     bd.dwBufferBytes = audio_buffer_bytes(pdo, as, 92880);
+#else
+    /*
+     * Twice the 92880 us of a capture buffer: dsound_place_out keeps half
+     * of it, past the write cursor, for a guest's late periods.
+     */
+    bd.dwBufferBytes = audio_buffer_bytes(pdo, as, 185760);
+#endif
 #ifdef DSBTYPE_IN
     hr = IDirectSoundCapture_CreateCaptureBuffer (
         s->dsound_capture,
@@ -253,6 +261,10 @@ static int dsound_init_out(HWVoiceOut *hw, struct audsettings *as)
     }
     hw->size_emul = bc.dwBufferBytes;
     hw->samples = bc.dwBufferBytes / hw->info.bytes_per_frame;
+#ifndef DSBTYPE_IN
+    ds->buffer_ns = muldiv64(hw->samples, NANOSECONDS_PER_SECOND,
+                             hw->info.freq);
+#endif
 
     trace_dsound_buffer_bytes(bc.dwBufferBytes, bd.dwBufferBytes);
     return 0;
