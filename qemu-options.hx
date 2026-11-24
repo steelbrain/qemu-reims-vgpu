@@ -2876,7 +2876,7 @@ DEF("smbios", HAS_ARG, QEMU_OPTION_smbios,
     "-smbios type=11[,value=str][,path=filename]\n"
     "                specify SMBIOS type 11 fields\n"
     "-smbios type=17[,loc_pfx=str][,bank=str][,manufacturer=str][,serial=str]\n"
-    "               [,asset=str][,part=str][,speed=%d]\n"
+    "               [,asset=str][,part=str][,speed=%d][,memory_type=%d]\n"
     "                specify SMBIOS type 17 fields\n"
     "-smbios type=41[,designation=str][,kind=str][,instance=%d][,pcidev=str]\n"
     "                specify SMBIOS type 41 fields\n",
@@ -2942,8 +2942,9 @@ SRST
               String 3: myapp:some extra data
 
 
-``-smbios type=17[,loc_pfx=str][,bank=str][,manufacturer=str][,serial=str][,asset=str][,part=str][,speed=%d]``
-    Specify SMBIOS type 17 fields
+``-smbios type=17[,loc_pfx=str][,bank=str][,manufacturer=str][,serial=str][,asset=str][,part=str][,speed=%d][,memory_type=%d]``
+    Specify SMBIOS type 17 fields. ``memory_type`` is the Memory Type
+    field's value, 1 to 255 (7, RAM, by default; 26 is DDR4).
 
 ``-smbios type=41[,designation=str][,kind=str][,instance=%d][,pcidev=str]``
     Specify SMBIOS type 41 fields

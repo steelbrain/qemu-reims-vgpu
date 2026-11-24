@@ -109,7 +109,10 @@ static struct {
 static struct {
     const char *loc_pfx, *bank, *manufacturer, *serial, *asset, *part;
     uint16_t speed;
-} type17;
+    uint8_t memory_type;
+} type17 = {
+    .memory_type = 0x07, /* RAM */
+};
 
 static QEnumLookup type41_kind_lookup = {
     .array = (const char *const[]) {
@@ -469,6 +472,10 @@ static const QemuOptDesc qemu_smbios_type17_opts[] = {
         .name = "speed",
         .type = QEMU_OPT_NUMBER,
         .help = "maximum capable speed",
+    },{
+        .name = "memory_type",
+        .type = QEMU_OPT_NUMBER,
+        .help = "memory type (7, RAM, by default; 26 is DDR4)",
     },
     { /* end of list */ }
 };
@@ -897,7 +904,7 @@ static void smbios_build_type_17_table(unsigned instance, uint64_t size)
     snprintf(loc_str, sizeof(loc_str), "%s %d", type17.loc_pfx, instance);
     SMBIOS_TABLE_SET_STR(17, device_locator_str, loc_str);
     SMBIOS_TABLE_SET_STR(17, bank_locator_str, type17.bank);
-    t->memory_type = 0x07; /* RAM */
+    t->memory_type = type17.memory_type;
     t->type_detail = cpu_to_le16(0x02); /* Other */
     t->speed = cpu_to_le16(type17.speed);
     SMBIOS_TABLE_SET_STR(17, manufacturer_str, type17.manufacturer);
@@ -1533,7 +1540,9 @@ void smbios_entry_add(QemuOpts *opts, Error **errp)
                 return;
             }
             return;
-        case 17:
+        case 17: {
+            uint64_t memory_type;
+
             if (!qemu_opts_validate(opts, qemu_smbios_type17_opts, errp)) {
                 return;
             }
@@ -1544,7 +1553,17 @@ void smbios_entry_add(QemuOpts *opts, Error **errp)
             save_opt(&type17.asset, opts, "asset");
             save_opt(&type17.part, opts, "part");
             type17.speed = qemu_opt_get_number(opts, "speed", 0);
+            memory_type = qemu_opt_get_number(opts, "memory_type",
+                                              0x07 /* RAM */);
+            if (memory_type == 0 || memory_type > UINT8_MAX) {
+                error_setg(errp, "SMBIOS memory type %" PRIu64
+                           " is out of range (1 to %d)", memory_type,
+                           UINT8_MAX);
+                return;
+            }
+            type17.memory_type = memory_type;
             return;
+        }
         case 41: {
             struct type41_instance *t41_i;
             Error *local_err = NULL;
