@@ -101,6 +101,7 @@ struct USBHostDevice {
     uint32_t                         loglevel;
     bool                             allow_one_guest_reset;
     bool                             allow_all_guest_resets;
+    bool                             reset_on_close;
     bool                             suppress_remote_wake;
 
     /* state */
@@ -1365,7 +1366,9 @@ fail:
     trace_usb_host_open_failure(bus_num, addr);
     if (s->dh != NULL) {
         usb_host_release_interfaces(s);
-        libusb_reset_device(s->dh);
+        if (s->reset_on_close) {
+            libusb_reset_device(s->dh);
+        }
         usb_host_attach_kernel(s);
         libusb_close(s->dh);
         s->dh = NULL;
@@ -1434,7 +1437,9 @@ static int usb_host_close(USBHostDevice *s)
     }
 
     usb_host_release_interfaces(s);
-    libusb_reset_device(s->dh);
+    if (s->reset_on_close) {
+        libusb_reset_device(s->dh);
+    }
     usb_host_attach_kernel(s);
     libusb_close(s->dh);
     s->dh = NULL;
@@ -1472,7 +1477,9 @@ static void usb_host_exit_notifier(struct Notifier *n, void *data)
         usb_host_set_interface_wait(s);
         usb_host_abort_xfers(s);
         usb_host_release_interfaces(s);
-        libusb_reset_device(s->dh);
+        if (s->reset_on_close) {
+            libusb_reset_device(s->dh);
+        }
         usb_host_attach_kernel(s);
         libusb_close(s->dh);
     }
@@ -2198,6 +2205,8 @@ static const Property usb_host_dev_properties[] = {
                      allow_one_guest_reset, true),
     DEFINE_PROP_BOOL("guest-resets-all", USBHostDevice,
                      allow_all_guest_resets, false),
+    DEFINE_PROP_BOOL("reset-on-close", USBHostDevice,
+                     reset_on_close, true),
     DEFINE_PROP_UINT32("loglevel",  USBHostDevice, loglevel,
                        LIBUSB_LOG_LEVEL_WARNING),
     DEFINE_PROP_BIT("pipeline",    USBHostDevice, options,

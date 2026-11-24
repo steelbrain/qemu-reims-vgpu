@@ -393,6 +393,16 @@ usb device at hand, so it's a trial-and-error game.  If the default
 doesn't work, try another option and see whenever the situation
 improves.
 
+QEMU also resets the device itself when it lets go of it: when the
+``usb-host`` device is removed or its host device closed, when QEMU
+exits, and when opening the device fails.  ``reset-on-close=false``
+leaves it unreset: QEMU releases its interfaces and gives them back to
+the host's drivers in the configuration the guest left.  An Apple iOS
+device switched to another USB mode by a macOS guest needs this: the
+reset leaves it in a state from which the next guest's mode switch makes
+it leave the bus until it is plugged in again, while unreset it stays in
+the mode the guest set, which the next guest finds and keeps.
+
 record usb transfers
 ^^^^^^^^^^^^^^^^^^^^
 
