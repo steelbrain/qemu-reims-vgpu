@@ -199,8 +199,8 @@ static int dsound_init_out(HWVoiceOut *hw, struct audsettings *as)
     bd.dwBufferBytes = audio_buffer_bytes(pdo, as, 92880);
 #else
     /*
-     * Twice the 92880 us of a capture buffer: dsound_place_out keeps half
-     * of it, past the write cursor, for a guest's late periods.
+     * Twice the 92880 us of a capture buffer: room past the write cursor
+     * for dsound_place_out's reserve and the guest's periods beyond it.
      */
     bd.dwBufferBytes = audio_buffer_bytes(pdo, as, 185760);
 #endif

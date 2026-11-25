@@ -60,13 +60,14 @@ struct AudioDsound {
  * A playback voice writes only past DirectSound's write cursor: the bytes
  * between its play and write cursors DirectSound has mixed already, so what is
  * written there is not heard, and the buffer's audio from one turn earlier
- * plays in its place. The write position (hw.pos_emul) is placed half the
- * buffer past the write cursor, with silence before it, when the voice
- * starts, and again when the audio written runs out before the write cursor:
- * a guest that hands its audio over in periods, late by up to some tens of
- * milliseconds now and then, is played from that reserve without a gap. The
- * reserve is latency: 92.88 ms at the default 185.76 ms buffer. What the play
- * cursor has passed becomes silence, so a gap plays silence.
+ * plays in its place. The write position (hw.pos_emul) is placed
+ * DSOUND_RESERVE_US past the write cursor, with silence before it, when the
+ * voice starts, and again when the audio written runs out before the write
+ * cursor: a guest that hands its audio over in periods, their arrivals spread
+ * over some 50 ms about their pace, is played from that reserve without a
+ * gap, where its frontend has the voice written as each period comes
+ * (virtio-snd does). The reserve is latency. What the play cursor has passed
+ * becomes silence, so a gap plays silence.
  */
 typedef struct {
     HWVoiceOut hw;
@@ -426,17 +427,27 @@ static void dsound_clear_out(HWVoiceOut *hw, DWORD pos, size_t len)
 }
 
 /*
- * Place the write position half the buffer past the write cursor @wpos, with
- * silence from the write cursor to it. Where the write cursor leads the play
- * cursor @ppos by more than half the buffer, the write position goes as far
- * as the play cursor.
+ * The reserve past the write cursor. An x86-64 macOS guest posts its periods
+ * on a 41.67 ms grid, their arrivals spread over 43 to 53 ms about their pace,
+ * and DirectSound's cursors move in 10 ms steps: 60 ms covers both, where the
+ * voice is written as each period comes.
+ */
+#define DSOUND_RESERVE_US 60000
+
+/*
+ * Place the write position DSOUND_RESERVE_US past the write cursor @wpos, with
+ * silence from the write cursor to it. Where the buffer is too short for that,
+ * the write position goes as far as the play cursor.
  */
 static void dsound_place_out(HWVoiceOut *hw, DWORD ppos, DWORD wpos)
 {
     DSoundVoiceOut *ds = (DSoundVoiceOut *)hw;
     size_t bpf = hw->info.bytes_per_frame;
     size_t lead = audio_ring_dist(wpos, ppos, hw->size_emul);
-    size_t reserve = MIN(hw->size_emul / 2, hw->size_emul - lead) / bpf * bpf;
+    size_t reserve = (size_t)muldiv64(hw->info.freq, DSOUND_RESERVE_US,
+                                      1000000) * bpf;
+
+    reserve = MIN(reserve, hw->size_emul - lead) / bpf * bpf;
 
     if (ds->primed) {
         ds->gaps++;
