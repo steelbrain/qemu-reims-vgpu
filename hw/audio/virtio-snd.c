@@ -1054,6 +1054,7 @@ static void virtio_snd_handle_tx_xfer(VirtIODevice *vdev, VirtQueue *vq)
      * return them after the for loop.
      */
     bool must_empty_invalid_queue = false;
+    bool queued = false;
 
     if (!virtio_queue_ready(vq)) {
         return;
@@ -1108,6 +1109,7 @@ static void virtio_snd_handle_tx_xfer(VirtIODevice *vdev, VirtQueue *vq)
         QSIMPLEQ_INSERT_TAIL(&stream->queue, buffer, entry);
         trace_virtio_snd_pcm_queued(stream_id, size,
                                     virtio_snd_pcm_get_io_msgs_count(stream));
+        queued = true;
         continue;
 
 tx_err:
@@ -1120,6 +1122,15 @@ tx_err:
 
     if (must_empty_invalid_queue) {
         empty_invalid_queue(vdev, vq);
+    }
+    /*
+     * The guest's new audio goes to the host's device now, not at the audio
+     * timer's next run: a guest that hands its audio over in periods is then
+     * played that much sooner, and the backend's reserve need not cover the
+     * timer's step and lateness.
+     */
+    if (queued) {
+        audio_be_kick(vsnd->audio_be);
     }
 }
 

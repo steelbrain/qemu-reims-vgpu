@@ -1426,6 +1426,12 @@ static void audio_mixeng_backend_set_volume_out(AudioBackend *be, SWVoiceOut *sw
 static void audio_mixeng_backend_set_volume_in(AudioBackend *be, SWVoiceIn *sw,
                                                Volume *vol);
 
+/* What the timer runs, between its runs: its period stays as it was. */
+static void audio_mixeng_backend_kick(AudioBackend *be)
+{
+    audio_run(AUDIO_MIXENG_BACKEND(be), "kick");
+}
+
 static void audio_mixeng_backend_class_init(ObjectClass *klass, const void *data)
 {
     AudioBackendClass *be = AUDIO_BACKEND_CLASS(klass);
@@ -1447,6 +1453,7 @@ static void audio_mixeng_backend_class_init(ObjectClass *klass, const void *data
     be->get_buffer_size_out = audio_mixeng_backend_get_buffer_size_out;
     be->add_capture = audio_mixeng_backend_add_capture;
     be->del_capture = audio_mixeng_backend_del_capture;
+    be->kick = audio_mixeng_backend_kick;
 }
 
 static void audio_mixeng_backend_init(Object *obj)

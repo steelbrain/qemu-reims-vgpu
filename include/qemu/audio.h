@@ -100,6 +100,8 @@ typedef struct AudioBackendClass {
                                     const struct audio_capture_ops *ops,
                                     void *cb_opaque);
     void (*del_capture)(AudioBackend *be, CaptureVoiceOut *cap, void *cb_opaque);
+    /* Optional: run the voices now, as the backend's own period does. */
+    void (*kick)(AudioBackend *be);
 
 #ifdef CONFIG_GIO
     bool (*set_dbus_server)(AudioBackend *be,
@@ -125,6 +127,12 @@ void audio_be_close_out(AudioBackend *be, SWVoiceOut *sw);
 size_t audio_be_write(AudioBackend *be, SWVoiceOut *sw, void *pcm_buf, size_t size);
 int  audio_be_get_buffer_size_out(AudioBackend *be, SWVoiceOut *sw);
 void audio_be_set_active_out(AudioBackend *be, SWVoiceOut *sw, bool on);
+/*
+ * Run the backend's voices now, as its own period does: a frontend calls it
+ * when it has new audio, which is then written without waiting for the
+ * period.
+ */
+void audio_be_kick(AudioBackend *be);
 bool audio_be_is_active_out(AudioBackend *be, SWVoiceOut *sw);
 
 

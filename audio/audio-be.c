@@ -145,6 +145,15 @@ void audio_be_set_active_out(AudioBackend *be, SWVoiceOut *sw, bool on)
     return klass->set_active_out(be, sw, on);
 }
 
+void audio_be_kick(AudioBackend *be)
+{
+    AudioBackendClass *klass = AUDIO_BACKEND_GET_CLASS(be);
+
+    if (klass->kick) {
+        klass->kick(be);
+    }
+}
+
 void audio_be_set_active_in(AudioBackend *be, SWVoiceIn *sw, bool on)
 {
     AudioBackendClass *klass = AUDIO_BACKEND_GET_CLASS(be);
