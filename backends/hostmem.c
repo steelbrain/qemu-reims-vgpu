@@ -364,6 +364,15 @@ static void host_memory_backend_collapse(HostMemoryBackend *backend,
     int64_t t0;
     int err = 0;
 
+    /*
+     * Off unless QEMU_HOSTMEM_COLLAPSE=1: on a Radeon 890M (RADV, Linux
+     * 6.18) a macOS guest on reims-graphics-pci over collapsed RAM panicked
+     * one to three minutes into every boot with its kernel's memory
+     * overwritten (page tables, locks, ledgers), and ran clean without it.
+     */
+    if (g_strcmp0(g_getenv("QEMU_HOSTMEM_COLLAPSE"), "1") != 0) {
+        return;
+    }
     /* A 2 MiB page is a huge page only over 4 KiB base pages. */
     if (!backend->prealloc || !backend->share ||
         (async && backend->prealloc_context) ||
