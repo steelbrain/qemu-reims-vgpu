@@ -24,6 +24,8 @@
 #include "qemu/mmap-alloc.h"
 #include "qemu/madvise.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
+#include "qemu/units.h"
 #include "hw/core/qdev.h"
 
 #ifdef CONFIG_NUMA
@@ -332,6 +334,69 @@ size_t host_memory_backend_pagesize(HostMemoryBackend *memdev)
     return pagesize;
 }
 
+/*
+ * Put a shared file's preallocated RAM, a memfd's shmem among it, on
+ * transparent huge pages, 2 MiB at a time, on Linux. At a fault the kernel
+ * backs shmem with a huge page only where
+ * /sys/kernel/mm/transparent_hugepage/shmem_enabled lets it (advise with
+ * QEMU_MADV_HUGEPAGE, always, within_size) and a free 2 MiB page is found;
+ * at never, most distributions' default, the guest runs on 4 KiB pages
+ * alone. MADV_COLLAPSE (Linux 6.1) copies a 2 MiB range onto one huge page
+ * at any shmem_enabled but deny, and leaves a range already on one as it is.
+ * It runs before any device is realized, so before a device pins guest
+ * pages, which would keep them where they are. A range it cannot collapse
+ * stays on its pages; one line says how much is on huge pages, and the first
+ * failure. An async prealloc (prealloc-context) has not run yet here: none.
+ * On Linux 7.2 or later only (qemu_guest_ram_huge_pages): below it the RAM
+ * was advised MADV_NOHUGEPAGE (ram_block_add), and one line says it stays on
+ * 4 KiB pages, naming the kernel's release.
+ */
+static void host_memory_backend_collapse(HostMemoryBackend *backend,
+                                         void *ptr, uint64_t sz,
+                                         size_t pagesize, bool async)
+{
+#if defined(CONFIG_LINUX) && (defined(__x86_64__) || defined(__aarch64__))
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+    const uintptr_t huge = 2 * MiB;
+    uintptr_t start = QEMU_ALIGN_UP((uintptr_t)ptr, huge);
+    uintptr_t end = QEMU_ALIGN_DOWN((uintptr_t)ptr + sz, huge);
+    g_autofree char *name = NULL;
+    const char *release;
+    uint64_t done = 0;
+    int64_t t0;
+    int err = 0;
+
+    /* A 2 MiB page is a huge page only over 4 KiB base pages. */
+    if (!backend->prealloc || !backend->share ||
+        (async && backend->prealloc_context) ||
+        memory_region_get_fd(&backend->mr) < 0 || pagesize != 4 * KiB) {
+        return;
+    }
+    if (!qemu_guest_ram_huge_pages(&release)) {
+        name = host_memory_backend_get_name(backend);
+        info_report("memory backend '%s': %" PRIu64 " bytes on 4 KiB pages, "
+                    "MADV_NOHUGEPAGE and no MADV_COLLAPSE: Linux %s is before "
+                    "7.2", name, sz, release);
+        return;
+    }
+    t0 = g_get_monotonic_time();
+    for (uintptr_t addr = start; addr < end; addr += huge) {
+        if (madvise((void *)addr, huge, MADV_COLLAPSE) == 0) {
+            done += huge;
+        } else if (!err) {
+            err = errno;
+        }
+    }
+    name = host_memory_backend_get_name(backend);
+    info_report("memory backend '%s': %" PRIu64 " of %" PRIu64 " bytes on "
+                "huge pages after MADV_COLLAPSE, in %" PRId64 " ms%s%s",
+                name, done, sz, (g_get_monotonic_time() - t0) / 1000,
+                err ? "; first failure: " : "", err ? strerror(err) : "");
+#endif
+}
+
 static void
 host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
 {
@@ -432,6 +497,7 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
                                                 async, errp)) {
         return;
     }
+    host_memory_backend_collapse(backend, ptr, sz, pagesize, async);
 }
 
 static bool

@@ -2428,18 +2428,20 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
     if (new_block->host) {
         qemu_ram_setup_dump(new_block->host, new_block->max_length);
         /*
-         * A shared file of base pages, memory-backend-memfd's shmem among it,
-         * stays on base pages: its pages are handed to devices as udmabuf
-         * dma-bufs, and Linux 6.11 to 7.1 build a udmabuf's scatterlist with
-         * an entry per base page that names a large folio's head page and an
-         * offset past PAGE_SIZE, which importers walking it by DMA page
-         * (amdgpu's dma-buf import) bind to the wrong pages. Advised before
-         * any prealloc touches the file, so no fault through this mapping and
-         * no khugepaged pass over it makes a large folio, at any
-         * shmem_enabled but force. Other RAM keeps the huge page advice.
+         * Below Linux 7.2, a shared file of base pages, memory-backend-memfd's
+         * shmem among it, stays on base pages: its pages are handed to devices
+         * as udmabuf dma-bufs, and Linux 6.11 to 7.1 build a udmabuf's
+         * scatterlist with an entry per base page that names a large folio's
+         * head page and an offset past PAGE_SIZE, which importers walking it
+         * by DMA page (amdgpu's dma-buf import) bind to the wrong pages
+         * (qemu_guest_ram_huge_pages). Advised before any prealloc touches the
+         * file, so no fault through this mapping and no khugepaged pass over
+         * it makes a large folio, at any shmem_enabled but force. On 7.2 and
+         * later, and for other RAM, the huge page advice.
          */
         if (new_block->fd >= 0 && qemu_ram_is_shared(new_block) &&
-            new_block->page_size == qemu_real_host_page_size()) {
+            new_block->page_size == qemu_real_host_page_size() &&
+            !qemu_guest_ram_huge_pages(NULL)) {
             qemu_madvise(new_block->host, new_block->max_length,
                          QEMU_MADV_NOHUGEPAGE);
         } else {

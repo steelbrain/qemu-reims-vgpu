@@ -48,9 +48,56 @@
 #include <wchar.h>
 #endif
 
+#ifdef CONFIG_LINUX
+#include <sys/utsname.h>
+#endif
+
 #include "qemu/ctype.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
+
+bool qemu_linux_release_at_least(const char *release, unsigned int major,
+                                 unsigned int minor)
+{
+    unsigned long maj, min;
+    char *end;
+
+    if (!release || !qemu_isdigit(release[0])) {
+        return false;
+    }
+    maj = strtoul(release, &end, 10);
+    if (end[0] != '.' || !qemu_isdigit(end[1])) {
+        return false;
+    }
+    min = strtoul(end + 1, &end, 10);
+    return maj > major || (maj == major && min >= minor);
+}
+
+bool qemu_guest_ram_huge_pages(const char **release)
+{
+#ifdef CONFIG_LINUX
+    static gsize once;
+    static struct utsname uts;
+    static bool huge;
+
+    if (g_once_init_enter(&once)) {
+        if (uname(&uts) != 0) {
+            pstrcpy(uts.release, sizeof(uts.release), "unknown");
+        }
+        huge = qemu_linux_release_at_least(uts.release, 7, 2);
+        g_once_init_leave(&once, 1);
+    }
+    if (release) {
+        *release = uts.release;
+    }
+    return huge;
+#else
+    if (release) {
+        *release = "not Linux";
+    }
+    return false;
+#endif
+}
 
 void strpadcpy(char *buf, int buf_size, const char *str, char pad)
 {

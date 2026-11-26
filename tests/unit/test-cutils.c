@@ -3687,6 +3687,39 @@ static void test_qemu_hexdump_alignment(void)
     g_assert_cmpstr(output, ==, expected);
 }
 
+/*
+ * The table qemu_guest_ram_huge_pages decides by, which the library's
+ * linux_release_at_least test holds too: 7.2 and later take huge pages.
+ */
+static void test_qemu_linux_release_at_least(void)
+{
+    static const struct {
+        const char *release;
+        bool huge;
+    } cases[] = {
+        { "6.13", false },
+        { "6.18.59", false },
+        { "7.1.9", false },
+        { "7.1.0-arch1-1", false },
+        { "7.2", true },
+        { "7.2.0", true },
+        { "7.3.3-1-cachyos", true },
+        { "10.0.1", true },
+        { "", false },
+        { "garbage", false },
+        { "7", false },
+        { "7.", false },
+        { "v7.3.3", false },
+        { "7.x", false },
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        g_assert_cmpint(qemu_linux_release_at_least(cases[i].release, 7, 2),
+                        ==, cases[i].huge);
+    }
+    g_assert_false(qemu_linux_release_at_least(NULL, 7, 2));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -4060,6 +4093,9 @@ int main(int argc, char **argv)
     /* qemu_hexdump() test */
     g_test_add_func("/cutils/qemu_hexdump/alignment",
                     test_qemu_hexdump_alignment);
+
+    g_test_add_func("/cutils/linux_release_at_least",
+                    test_qemu_linux_release_at_least);
 
     return g_test_run();
 }

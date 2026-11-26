@@ -1364,20 +1364,23 @@ static bool reims_graphics_pool_free(ReimsGraphicsPCIState *s, hwaddr gpa,
 
 /*
  * @mr as RAM of @size bytes of the library's memory at @host (the region, a
- * pool piece), advised off transparent huge pages. ram_block_add advises a
- * block from a pointer MADV_HUGEPAGE, which takes back the library's advice:
- * the library's memory is shared mappings of memfds it hands GPUs as udmabuf
- * dma-bufs, and Linux 6.11 to 7.1 build a udmabuf's scatterlist for a large
- * folio's pages with entries amdgpu's import binds to the wrong pages
- * (reims-vgpu issue 185). With shmem_enabled at advise the region held 70 MiB
- * of 2 MiB folios after a boot.
+ * pool piece), advised off transparent huge pages below Linux 7.2.
+ * ram_block_add advises a block from a pointer MADV_HUGEPAGE, which takes
+ * back the library's advice: the library's memory is shared mappings of
+ * memfds it hands GPUs as udmabuf dma-bufs, and Linux 6.11 to 7.1 build a
+ * udmabuf's scatterlist for a large folio's pages with entries amdgpu's
+ * import binds to the wrong pages (qemu_guest_ram_huge_pages; reims-vgpu
+ * issue 185). With shmem_enabled at advise the region held 70 MiB of 2 MiB
+ * folios after a boot. On 7.2 and later the huge page advice stands.
  */
 static void reims_graphics_library_ram(MemoryRegion *mr, Object *owner,
                                        const char *name, uint64_t size,
                                        void *host)
 {
     memory_region_init_ram_ptr(mr, owner, name, size, host);
-    qemu_madvise(host, size, QEMU_MADV_NOHUGEPAGE);
+    if (!qemu_guest_ram_huge_pages(NULL)) {
+        qemu_madvise(host, size, QEMU_MADV_NOHUGEPAGE);
+    }
 }
 
 /*
