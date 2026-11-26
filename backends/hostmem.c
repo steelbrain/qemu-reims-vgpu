@@ -347,9 +347,6 @@ size_t host_memory_backend_pagesize(HostMemoryBackend *memdev)
  * pages, which would keep them where they are. A range it cannot collapse
  * stays on its pages; one line says how much is on huge pages, and the first
  * failure. An async prealloc (prealloc-context) has not run yet here: none.
- * On Linux 7.2 or later only (qemu_guest_ram_huge_pages): below it the RAM
- * was advised MADV_NOHUGEPAGE (ram_block_add), and one line says it stays on
- * 4 KiB pages, naming the kernel's release.
  */
 static void host_memory_backend_collapse(HostMemoryBackend *backend,
                                          void *ptr, uint64_t sz,
@@ -363,7 +360,6 @@ static void host_memory_backend_collapse(HostMemoryBackend *backend,
     uintptr_t start = QEMU_ALIGN_UP((uintptr_t)ptr, huge);
     uintptr_t end = QEMU_ALIGN_DOWN((uintptr_t)ptr + sz, huge);
     g_autofree char *name = NULL;
-    const char *release;
     uint64_t done = 0;
     int64_t t0;
     int err = 0;
@@ -372,13 +368,6 @@ static void host_memory_backend_collapse(HostMemoryBackend *backend,
     if (!backend->prealloc || !backend->share ||
         (async && backend->prealloc_context) ||
         memory_region_get_fd(&backend->mr) < 0 || pagesize != 4 * KiB) {
-        return;
-    }
-    if (!qemu_guest_ram_huge_pages(&release)) {
-        name = host_memory_backend_get_name(backend);
-        info_report("memory backend '%s': %" PRIu64 " bytes on 4 KiB pages, "
-                    "MADV_NOHUGEPAGE and no MADV_COLLAPSE: Linux %s is before "
-                    "7.2", name, sz, release);
         return;
     }
     t0 = g_get_monotonic_time();

@@ -3688,17 +3688,18 @@ static void test_qemu_hexdump_alignment(void)
 }
 
 /*
- * The table qemu_guest_ram_huge_pages decides by, which the library's
- * linux_release_at_least test holds too: 7.2 and later take huge pages.
+ * The reims-graphics device's Linux floor: 7.2 and later pass, an older
+ * release or one that does not parse is refused.
  */
-static void test_qemu_linux_release_at_least(void)
+static void test_qemu_linux_release_meets_floor(void)
 {
     static const struct {
         const char *release;
-        bool huge;
+        bool met;
     } cases[] = {
         { "6.13", false },
         { "6.18.59", false },
+        { "7.1", false },
         { "7.1.9", false },
         { "7.1.0-arch1-1", false },
         { "7.2", true },
@@ -3714,10 +3715,10 @@ static void test_qemu_linux_release_at_least(void)
     };
 
     for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
-        g_assert_cmpint(qemu_linux_release_at_least(cases[i].release, 7, 2),
-                        ==, cases[i].huge);
+        g_assert_cmpint(qemu_linux_release_meets_floor(cases[i].release),
+                        ==, cases[i].met);
     }
-    g_assert_false(qemu_linux_release_at_least(NULL, 7, 2));
+    g_assert_false(qemu_linux_release_meets_floor(NULL));
 }
 
 int main(int argc, char **argv)
@@ -4094,8 +4095,8 @@ int main(int argc, char **argv)
     g_test_add_func("/cutils/qemu_hexdump/alignment",
                     test_qemu_hexdump_alignment);
 
-    g_test_add_func("/cutils/linux_release_at_least",
-                    test_qemu_linux_release_at_least);
+    g_test_add_func("/cutils/linux_release_meets_floor",
+                    test_qemu_linux_release_meets_floor);
 
     return g_test_run();
 }

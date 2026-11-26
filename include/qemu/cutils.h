@@ -175,30 +175,16 @@ int qemu_strtosz_metric(const char *nptr, const char **end, uint64_t *result);
 char *size_to_str(uint64_t val);
 
 /**
- * qemu_linux_release_at_least:
+ * qemu_linux_release_meets_floor:
  * @release: a Linux kernel release, as uname(2) gives it ("7.3.3-1-cachyos")
- * @major: the major version to compare with
- * @minor: the minor version to compare with
  *
- * Returns: whether @release's leading "MAJOR.MINOR" is @major.@minor or
- * later; false where @release does not start with two numbers and a dot
- * between them.
+ * Returns: whether @release's leading "MAJOR.MINOR" is 7.2 or later, the
+ * oldest Linux the reims-graphics device runs on; false where @release does
+ * not start with two numbers and a dot between them. Before 7.2 a udmabuf
+ * over large pages is malformed, and an AMD GPU's import of it is bound to
+ * the wrong pages (reims-vgpu issue 185).
  */
-bool qemu_linux_release_at_least(const char *release, unsigned int major,
-                                 unsigned int minor);
-
-/**
- * qemu_guest_ram_huge_pages:
- * @release: if not NULL, set to the running kernel's release
- *
- * Returns: whether a shared file's guest RAM may go on transparent huge
- * pages: the running kernel is Linux 7.2 or later, read once. Linux 6.11 to
- * 7.1 build a udmabuf's scatterlist with an entry per base page that names a
- * large folio's head page and an offset past the page, which importers walking
- * it by DMA page (amdgpu's dma-buf import) bind to the wrong pages; 7.2 builds
- * it from the pages themselves (upstream 5bf888673e0d). False off Linux.
- */
-bool qemu_guest_ram_huge_pages(const char **release);
+bool qemu_linux_release_meets_floor(const char *release);
 
 /**
  * freq_to_str:

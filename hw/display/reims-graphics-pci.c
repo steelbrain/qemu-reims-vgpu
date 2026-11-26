@@ -104,7 +104,6 @@
 #include "qemu/event_notifier.h"
 #include "qemu/lockable.h"
 #include "qemu/log.h"
-#include "qemu/madvise.h"
 #include "qemu/main-loop.h"
 #include "qemu/queue.h"
 #include "qemu/target-info.h"
@@ -136,6 +135,7 @@
 #include "qemu/rcu.h"
 #include "trace.h"
 #ifdef CONFIG_LINUX
+#include <sys/utsname.h>
 #include "reims-graphics-pci-kvm.h"
 #endif
 #include "reims-graphics-pci-prefault.h"
@@ -1363,27 +1363,6 @@ static bool reims_graphics_pool_free(ReimsGraphicsPCIState *s, hwaddr gpa,
 }
 
 /*
- * @mr as RAM of @size bytes of the library's memory at @host (the region, a
- * pool piece), advised off transparent huge pages below Linux 7.2.
- * ram_block_add advises a block from a pointer MADV_HUGEPAGE, which takes
- * back the library's advice: the library's memory is shared mappings of
- * memfds it hands GPUs as udmabuf dma-bufs, and Linux 6.11 to 7.1 build a
- * udmabuf's scatterlist for a large folio's pages with entries amdgpu's
- * import binds to the wrong pages (qemu_guest_ram_huge_pages; reims-vgpu
- * issue 185). With shmem_enabled at advise the region held 70 MiB of 2 MiB
- * folios after a boot. On 7.2 and later the huge page advice stands.
- */
-static void reims_graphics_library_ram(MemoryRegion *mr, Object *owner,
-                                       const char *name, uint64_t size,
-                                       void *host)
-{
-    memory_region_init_ram_ptr(mr, owner, name, size, host);
-    if (!qemu_guest_ram_huge_pages(NULL)) {
-        qemu_madvise(host, size, QEMU_MADV_NOHUGEPAGE);
-    }
-}
-
-/*
  * Adds @ask's piece to the guest's address space, inside the run's memory
  * transaction (reims_graphics_pool_bh); false, with nothing added, where it
  * lies outside the pool's free range.
@@ -1406,7 +1385,7 @@ static bool reims_graphics_pool_add(ReimsGraphicsPCIState *s,
     piece = REIMS_GRAPHICS_POOL_PIECE(object_new(TYPE_REIMS_GRAPHICS_POOL_PIECE));
     piece->s = s;
     piece->gpa = ask->gpa;
-    reims_graphics_library_ram(&piece->mr, OBJECT(piece),
+    memory_region_init_ram_ptr(&piece->mr, OBJECT(piece),
                                "reims-graphics-pci.pool-piece", ask->size,
                                ask->host);
     /*
@@ -2449,6 +2428,33 @@ static void reims_graphics_pci_at_exit(void)
     }
 }
 
+/*
+ * Whether the host meets the device's floor, Linux 7.2 or later; else false,
+ * with @errp naming the running release. The guest's pages reach the host's
+ * GPU as udmabuf dma-bufs of its RAM's memfd, and before 7.2 a udmabuf over
+ * large pages is malformed, so an AMD GPU's import binds the wrong pages
+ * (qemu_linux_release_meets_floor; reims-vgpu issue 185). True off Linux.
+ */
+static bool reims_graphics_linux_floor(Error **errp)
+{
+#ifdef CONFIG_LINUX
+    struct utsname uts;
+
+    if (uname(&uts) != 0) {
+        pstrcpy(uts.release, sizeof(uts.release), "unknown");
+    }
+    if (!qemu_linux_release_meets_floor(uts.release)) {
+        error_setg(errp, "%s: this host runs Linux %s, and the device needs "
+                   "Linux 7.2 or later: before 7.2 a udmabuf over large pages "
+                   "is malformed, and an AMD GPU is bound to the wrong pages "
+                   "of the guest's memory", TYPE_REIMS_GRAPHICS_PCI,
+                   uts.release);
+        return false;
+    }
+#endif
+    return true;
+}
+
 static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
 {
     ReimsGraphicsPCIState *s = REIMS_GRAPHICS_PCI(dev);
@@ -2505,6 +2511,9 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
     uint64_t pool_room = 0;
     uint32_t i;
 
+    if (!reims_graphics_linux_floor(errp)) {
+        return;
+    }
     if (s->displays < 1 || s->displays > RVG_GRAPHICS_DISPLAYS_MAX) {
         error_setg(errp, "%s: displays must be 1 to %d, not %" PRIu32,
                    TYPE_REIMS_GRAPHICS_PCI, RVG_GRAPHICS_DISPLAYS_MAX,
@@ -2674,7 +2683,7 @@ static void reims_graphics_pci_realize(PCIDevice *dev, Error **errp)
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->doorbells);
 
     base = rvg_graphics_device_region(s->device, &size);
-    reims_graphics_library_ram(&s->region, OBJECT(dev),
+    memory_region_init_ram_ptr(&s->region, OBJECT(dev),
                                "reims-graphics-pci.region", size, base);
     pci_register_bar(dev, RVG_GRAPHICS_PCI_BAR_REGION,
                      PCI_BASE_ADDRESS_SPACE_MEMORY |
