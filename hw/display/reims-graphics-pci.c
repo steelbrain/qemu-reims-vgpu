@@ -1816,6 +1816,28 @@ static void reims_graphics_pool_grow_set(Object *obj, Visitor *v,
     }
 }
 
+/*
+ * The x-write-counts property: a set to true has the library write its
+ * degradation counts on stderr now (rvg_write_counts), where they changed
+ * since it last wrote them, as it does at a reset and at the exit, so that a
+ * log read while the guest runs has them: reims-ctl's report sets it before
+ * it zips QEMU's log. It runs under the BQL and waits for none of the
+ * library's threads; false does nothing.
+ */
+static void reims_graphics_write_counts_set(Object *obj, Visitor *v,
+                                            const char *name, void *opaque,
+                                            Error **errp)
+{
+    bool value;
+
+    if (!visit_type_bool(v, name, &value, errp)) {
+        return;
+    }
+    if (value) {
+        rvg_write_counts();
+    }
+}
+
 /* ------ Initialisation and startup ------ */
 
 /* ------ The consoles: what each display shows, read back ------ */
@@ -2779,6 +2801,9 @@ static void reims_graphics_pci_class_init(ObjectClass *klass, const void *data)
     object_class_property_add(klass, "x-pool-grow", "uint64",
                               &uint64_type_info, NULL,
                               reims_graphics_pool_grow_set, NULL, NULL);
+    object_class_property_add(klass, "x-write-counts", "bool",
+                              &bool_type_info, NULL,
+                              reims_graphics_write_counts_set, NULL, NULL);
 
     pci->vendor_id = RVG_GRAPHICS_PCI_VENDOR_ID;
     pci->device_id = RVG_GRAPHICS_PCI_DEVICE_ID;
