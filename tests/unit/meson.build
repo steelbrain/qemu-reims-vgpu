@@ -25,6 +25,8 @@ tests = {
   # all code tested by test-x86-topo is inside topology.h
   'test-x86-topo': [],
   'test-cutils': [],
+  # all code tested by test-dsound-ring is inside audio/dsound-ring.h
+  'test-dsound-ring': [],
   'test-div128': [],
   'test-shift128': [],
   'test-mul64': [],

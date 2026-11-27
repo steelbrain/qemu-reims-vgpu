@@ -31,6 +31,7 @@
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "audio_int.h"
+#include "dsound-ring.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qom/object.h"
@@ -427,14 +428,6 @@ static void dsound_clear_out(HWVoiceOut *hw, DWORD pos, size_t len)
 }
 
 /*
- * The reserve past the write cursor. An x86-64 macOS guest posts its periods
- * on a 41.67 ms grid, their arrivals spread over 43 to 53 ms about their pace,
- * and DirectSound's cursors move in 10 ms steps: 60 ms covers both, where the
- * voice is written as each period comes.
- */
-#define DSOUND_RESERVE_US 60000
-
-/*
  * Place the write position DSOUND_RESERVE_US past the write cursor @wpos, with
  * silence from the write cursor to it. Where the buffer is too short for that,
  * the write position goes as far as the play cursor.
@@ -444,10 +437,7 @@ static void dsound_place_out(HWVoiceOut *hw, DWORD ppos, DWORD wpos)
     DSoundVoiceOut *ds = (DSoundVoiceOut *)hw;
     size_t bpf = hw->info.bytes_per_frame;
     size_t lead = audio_ring_dist(wpos, ppos, hw->size_emul);
-    size_t reserve = (size_t)muldiv64(hw->info.freq, DSOUND_RESERVE_US,
-                                      1000000) * bpf;
-
-    reserve = MIN(reserve, hw->size_emul - lead) / bpf * bpf;
+    size_t reserve = dsound_reserve(hw->info.freq, bpf, hw->size_emul, lead);
 
     if (ds->primed) {
         ds->gaps++;
@@ -476,8 +466,8 @@ static size_t dsound_buffer_get_free(HWVoiceOut *hw)
         return 0;
     }
     /* Whole frames: the play cursor's frame, and the first past the write's. */
-    ppos = ppos / bpf * bpf;
-    wpos = (wpos + bpf - 1) / bpf * bpf % hw->size_emul;
+    ppos = dsound_play_frame(ppos, bpf);
+    wpos = dsound_write_frame(wpos, bpf, hw->size_emul);
 
     /*
      * The play cursor's advance since the last read, which reads it more
@@ -492,12 +482,8 @@ static size_t dsound_buffer_get_free(HWVoiceOut *hw)
         ds->primed = false;
     } else {
         dsound_clear_out(hw, ds->play_pos, played);
-        if (played >= ds->filled ||
-            now - ds->play_ns >= ds->buffer_ns / 4 * 3) {
-            ds->filled = 0;
-        } else {
-            ds->filled -= played;
-        }
+        ds->filled = dsound_filled_after(ds->filled, played,
+                                         now - ds->play_ns, ds->buffer_ns);
     }
     ds->play_pos = ppos;
     ds->play_ns = now;
